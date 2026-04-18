@@ -1,0 +1,38 @@
+[project]
+name = "snowflake-optimizer"
+version = "0.1.0"
+description = "Locally-hosted, open-source Snowflake cost & performance optimizer"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1.0",
+    "pydantic>=2.6",
+    "sqlglot>=25.0",
+    "click>=8.1",
+    "rich>=13.7",
+    "streamlit>=1.35",
+    "pandas>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+snowflake = [
+    "snowflake-connector-python>=3.10",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+sfo = "snowflake_optimizer.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/snowflake_optimizer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
