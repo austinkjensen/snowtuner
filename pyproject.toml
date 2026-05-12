@@ -1,8 +1,33 @@
 [project]
-name = "snowflake-optimizer"
+name = "snowtuner"
 version = "0.1.0"
-description = "Locally-hosted, open-source Snowflake cost & performance optimizer"
+description = "Locally-hosted, open-source Snowflake cost & performance advisor"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Austin Jensen" }]
+keywords = [
+    "snowflake",
+    "cost-optimization",
+    "finops",
+    "data-platform",
+    "duckdb",
+    "mcp",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: System :: Monitoring",
+]
 dependencies = [
     "duckdb>=1.1.0",
     "pydantic>=2.6",
@@ -12,6 +37,13 @@ dependencies = [
     "streamlit>=1.35",
     "pandas>=2.2",
     "numpy>=1.26",
+    "scipy>=1.13",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "keyring>=24.0",
+    "cryptography>=41.0",
+    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -23,15 +55,22 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.urls]
+# Update once the repo is public.
+Homepage = "https://github.com/austinkjensen/snowtuner"
+Repository = "https://github.com/austinkjensen/snowtuner"
+Issues = "https://github.com/austinkjensen/snowtuner/issues"
+Changelog = "https://github.com/austinkjensen/snowtuner/blob/main/CHANGELOG.md"
+
 [project.scripts]
-sfo = "snowflake_optimizer.cli:cli"
+snowtuner = "snowtuner.cli:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/snowflake_optimizer"]
+packages = ["src/snowtuner"]
 
 [tool.ruff]
 line-length = 100

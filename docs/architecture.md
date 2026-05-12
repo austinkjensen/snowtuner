@@ -1,0 +1,262 @@
+# snowtuner architecture
+
+This document is a map of the codebase. Read it once before changing anything;
+keep it nearby when adding a new recommender or feature transform.
+
+> The Mermaid diagrams below render natively in GitHub. Want PNG/SVG versions
+> for slides or screenshots? Run `python scripts/render_mermaid.py` (requires
+> Node + `npx`); outputs land in `docs/img/`.
+
+## The 30-second mental model
+
+Three logical layers, each independently testable. Data flows left to right
+through the layers; the API + UI + MCP are clients of the bottom (`app.*`).
+
+```mermaid
+flowchart LR
+    SF[(Snowflake<br/>ACCOUNT_USAGE)]
+
+    subgraph "Ingestion"
+      direction TB
+      Sources["Sources<br/>(QueryHistory, Metering,<br/>Events, Warehouses)"]
+    end
+
+    subgraph "Storage (local DuckDB)"
+      direction TB
+      Raw["raw.*<br/>(mirrors of Snowflake views)"]
+      Feat["features.*<br/>(derived tables)"]
+      App["app.*<br/>(recommendations, autonomous,<br/>training_state, watermarks)"]
+    end
+
+    subgraph "Pipeline"
+      direction TB
+      Pipe["FeaturePipeline<br/>(topo-sorted FeatureTransforms)"]
+      Recs["Recommenders<br/>(in-process registry)"]
+      AutoR["AutonomousRunner<br/>(cooldown, breaker, apply)"]
+    end
+
+    subgraph "Surfaces"
+      direction TB
+      API["FastAPI<br/>(snowtuner api)"]
+      CLI["CLI<br/>(snowtuner ...)"]
+      UI["Streamlit UI"]
+      MCP["Admin MCP<br/>(snowtuner mcp)"]
+    end
+
+    SF --> Sources --> Raw
+    Raw --> Pipe --> Feat
+    Raw --> Recs
+    Feat --> Recs
+    Recs --> App
+    App --> AutoR
+    AutoR -->|"ALTER WAREHOUSE"| SF
+    AutoR --> App
+    App --> API
+    API --> UI
+    API --> MCP
+    CLI --> App
+    CLI --> Sources
+    CLI --> Pipe
+    CLI --> Recs
+    CLI --> AutoR
+```
+
+## Source-tree map
+
+```
+src/snowtuner/
+├── cli.py                    # Click CLI — every user-facing command
+├── format.py                 # Display helpers (credit-delta formatting)
+├── storage/
+│   ├── db.py                 # DuckDB singleton + paths (~/.snowtuner/snowtuner.duckdb)
+│   └── schema.py             # ALL DDL + forward-only migrations (single source of truth)
+├── credentials/
+│   ├── model.py              # SnowflakeCredentials + AuthMethod enum
+│   ├── env_backend.py        # SNOWTUNER_SNOWFLAKE_* env-var loader
+│   ├── keyring_backend.py    # OS keychain (macOS/Windows/desktop Linux)
+│   ├── file_backend.py       # ~/.snowtuner/creds.toml fallback (mode 0600)
+│   ├── keypair.py            # RSA keygen for the SNOWTUNER_SVC service user
+│   └── resolver.py           # tiered resolver: env → keyring → file
+├── ingestion/
+│   ├── base.py               # Source ABC + SnowflakeClient Protocol + SyncResult
+│   ├── snowflake_client.py   # Lazy snowflake-connector wrapper
+│   ├── sync.py               # sync_all(): per-source error isolation + watermarks
+│   └── sources/
+│       ├── query_history.py
+│       ├── warehouse_metering.py
+│       ├── warehouse_events.py
+│       └── warehouses.py     # Uses execute_with_columns; SHOW WAREHOUSES col order varies
+├── features/
+│   ├── base.py               # FeatureTransform ABC + FeaturePipeline (topo-sorted)
+│   ├── sqlglot_utils.py      # parameterized_hash, AST feature vectors
+│   └── library/
+│       ├── warehouse_idle_gaps.py
+│       └── query_families.py
+├── actions/
+│   ├── base.py               # Action ABC: target_resource, to_sql, apply, etc.
+│   ├── alter_warehouse.py    # The action type used by both built-in recommenders
+│   ├── create_warehouse.py   # Stub (v0.2)
+│   ├── routing_rule.py       # Stub (v0.2)
+│   ├── local_table.py        # Stub (v0.2)
+│   └── registry.py           # Action subclass dispatch by ActionType
+├── recommendations/
+│   ├── model.py              # Recommendation, EvidenceRef, Impact
+│   └── store.py              # CRUD over app.recommendations (incl. supersede semantics)
+├── recommenders/
+│   ├── base.py               # Recommender ABC + TrainingGate ABC
+│   ├── registry.py           # In-process registration (no entry-points discovery)
+│   ├── sizes.py              # Snowflake size ladder + alias normalization + credits/memory
+│   ├── training_state.py     # CRUD over app.training_state (per-recommender)
+│   └── builtins/
+│       ├── auto_suspend_survival.py   # Cost-minimizing AUTO_SUSPEND tuner (registered)
+│       ├── auto_suspend_tuner.py      # Earlier p25-heuristic version (kept for contrast)
+│       ├── rule_based_right_sizer.py  # WAREHOUSE_SIZE rule-based tuner (registered)
+│       └── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
+├── orchestrator/
+│   └── runner.py             # End-to-end: sync → features → predict → autonomous
+├── autonomous/
+│   ├── config.py             # AutonomousConfigStore (per (action, warehouse))
+│   ├── applications.py       # AutonomousApplicationStore (audit log + rollback)
+│   └── runner.py             # AutonomousRunner: gate → cooldown → apply → record
+├── api/
+│   ├── app.py                # FastAPI factory; endpoints group by domain
+│   └── schemas.py            # Pydantic I/O models (RecommendationOut etc.)
+├── ui/
+│   └── app.py                # Streamlit — talks to API, never DuckDB directly
+├── mcp/
+│   ├── __init__.py
+│   └── admin.py              # 13 MCP tools wrapping the FastAPI for Claude Desktop
+└── seed/
+    └── generate.py           # Synthetic data for demo + dev (6 warehouses)
+```
+
+## Key abstractions
+
+### `Action` (actions/base.py)
+
+A typed description of something snowtuner proposes the user do. Subclasses
+own their own SQL rendering, dry-run preview, validation, and (for
+autonomous-eligible types) `apply()`.
+
+- `target_resource() -> str` — used to deduplicate proposals. For
+  `AlterWarehouse`, scoped by knob set so `AUTO_SUSPEND` and `WAREHOUSE_SIZE`
+  proposals on the same warehouse don't clobber each other.
+- `target_warehouse_name() -> str | None` — used by autonomous-mode config
+  matching. Named with `_name` so it doesn't shadow the
+  `target_warehouse: str` Pydantic field on `CreateRoutingRule`.
+- `supports_autonomous_apply() -> bool` — gate for the autonomous runner.
+- `apply(client) -> str` — execute against Snowflake, return SQL run.
+
+Adding a new action type means subclassing `Action`, registering in
+`actions/registry.py`, and (if autonomous-eligible) implementing `apply()`.
+
+### `FeatureTransform` + `FeaturePipeline` (features/base.py)
+
+Each transform declares the DuckDB tables it reads (`inputs`) and writes
+(`outputs`). The pipeline topologically sorts transforms by I/O so
+upstream-feeding transforms run first. This is how feature engineering
+stays composable without an orchestration framework.
+
+```python
+class WarehouseIdleGapsTransform(FeatureTransform):
+    name = "warehouse_idle_gaps"
+    inputs = {"raw.query_history", "raw.warehouse_events_history"}
+    outputs = {"features.warehouse_idle_gaps"}
+    def run(self, conn): ...
+```
+
+### `Recommender` + `TrainingGate` (recommenders/base.py)
+
+A recommender encapsulates one inference strategy. Two pieces:
+
+- `TrainingGate.evaluate(conn) -> ReadinessReport` — "do we have enough data
+  to make recommendations?" Returns `is_ready` + a human-readable reason.
+  Each recommender owns its own gate.
+- `Recommender.fit(conn) -> dict` — compute and return a JSON-serializable
+  state dict. Persisted to `app.training_state`.
+- `Recommender.predict(conn, model_state) -> list[Recommendation]` — emit
+  recommendations.
+
+The orchestrator runs `fit` whether the gate is ready or not (so the model
+keeps refining), but only runs `predict` once it is.
+
+See [docs/recommenders.md](recommenders.md) for the contributor walkthrough.
+
+### `AutonomousRunner` (autonomous/runner.py)
+
+Walks open `PROPOSED` recommendations and applies the ones whose
+`(action_type, warehouse)` matches an enabled config row, subject to:
+
+- `confidence ≥ configured threshold`
+- not in cooldown (last apply on same `(action, warehouse)` was ≥ N hours ago)
+- circuit not currently open
+- ≤ N rollbacks in the last 7 days (else: trip circuit, skip)
+- `action.supports_autonomous_apply()` returns True
+
+Every apply records an `app.autonomous_applications` row with the SQL it ran
++ the rollback SQL, then flips the recommendation to `APPLIED`.
+
+## How a typical run works
+
+`snowtuner run --auto` calls `Orchestrator.run()` which does:
+
+1. **Sync** (if `--no-skip-sync`): each `Source` pulls from Snowflake, upserts
+   to `raw.*`, updates `app.sync_watermarks`. Per-source error isolation —
+   one failing source doesn't kill the others.
+2. **Feature pipeline**: each `FeatureTransform` runs in topological order,
+   writing to `features.*`.
+3. **Per-recommender loop**:
+   - Evaluate `TrainingGate`. If not ready: fit anyway (cache state), skip predict.
+   - If ready: supersede prior open proposals from this recommender, then predict.
+   - For each new proposal: insert into `app.recommendations`, then
+     supersede any other open proposal for the same `(action_type, target_resource)`.
+4. **Autonomous pass** (if `--auto` and at least one config enabled): walk
+   open `PROPOSED`, apply where the gates allow.
+
+The `RunReport` returned at each step is what the CLI/UI/MCP report on.
+
+## Three DuckDB schemas
+
+- **`raw.*`** — mirrors of Snowflake `ACCOUNT_USAGE` views and `SHOW WAREHOUSES`.
+  Append-only (mostly); `raw.warehouses` is a full-refresh snapshot.
+- **`features.*`** — derived tables produced by `FeatureTransform`s.
+  Recomputed each run; safe to drop and rebuild.
+- **`app.*`** — application state: recommendations, training, watermarks,
+  routing rules, autonomous config, autonomous applications. The "memory" of
+  the system across runs.
+
+See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
+
+## Things that look weird and why
+
+- **No SQLAlchemy.** All DDL is raw SQL in `storage/schema.py`. DuckDB is fast
+  enough that the overhead of an ORM isn't worth it; all queries are explicit
+  parameterized SQL. Trade-off: schema migrations are hand-written.
+
+- **No FOREIGN KEY constraints** even though semantic relationships exist
+  (e.g. `app.autonomous_applications.recommendation_id`). DuckDB enforces FKs
+  but the cost in DDL complexity wasn't worth it for v0.1; we accept the
+  occasional orphan row and clean up in migrations as needed.
+
+- **Schema migrations are forward-only and shape-detecting.** When the
+  shape of `raw.warehouse_events_history` changed twice during development,
+  the migration in `storage/schema.py:_pre_create_migrations` detects pre-v3
+  shape and DROPs the table so the DDL recreates it. Acceptable because
+  `raw.*` is fully repopulatable from a sync.
+
+- **`raw.warehouses.size` returns a non-canonical string** (e.g. `"X-Small"`
+  rather than `"XSMALL"`) because Snowflake's `SHOW WAREHOUSES` does. The
+  `recommenders/sizes.py:normalize` function handles aliases.
+
+- **Two right-sizing recommenders, only one registered.** `RuleBasedRightSizer`
+  ships in `default_registry`. `SpillAwareRightSizer` is the alternative — both
+  target the same `(action_type, target_resource)`, so running both
+  simultaneously would have them mutually-supersede each other's proposals.
+  v0.2 will add proper ensemble logic; for now, swap by editing
+  `recommenders/registry.py`.
+
+- **`AutonomousRunner` reads `app.recommendations`, not the in-memory
+  `RunReport`** from the recommender step that just ran. This is intentional:
+  it means autonomous-apply works the same whether you run `snowtuner run --auto`
+  (one process) or run the recommenders one day, manually inspect, and run
+  autonomous separately the next.
