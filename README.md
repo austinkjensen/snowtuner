@@ -6,7 +6,7 @@ Connects to your Snowflake account (read-mostly, dedicated service user), ingest
 
 For warehouses where you trust the algorithm, you can flip a per-warehouse switch to **autonomous mode** — snowtuner applies new recommendations on its own, with a cooldown between changes and a circuit breaker that pauses autonomy after too many rollbacks. Every autonomous change records a rollback statement so you can revert with one click.
 
-> **Status:** v0.1. Single-account, advisory-by-default, autonomous-mode opt-in. Not yet recommended for unattended production use. See the [v0.2 roadmap](#v02-roadmap) below.
+> **Status:** v0.1 shipped (recommenders + autonomous-apply). v0.2 in flight: replay-experiments framework and Queries explorer are landing now. Single-account, advisory-by-default, autonomous-mode opt-in. Not yet recommended for unattended production use. See the [roadmap](#roadmap) below.
 
 ---
 
@@ -20,28 +20,32 @@ snowtuner exists to:
 2. **Run entirely on your infrastructure.** No outbound calls except to your Snowflake account.
 3. **Make autonomous-apply a free-tier feature, not a paid one.** The narrative "advisory → autonomous" is the product, not the paywall.
 
-## What it does today (v0.1)
+## What it does today
 
 | Capability | Status |
 |---|---|
-| Ingests `QUERY_HISTORY`, `WAREHOUSE_METERING_HISTORY`, `WAREHOUSE_EVENTS_HISTORY`, and `SHOW WAREHOUSES` into local DuckDB | ✅ |
-| **AUTO_SUSPEND tuning** via cost-minimizing survival analysis on reactivation gaps | ✅ |
-| **Warehouse right-sizing** (`WAREHOUSE_SIZE` only) via transparent rules + alternative spill-aware model | ✅ |
-| Per-(action_type, warehouse) **autonomous-apply** with cooldown and circuit breaker | ✅ |
-| One-click **rollback** of autonomous applications | ✅ |
-| HTTP API (FastAPI), Streamlit UI, Admin MCP server (Claude Desktop) | ✅ |
-| Service-user setup with RSA key-pair auth + `bootstrap-sql` generator | ✅ |
-| Multi-cluster tuning (`MIN_CLUSTER_COUNT`, `MAX_CLUSTER_COUNT`, `SCALING_POLICY`) | v0.2 |
-| `CREATE WAREHOUSE` + automatic query routing | v0.2 |
-| Query result caching (DuckDB) + analyst-facing MCP for cost-aware text-to-SQL | v0.2 |
-| Non-destructive query rewrite *suggestions* | v0.2+ |
+| Ingests `QUERY_HISTORY`, `WAREHOUSE_METERING_HISTORY`, `WAREHOUSE_EVENTS_HISTORY`, and `SHOW WAREHOUSES` into local DuckDB | ✅ v0.1 |
+| **AUTO_SUSPEND tuning** via cost-minimizing survival analysis on reactivation gaps | ✅ v0.1 |
+| **Warehouse right-sizing** (`WAREHOUSE_SIZE` only) via transparent rules + alternative spill-aware model | ✅ v0.1 |
+| Per-(action_type, warehouse, knob) **autonomous-apply** with cooldown and circuit breaker | ✅ v0.1 |
+| One-click **rollback** of autonomous applications | ✅ v0.1 |
+| HTTP API (FastAPI) + React web UI + Admin MCP server (Claude Desktop, 22 tools) | ✅ v0.1+ |
+| Service-user setup with RSA key-pair auth + `bootstrap-sql` generator | ✅ v0.1 |
+| **Queries explorer** — filter / drill into ingested query history; family rollup view | ✅ v0.2 |
+| **Replay experiments framework** — in-vitro A/B testing of warehouse configs with paired t-tests, Bonferroni correction, confidence intervals | ✅ v0.2 |
+| **Gen2 / QAS / size sweeps** as preset experiment recipes (`gen1_to_gen2`, `size_sweep_pm1`, `qas_on_off`, `factorial_gen_x_size`) | ✅ v0.2 |
+| Multi-cluster tuning (`MIN_CLUSTER_COUNT`, `MAX_CLUSTER_COUNT`, `SCALING_POLICY`) | roadmap |
+| Saved query groups (static + dynamic) for monitoring and experiment inputs | roadmap |
+| User-built experiment recipes; benchmark-style experiments | roadmap |
+| Snowflake-compatible proxy + caching layer; multi-platform (Snowflake + Databricks) | roadmap |
+| Non-destructive query rewrite *suggestions* | roadmap |
 | Multi-account fleet management, SLO-backed savings, managed hosting | paid tier |
 
-## Quickstart (~5 minutes from install to first recommendation)
+## Quickstart (~10 minutes from install to first recommendation)
 
 ```bash
 # 1. Install
-git clone https://github.com/<your-org>/snowtuner
+git clone https://github.com/austinkjensen/snowtuner
 cd snowtuner
 uv venv && source .venv/bin/activate
 uv pip install -e '.[snowflake]'
@@ -60,11 +64,25 @@ snowtuner verify
 snowtuner sync --lookback-days 14
 snowtuner run
 
-# 6. Review
-snowtuner list                 # terminal
+# 6. Review from the terminal
+snowtuner list                 # list recommendations
 snowtuner status               # ingestion + warehouse summary
-snowtuner ui                   # Streamlit at http://127.0.0.1:8501
+
+# 7. Launch the web UI (two terminals)
+snowtuner api --host 127.0.0.1 --port 8770       # terminal A: backend
+cd web && npm install && npm run dev             # terminal B: Vite at :5173
+# Open http://127.0.0.1:5173 — proxies /api/* to the backend automatically.
 ```
+
+### Optional: experiments framework (v0.2)
+
+The replay-experiments framework needs a separate Snowflake service user with `CREATE WAREHOUSE` privilege. Generate its bootstrap and run as `ACCOUNTADMIN`:
+
+```bash
+snowtuner bootstrap-sql --enable-experiments > experiments-bootstrap.sql
+```
+
+Then grant `SELECT` on whatever databases / tables you want experiments to replay queries against — see the comment block in the generated SQL.
 
 ## Going autonomous (one warehouse at a time)
 
@@ -103,7 +121,12 @@ snowtuner ships with an Admin MCP server. After running `snowtuner api` (the HTT
 
 Then ask Claude things like *"What recommendations are open?"*, *"What's the audit log say about POSIT_TEAM?"*, *"Roll back application #2."*
 
-Tools exposed (13 total): `get_status`, `list_warehouses`, `list_recommendations`, `get_recommendation`, `accept_recommendation`, `reject_recommendation`, `list_recommenders`, `list_autonomous_config`, `enable_autonomous`, `disable_autonomous`, `reset_autonomous_circuit`, `list_autonomous_applications`, `rollback_autonomous_application`.
+Tools exposed (22 total):
+
+- Status / discovery: `get_status`, `list_warehouses`, `list_recommenders`
+- Recommendations: `list_recommendations`, `get_recommendation`, `accept_recommendation`, `reject_recommendation`
+- Autonomous mode: `list_autonomous_config`, `enable_autonomous`, `disable_autonomous`, `reset_autonomous_circuit`, `list_autonomous_applications`, `rollback_autonomous_application`
+- Experiments (v0.2): `list_experiment_recipes`, `list_experiments`, `get_experiment`, `list_experiment_runs`, `propose_experiment`, `accept_experiment`, `reject_experiment`, `run_experiment`, `abort_experiment`
 
 ## How recommenders decide
 
@@ -116,7 +139,7 @@ Both implementations are short single-file modules under `src/snowtuner/recommen
 
 ## Comparison
 
-| | snowtuner (v0.1) | espresso.ai | keebo.ai | greybeam.ai |
+| | snowtuner | espresso.ai | keebo.ai | greybeam.ai |
 |---|---|---|---|---|
 | Open source | Apache 2.0 | — | — | — |
 | Self-hosted | always | — | — | — |
@@ -124,32 +147,28 @@ Both implementations are short single-file modules under `src/snowtuner/recommen
 | Auto-suspend tuning | ✅ | ✅ | ✅ | — |
 | Right-sizing | ✅ (size only) | ✅ | ✅ | — |
 | Autonomous apply | ✅ (free, opt-in) | ✅ | ✅ | — |
-| Multi-cluster + scaling-policy tuning | v0.2 | ✅ | ✅ | — |
-| Routing rules | v0.2 | ✅ | ✅ | — |
-| Query result caching | v0.2 | — | — | ✅ |
-| Cost-aware text-to-SQL via MCP | v0.2 | — | — | — |
+| **Replay experiments framework** (paired t-tests, Bonferroni, CIs) | ✅ v0.2 | — | — | — |
+| **Queries explorer + family rollup** | ✅ v0.2 | — | — | — |
+| Multi-cluster + scaling-policy tuning | roadmap | ✅ | ✅ | — |
+| Query routing + caching | roadmap | ✅ | ✅ | ✅ |
+| Multi-platform (Snowflake + Databricks) | roadmap | — | ✅ | — |
 | Multi-account, SLO guarantees, managed hosting | paid | ✅ | ✅ | ✅ |
 
-## v0.2 roadmap
+## Roadmap
 
-The marquee feature for v0.2 is **the analyst MCP server with query result caching** — the cost-aware text-to-SQL story. When a business user asks Claude (or any LLM agent) a question that translates to SQL, snowtuner sits between Claude and Snowflake:
+**v0.2 (in flight):** the replay-experiments framework and the Queries explorer are shipped. The next slices in this line:
 
-- Caches frequent query results in a separate local DuckDB (5–10 min default TTL, per-rule overrides).
-- Identifies cache candidates automatically (`features.query_families` already feeds this).
-- Routes queries to the right warehouse based on user, role, or query family.
-- Uses each business user's own Snowflake credentials for the actual query — RLS / masking policies pass through cleanly.
-
-Other v0.2 work:
-
+- **Saved query groups** — static (snapshot) and dynamic (filter-defined, live) groups, feeding experiments and ad-hoc analysis.
+- **Benchmark-style experiments** — "compare N configurations against this workload" (no implicit production-warehouse control), distinct from the tuning-experiment flow.
+- **From-scratch recipe builder** — arm-by-arm UI for user-defined experiment templates.
 - **Multi-cluster tuning** (`MIN_CLUSTER_COUNT`, `MAX_CLUSTER_COUNT`, `SCALING_POLICY`).
-- **`CREATE WAREHOUSE`** + automatic routing rule generation (coupled — a new warehouse without routes is dead weight).
-- **Non-destructive rewrite suggestions** ("this predicate could move," "this `SELECT *` could be narrower"). Strictly advisory.
-- **Per-warehouse `MODIFY` GRANT bootstrap** automated via an admin-mode MCP tool that runs the GRANT against an admin-credentialed session.
+
+**v0.3+ (strategic direction):** the longer-term play is a **Snowflake-compatible proxy + caching layer**, multi-platform (Snowflake + Databricks), with BYOC deployment for regulated industries. The proxy unlocks in-vivo experiments on live traffic (with the experiments framework providing the statistical inference) and structurally larger savings via query routing / caching, rather than warehouse-config tuning alone.
 
 What stays explicitly out of scope:
 
 - **Automatic query rewriting** (the correctness surface is enormous; we'll surface suggestions, not auto-apply).
-- **Cross-platform arbitrage** (Databricks federation etc.) — paid-tier territory.
+- **Cross-platform arbitrage** (Databricks federation etc.) at the OSS tier — that's paid-tier territory once we get there.
 
 ## Architecture
 
@@ -168,8 +187,13 @@ See [docs/architecture.md](docs/architecture.md) for the full module breakdown a
 
 - snowtuner runs on **your** infrastructure. No outbound calls except to your Snowflake account.
 - Auth uses a **dedicated `SNOWTUNER_SVC` service user** with `TYPE=SERVICE` and **RSA key-pair auth**. Private key lives at `~/.snowtuner/snowtuner_rsa_key.p8` (mode 0600).
-- Privileges granted to `SNOWTUNER_ROLE` for advisory mode are intentionally narrow: `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE` (read `ACCOUNT_USAGE`), `MONITOR USAGE ON ACCOUNT`, and `USAGE/OPERATE/MONITOR ON SNOWTUNER_WH`.
+- Privileges granted to `SNOWTUNER_ROLE` for advisory mode are intentionally narrow:
+  - `IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE` — read `ACCOUNT_USAGE`
+  - `MONITOR USAGE ON ACCOUNT` — `SHOW WAREHOUSES` + account-wide observability
+  - `USAGE / OPERATE / MONITOR ON SNOWTUNER_WH` — run snowtuner's own metadata queries
+  - `DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER` — unredacted `query_text` in `QUERY_HISTORY` (without this, Snowflake redacts text for queries run by roles you haven't been granted, making them invisible to the explorer and unreplayable in experiments). Comment this out in `bootstrap-sql` output for stricter scoping; grant `MONITOR ON WAREHOUSE <name>` per warehouse instead.
 - **Autonomous apply** requires an additional `GRANT MODIFY, OPERATE ON WAREHOUSE <name>` per warehouse, granted by an account admin one warehouse at a time.
+- **Experiments framework** requires a separate `SNOWTUNER_EXP_SVC` user (created by `snowtuner bootstrap-sql --enable-experiments`) with `CREATE WAREHOUSE` privilege, so the engine can provision side-by-side test warehouses. The experiments user has no default warehouse — every operation is explicit.
 - Credentials are stored in your OS keychain by default (`keyring`) with a plaintext-TOML fallback at `~/.snowtuner/creds.toml` (mode 0600) for headless environments.
 
 ## License
@@ -178,4 +202,4 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ## Contributing
 
-This is currently in design-partner mode. Open an issue describing your Snowflake setup and what you wish snowtuner would tell you about it; we'll prioritize accordingly. PRs welcome for the documented [v0.2 roadmap](#v02-roadmap) items.
+This is currently in design-partner mode. Open an issue describing your Snowflake setup and what you wish snowtuner would tell you about it; we'll prioritize accordingly. PRs welcome for the documented [roadmap](#roadmap) items.

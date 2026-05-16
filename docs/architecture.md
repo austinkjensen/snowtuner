@@ -9,12 +9,12 @@ keep it nearby when adding a new recommender or feature transform.
 
 ## The 30-second mental model
 
-Three logical layers, each independently testable. Data flows left to right
-through the layers; the API + UI + MCP are clients of the bottom (`app.*`).
+Four logical layers, each independently testable. Data flows left to right
+through the layers; the API + Web UI + MCP are clients of the bottom (`app.*`).
 
 ```mermaid
 flowchart LR
-    SF[(Snowflake<br/>ACCOUNT_USAGE)]
+    SF[(Snowflake<br/>ACCOUNT_USAGE +<br/>warehouses)]
 
     subgraph "Ingestion"
       direction TB
@@ -25,7 +25,7 @@ flowchart LR
       direction TB
       Raw["raw.*<br/>(mirrors of Snowflake views)"]
       Feat["features.*<br/>(derived tables)"]
-      App["app.*<br/>(recommendations, autonomous,<br/>training_state, watermarks)"]
+      App["app.*<br/>(recommendations, autonomous,<br/>experiments, training_state, watermarks)"]
     end
 
     subgraph "Pipeline"
@@ -33,13 +33,14 @@ flowchart LR
       Pipe["FeaturePipeline<br/>(topo-sorted FeatureTransforms)"]
       Recs["Recommenders<br/>(in-process registry)"]
       AutoR["AutonomousRunner<br/>(cooldown, breaker, apply)"]
+      ExpE["ExperimentEngine<br/>(provision, replay, stats, teardown)"]
     end
 
     subgraph "Surfaces"
       direction TB
       API["FastAPI<br/>(snowtuner api)"]
       CLI["CLI<br/>(snowtuner ...)"]
-      UI["Streamlit UI"]
+      Web["React Web UI<br/>(Vite dev server,<br/>proxies to API)"]
       MCP["Admin MCP<br/>(snowtuner mcp)"]
     end
 
@@ -48,86 +49,117 @@ flowchart LR
     Raw --> Recs
     Feat --> Recs
     Recs --> App
+    Recs -.->|"propose_experiments()"| App
     App --> AutoR
     AutoR -->|"ALTER WAREHOUSE"| SF
     AutoR --> App
+    App --> ExpE
+    ExpE -->|"CREATE/DROP WH +<br/>replay queries"| SF
+    ExpE --> App
     App --> API
-    API --> UI
+    API --> Web
     API --> MCP
     CLI --> App
     CLI --> Sources
     CLI --> Pipe
     CLI --> Recs
     CLI --> AutoR
+    CLI --> ExpE
 ```
+
+The `ExperimentEngine` is the only component besides `AutonomousRunner` that
+*writes* to Snowflake — and unlike autonomous-apply (which alters production
+warehouses), the engine only ever creates and drops disposable test warehouses
+named `SNOWTUNER_EXP_*`.
 
 ## Source-tree map
 
 ```
-src/snowtuner/
-├── cli.py                    # Click CLI — every user-facing command
-├── format.py                 # Display helpers (credit-delta formatting)
-├── storage/
-│   ├── db.py                 # DuckDB singleton + paths (~/.snowtuner/snowtuner.duckdb)
-│   └── schema.py             # ALL DDL + forward-only migrations (single source of truth)
-├── credentials/
-│   ├── model.py              # SnowflakeCredentials + AuthMethod enum
-│   ├── env_backend.py        # SNOWTUNER_SNOWFLAKE_* env-var loader
-│   ├── keyring_backend.py    # OS keychain (macOS/Windows/desktop Linux)
-│   ├── file_backend.py       # ~/.snowtuner/creds.toml fallback (mode 0600)
-│   ├── keypair.py            # RSA keygen for the SNOWTUNER_SVC service user
-│   └── resolver.py           # tiered resolver: env → keyring → file
-├── ingestion/
-│   ├── base.py               # Source ABC + SnowflakeClient Protocol + SyncResult
-│   ├── snowflake_client.py   # Lazy snowflake-connector wrapper
-│   ├── sync.py               # sync_all(): per-source error isolation + watermarks
-│   └── sources/
-│       ├── query_history.py
-│       ├── warehouse_metering.py
-│       ├── warehouse_events.py
-│       └── warehouses.py     # Uses execute_with_columns; SHOW WAREHOUSES col order varies
-├── features/
-│   ├── base.py               # FeatureTransform ABC + FeaturePipeline (topo-sorted)
-│   ├── sqlglot_utils.py      # parameterized_hash, AST feature vectors
-│   └── library/
-│       ├── warehouse_idle_gaps.py
-│       └── query_families.py
-├── actions/
-│   ├── base.py               # Action ABC: target_resource, to_sql, apply, etc.
-│   ├── alter_warehouse.py    # The action type used by both built-in recommenders
-│   ├── create_warehouse.py   # Stub (v0.2)
-│   ├── routing_rule.py       # Stub (v0.2)
-│   ├── local_table.py        # Stub (v0.2)
-│   └── registry.py           # Action subclass dispatch by ActionType
-├── recommendations/
-│   ├── model.py              # Recommendation, EvidenceRef, Impact
-│   └── store.py              # CRUD over app.recommendations (incl. supersede semantics)
-├── recommenders/
-│   ├── base.py               # Recommender ABC + TrainingGate ABC
-│   ├── registry.py           # In-process registration (no entry-points discovery)
-│   ├── sizes.py              # Snowflake size ladder + alias normalization + credits/memory
-│   ├── training_state.py     # CRUD over app.training_state (per-recommender)
-│   └── builtins/
-│       ├── auto_suspend_survival.py   # Cost-minimizing AUTO_SUSPEND tuner (registered)
-│       ├── auto_suspend_tuner.py      # Earlier p25-heuristic version (kept for contrast)
-│       ├── rule_based_right_sizer.py  # WAREHOUSE_SIZE rule-based tuner (registered)
-│       └── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
-├── orchestrator/
-│   └── runner.py             # End-to-end: sync → features → predict → autonomous
-├── autonomous/
-│   ├── config.py             # AutonomousConfigStore (per (action, warehouse))
-│   ├── applications.py       # AutonomousApplicationStore (audit log + rollback)
-│   └── runner.py             # AutonomousRunner: gate → cooldown → apply → record
-├── api/
-│   ├── app.py                # FastAPI factory; endpoints group by domain
-│   └── schemas.py            # Pydantic I/O models (RecommendationOut etc.)
-├── ui/
-│   └── app.py                # Streamlit — talks to API, never DuckDB directly
-├── mcp/
-│   ├── __init__.py
-│   └── admin.py              # 13 MCP tools wrapping the FastAPI for Claude Desktop
-└── seed/
-    └── generate.py           # Synthetic data for demo + dev (6 warehouses)
+snowtuner/
+├── src/snowtuner/            # Python package
+│   ├── cli.py                # Click CLI — every user-facing command
+│   ├── format.py             # Display helpers (credit-delta formatting)
+│   ├── storage/
+│   │   ├── db.py             # Thread-safe DuckDB via per-thread cursors
+│   │   └── schema.py         # ALL DDL + forward-only migrations (single source of truth)
+│   ├── credentials/
+│   │   ├── model.py          # SnowflakeCredentials + AuthMethod enum
+│   │   ├── env_backend.py    # SNOWTUNER_SNOWFLAKE_* env-var loader
+│   │   ├── keyring_backend.py# OS keychain (macOS/Windows/desktop Linux)
+│   │   ├── file_backend.py   # ~/.snowtuner/creds.toml fallback (mode 0600)
+│   │   ├── keypair.py        # RSA keygen for the SNOWTUNER_SVC service user
+│   │   └── resolver.py       # tiered resolver: env → keyring → file
+│   ├── ingestion/
+│   │   ├── base.py           # Source ABC + SnowflakeClient Protocol + SyncResult
+│   │   ├── snowflake_client.py  # Lazy snowflake-connector wrapper
+│   │   ├── sync.py           # sync_all(): per-source error isolation + watermarks
+│   │   └── sources/
+│   │       ├── query_history.py
+│   │       ├── warehouse_metering.py
+│   │       ├── warehouse_events.py
+│   │       └── warehouses.py # Uses execute_with_columns; SHOW WAREHOUSES col order varies
+│   ├── features/
+│   │   ├── base.py           # FeatureTransform ABC + FeaturePipeline (topo-sorted)
+│   │   ├── sqlglot_utils.py  # parameterized_hash, AST feature vectors
+│   │   └── library/
+│   │       ├── warehouse_idle_gaps.py
+│   │       └── query_families.py
+│   ├── actions/
+│   │   ├── base.py           # Action ABC: target_resource, to_sql, apply, etc.
+│   │   ├── alter_warehouse.py# The action type used by both built-in recommenders
+│   │   ├── create_warehouse.py  # Stub (roadmap)
+│   │   ├── routing_rule.py   # Stub (roadmap — proxy direction)
+│   │   ├── local_table.py    # Stub (roadmap — caching direction)
+│   │   └── registry.py       # Action subclass dispatch by ActionType
+│   ├── recommendations/
+│   │   ├── model.py          # Recommendation, EvidenceRef, Impact
+│   │   └── store.py          # CRUD over app.recommendations (supersede semantics)
+│   ├── recommenders/
+│   │   ├── base.py           # Recommender ABC + TrainingGate ABC + propose_experiments hook
+│   │   ├── registry.py       # In-process registration (no entry-points discovery)
+│   │   ├── sizes.py          # Snowflake size ladder + alias normalization + credits/memory
+│   │   ├── training_state.py # CRUD over app.training_state (per-recommender)
+│   │   └── builtins/
+│   │       ├── auto_suspend_survival.py   # Cost-minimizing AUTO_SUSPEND tuner (registered)
+│   │       ├── auto_suspend_tuner.py      # Earlier p25-heuristic version (kept for contrast)
+│   │       ├── rule_based_right_sizer.py  # WAREHOUSE_SIZE rule-based tuner (registered)
+│   │       └── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
+│   ├── experiments/           # v0.2 — replay-experiments framework
+│   │   ├── axes.py            # Generation / QASState enums
+│   │   ├── config_delta.py    # WarehouseConfigDelta + WarehouseConfig (merge, render)
+│   │   ├── arm.py             # Arm = (name, delta, eligibility_issues)
+│   │   ├── eligibility.py     # check_arm_eligibility(arm, control, AccountInfo)
+│   │   ├── cost_estimate.py   # Variance-banded experiment cost; savings projection
+│   │   ├── sampling.py        # StratifiedByFamily query sampler
+│   │   ├── recipes.py         # Preset arm sets (gen1_to_gen2, size_sweep_pm1, ...)
+│   │   ├── derive.py          # Winning arm → list[Action] for recommendation derivation
+│   │   ├── model.py           # ProposedExperiment, Experiment, ExperimentReport, RunStatus
+│   │   ├── provisioning.py    # Create / drop SNOWTUNER_EXP_* test warehouses
+│   │   ├── replay.py          # Per-query replay primitive (cache off, metric fetch)
+│   │   ├── stats.py           # Paired t-test + Bonferroni + 95% CIs + best-arm selection
+│   │   ├── engine.py          # ExperimentEngine: orchestrates a full run end-to-end
+│   │   └── store.py           # CRUD over app.experiments + app.experiment_runs
+│   ├── orchestrator/
+│   │   └── runner.py         # End-to-end: sync → features → predict → propose_experiments → autonomous
+│   ├── autonomous/
+│   │   ├── config.py         # AutonomousConfigStore (per (action, warehouse, knob))
+│   │   ├── applications.py   # AutonomousApplicationStore (audit log + rollback)
+│   │   └── runner.py         # AutonomousRunner: gate → cooldown → apply → record
+│   ├── api/
+│   │   ├── app.py            # FastAPI factory; endpoints group by domain
+│   │   └── schemas.py        # Pydantic I/O models (RecommendationOut, ExperimentOut, QueryRow, ...)
+│   ├── ui/
+│   │   └── app.py            # Streamlit (legacy; React UI under web/ is primary)
+│   ├── mcp/
+│   │   └── admin.py          # 22 MCP tools (status, recs, autonomous, experiments) over the FastAPI
+│   └── seed/
+│       └── generate.py       # Synthetic data for demo + dev (6 warehouses)
+└── web/                       # React + Vite + TanStack Router web UI
+    ├── src/
+    │   ├── routes/            # File-based routing (recommendations, warehouses, queries, experiments)
+    │   ├── components/        # Shared UI (top-nav, sheets, ui primitives)
+    │   └── lib/api.ts         # Typed client over the FastAPI surface
+    └── vite.config.ts         # Proxies /api/* → 127.0.0.1:8770 in dev
 ```
 
 ## Key abstractions
@@ -196,6 +228,53 @@ Walks open `PROPOSED` recommendations and applies the ones whose
 Every apply records an `app.autonomous_applications` row with the SQL it ran
 + the rollback SQL, then flips the recommendation to `APPLIED`.
 
+### `ExperimentEngine` + experiment primitives (experiments/)
+
+Where recommenders make *observational* claims ("based on history, do X"),
+experiments make *interventional* ones ("we tried Y on a clone of your
+warehouse and measured the result"). The framework has two layers:
+
+**Primitives** — the typed vocabulary that recipes and recommenders use to
+describe an experiment:
+
+- `WarehouseConfigDelta` — typed "diff from control" (size, generation, qas_state,
+  qas_max_scale_factor). Empty delta = inherit everything from control.
+- `Arm` = `(name, delta, eligibility_issues)`. One cell of the experiment matrix.
+- `check_arm_eligibility(arm, control, AccountInfo)` — pre-flight against
+  Snowflake's compatibility matrix (Gen2 region, size cap, QAS edition, etc.).
+  Returns issues with `error` (blocks) or `warning` (surfaces but allows).
+- `StratifiedByFamily` — sampling strategy: rank query families by
+  `frequency × mean_elapsed`, pick representative queries per family.
+- `recipes.PRESET_RECIPES` — preset constructors (`gen1_to_gen2`,
+  `size_sweep_pm1`, `qas_on_off`, `factorial_gen_x_size`) that build arm sets
+  for common comparisons.
+
+**Engine** — `ExperimentEngine` walks an ACCEPTED experiment through its full
+lifecycle:
+
+1. Sample fresh queries via the configured sampling strategy.
+2. Persist test warehouse names to `app.experiments.test_warehouses` *before*
+   the CREATE — so crash recovery (`recover_orphaned_warehouses()`) can clean
+   up after a process death.
+3. Provision one test warehouse per arm (`SNOWTUNER_EXP_{id}_{arm_name}`).
+4. Mark experiment `RUNNING`, run replay loop:
+   - For each (rep, query, arm) tuple in alternation, switch warehouse and
+     execute the query.
+   - Fetch metrics from `INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION`.
+   - Record an `ExperimentRun` row.
+   - After each (query, rep) pass: compute a leading-indicator cost (elapsed
+     × credit_rate), compare against the cap, abort if hit.
+5. Aggregate runs via `stats.aggregate()`: paired t-tests, Bonferroni
+   correction, 95% CIs, best-arm selection on credits-CI-upper-bound < 0 AND
+   p95 latency regression ≤ 10%. Persist the resulting `ExperimentReport`.
+6. Tear down test warehouses; mark experiment `COMPLETED`.
+
+`Recommender.propose_experiments(conn, model_state) -> list[ProposedExperiment]`
+is the hook by which a recommender can defer commitment when its confidence
+is low — instead of (or alongside) emitting a recommendation, it proposes an
+experiment that, if accepted and run, produces a confident derived
+recommendation via `derive_actions(arm, control) -> list[Action]`.
+
 ## How a typical run works
 
 `snowtuner run --auto` calls `Orchestrator.run()` which does:
@@ -210,10 +289,21 @@ Every apply records an `app.autonomous_applications` row with the SQL it ran
    - If ready: supersede prior open proposals from this recommender, then predict.
    - For each new proposal: insert into `app.recommendations`, then
      supersede any other open proposal for the same `(action_type, target_resource)`.
+   - Call `propose_experiments()`. For each `ProposedExperiment` returned,
+     insert into `app.experiments` with status `PROPOSED`. Surfaced in the UI
+     for human acceptance.
 4. **Autonomous pass** (if `--auto` and at least one config enabled): walk
-   open `PROPOSED`, apply where the gates allow.
+   open `PROPOSED` recommendations, apply where the gates allow.
 
 The `RunReport` returned at each step is what the CLI/UI/MCP report on.
+
+**Experiment execution is *not* part of `snowtuner run`** — it's a separate,
+on-demand flow. An accepted experiment is run via `snowtuner experiments run
+<id>`, or by clicking "Run" in the web UI (which spawns the engine in a
+background thread off the API process). This separation is deliberate:
+experiments are expensive (test warehouses + replay queries) and require
+their own credentials (`SNOWTUNER_EXP_SVC`), so they aren't safe to bundle
+into a cron-friendly batch flow.
 
 ## Three DuckDB schemas
 
@@ -221,9 +311,15 @@ The `RunReport` returned at each step is what the CLI/UI/MCP report on.
   Append-only (mostly); `raw.warehouses` is a full-refresh snapshot.
 - **`features.*`** — derived tables produced by `FeatureTransform`s.
   Recomputed each run; safe to drop and rebuild.
-- **`app.*`** — application state: recommendations, training, watermarks,
-  routing rules, autonomous config, autonomous applications. The "memory" of
-  the system across runs.
+- **`app.*`** — application state: the "memory" of the system across runs.
+  Includes:
+  - `recommendations` + `autonomous_config` + `autonomous_applications` (v0.1)
+  - `experiments` + `experiment_runs` (v0.2) — the `experiments` row carries the
+    `ProposedExperiment` as a JSON `spec` blob plus first-class columns for
+    things we filter / aggregate by (status, target_warehouse, cost columns,
+    lifecycle timestamps). `experiment_runs` is one row per `(arm, query, rep)`
+    replay with elapsed / spill / credits captured at completion.
+  - `training_state`, `sync_watermarks` — operational metadata.
 
 See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
 
@@ -252,11 +348,46 @@ See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
   ships in `default_registry`. `SpillAwareRightSizer` is the alternative — both
   target the same `(action_type, target_resource)`, so running both
   simultaneously would have them mutually-supersede each other's proposals.
-  v0.2 will add proper ensemble logic; for now, swap by editing
-  `recommenders/registry.py`.
+  Proper ensemble / voting logic is on the roadmap; for now, swap by editing
+  `recommenders/registry.py`. The experiments framework is the more rigorous
+  way to choose between them: propose a tuning experiment on a warehouse,
+  let the report tell you which size recommendation actually wins.
 
 - **`AutonomousRunner` reads `app.recommendations`, not the in-memory
   `RunReport`** from the recommender step that just ran. This is intentional:
   it means autonomous-apply works the same whether you run `snowtuner run --auto`
   (one process) or run the recommenders one day, manually inspect, and run
   autonomous separately the next.
+
+- **DuckDB connections are per-thread, not singleton.** `DuckDBPyConnection`
+  is not thread-safe; concurrent calls from multiple threads SIGSEGV the
+  process. FastAPI runs sync handlers in a worker threadpool, so we hit this
+  immediately under real load. `storage/db.py` opens one master connection
+  and uses `master.cursor()` to mint per-thread "duplicate" connections via
+  `threading.local`. Each cursor has the full `DuckDBPyConnection` API and is
+  safe to use from its own thread. This is what DuckDB's docs recommend.
+
+- **`ProposedExperiment` is stored as a JSON blob in `app.experiments.spec`,
+  not normalized.** The engine roundtrips it via Pydantic
+  (`model_dump_json` / `model_validate_json`). We denormalize only the
+  columns we actually filter / aggregate by (status, target_warehouse,
+  cost_estimate, lifecycle timestamps). Trade-off: you can't `SELECT
+  spec.arms[0].name FROM app.experiments` ergonomically, but we never need
+  to — the spec is opaque to anyone except the engine. The benefit is that
+  adding a new field to `ProposedExperiment` doesn't require a migration.
+
+- **Single-experiment-at-a-time invariant.** `ExperimentStore.has_running_experiment()`
+  returns true if any experiment is in `ACCEPTED` or `RUNNING`. The accept
+  endpoint and CLI both consult this before transitioning state. The reason:
+  the engine provisions warehouses named `SNOWTUNER_EXP_{id}_*` and the
+  cleanup janitor (`recover_orphaned_warehouses()`) trusts that naming
+  convention to find orphans. Concurrent experiments would step on each
+  other's warehouses if they happened to collide on names. v0.2 keeps it
+  simple; later versions can lift this if needed.
+
+- **Two web UIs in the source tree.** `src/snowtuner/ui/app.py` is the
+  original Streamlit (launched by `snowtuner ui`). The primary UI is now the
+  React app under `web/`, served by Vite in dev (port 5173) and built as a
+  static SPA for prod. Streamlit is kept because some users prefer a single
+  `pip install` to running a Node toolchain; we may retire it once feature
+  parity is confirmed and the React build is bundled in the wheel.

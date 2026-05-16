@@ -21,6 +21,28 @@ class ExperimentStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class ExperimentKind(str, Enum):
+    """What problem the experiment is trying to solve.
+
+    Two kinds, distinguished by what's anchored:
+
+    ``TUNING`` — anchored to a specific warehouse.  We're asking
+    "how should *this* warehouse change?"  The control arm is implicit
+    (the warehouse's current config); non-control arms are *deltas* on
+    top of that config.  Produces a recommendation if a winning arm is
+    found.
+
+    ``BENCHMARK`` — anchored to a workload.  We're asking "across these
+    N candidate configurations, which performs best on this set of
+    queries?"  Arms are *absolute* configs; control is optional (one of
+    the arms may be designated as reference, or none).  Produces a
+    benchmark report; doesn't directly emit a recommendation since
+    there's no specific warehouse being optimized.
+    """
+    TUNING = "tuning"
+    BENCHMARK = "benchmark"
+
+
 class ProposedExperiment(BaseModel):
     """What a recommender (or a user via the UI) proposes when more data is
     needed before recommending.
@@ -28,38 +50,73 @@ class ProposedExperiment(BaseModel):
     Mirrors the role ``Recommendation`` plays for advisory output.  Frozen
     once accepted — the engine reads from this same spec to drive the run.
     """
-    recipe_name: str            # which preset constructed this
-    target_warehouse: str       # control warehouse (UPPERCASE)
-    hypothesis: str             # plain-English statement
-    arms: list[Arm]             # always includes the control arm
-    sample_size: int            # number of distinct queries to sample
-    reps_per_arm: int           # repetitions per (arm, query) pair
+    kind: ExperimentKind = ExperimentKind.TUNING
+    recipe_name: str            # which preset constructed this; "user_built" for from-scratch
+    target_warehouse: str | None = None
+        # TUNING:   required — the warehouse being optimized (also workload source + control)
+        # BENCHMARK: optional — if set, the workload source; never used as control
+    workload_warehouse: str | None = None
+        # BENCHMARK only — explicit workload source.  Falls back to target_warehouse
+        # when None.  In v1 we only support "queries from one warehouse"; a saved
+        # query group ref will land here in a later slice.
+    control_arm_name: str | None = "control"
+        # TUNING:   always "control" (the implicit empty-delta arm)
+        # BENCHMARK: arm name designated as reference baseline, or None for no control
+    hypothesis: str
+    arms: list[Arm]             # TUNING includes implicit control; BENCHMARK is whatever the user built
+    sample_size: int
+    reps_per_arm: int
     cost_estimate: CostEstimate
     eligibility_issues: list[Issue] = Field(default_factory=list)
     proposed_by: str            # recommender name@version, or 'user' for UI-built
 
 
 class ArmObservation(BaseModel):
-    """Aggregated metrics for a single non-control arm vs the control arm."""
+    """Aggregated metrics for a single arm.
+
+    Carries two complementary views:
+
+    1. **Absolute stats** (always populated): the arm's own mean/p50/p95
+       elapsed and per-query credits.  Used by the benchmark Pareto-frontier
+       ranking and shown on every report regardless of kind.
+    2. **Delta stats** (populated only when there's a control to pair
+       against): mean/p50/p95 of (arm_elapsed - control_elapsed) and per-query
+       credit deltas, plus Bonferroni-corrected p-values.  Used by the
+       tuning best-arm rule.
+    """
     arm_name: str
     n_queries_run: int
     n_queries_failed: int
     n_queries_excluded: int
 
-    # Paired-test deltas vs control.  Negative elapsed/credits = improvement.
-    elapsed_ms_delta_mean: float
-    elapsed_ms_delta_p50: float
-    elapsed_ms_delta_p95: float
-    elapsed_ms_delta_ci_low: float
-    elapsed_ms_delta_ci_high: float
+    # ── Absolute stats (always populated) ───────────────────────────
+    elapsed_ms_mean: float = 0.0
+    elapsed_ms_p50: float = 0.0
+    elapsed_ms_p95: float = 0.0
+    credits_per_query_mean: float = 0.0
 
-    credits_per_query_delta_mean: float
-    credits_per_query_delta_ci_low: float
-    credits_per_query_delta_ci_high: float
+    # ── Paired-test deltas vs control ────────────────────────────────
+    # Negative elapsed/credits = improvement vs control.
+    # All zero when there's no control (benchmark experiments without a
+    # designated reference arm).
+    elapsed_ms_delta_mean: float = 0.0
+    elapsed_ms_delta_p50: float = 0.0
+    elapsed_ms_delta_p95: float = 0.0
+    elapsed_ms_delta_ci_low: float = 0.0
+    elapsed_ms_delta_ci_high: float = 0.0
+
+    credits_per_query_delta_mean: float = 0.0
+    credits_per_query_delta_ci_low: float = 0.0
+    credits_per_query_delta_ci_high: float = 0.0
 
     # Bonferroni-corrected p-value for "this arm differs from control."
     elapsed_p_value_corrected: float | None = None
     credits_p_value_corrected: float | None = None
+
+    # ── Pareto-frontier metadata (benchmark only) ────────────────────
+    # True if this arm is on the Pareto frontier of (credits_per_query_mean,
+    # elapsed_ms_p95) — no other arm dominates it on both metrics.
+    is_pareto_optimal: bool = False
 
 
 class ExperimentReport(BaseModel):

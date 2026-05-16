@@ -139,13 +139,40 @@ class ExperimentEngine:
 
         provisioned: list[ProvisionedArm] = []
         try:
-            # Step 1: look up control config and sample queries.
-            control_config = self._load_control_config(exp.proposed.target_warehouse)
-            sampled = self._sample_queries(exp.proposed.target_warehouse, exp.proposed.sample_size)
+            # Step 1: resolve workload source + control config, sample queries.
+            #
+            # Workload source rules:
+            #   TUNING:    queries come from target_warehouse (always set)
+            #   BENCHMARK: queries come from workload_warehouse (or target_warehouse
+            #              if the user specified it as the workload source)
+            workload_wh = (
+                exp.proposed.workload_warehouse
+                or exp.proposed.target_warehouse
+            )
+            if not workload_wh:
+                self.store.set_status(
+                    experiment_id, ExperimentStatus.FAILED,
+                    aborted_reason="no workload source: experiment has neither "
+                                   "target_warehouse nor workload_warehouse set",
+                )
+                return
+
+            # Control config: TUNING reads from raw.warehouses so arm deltas
+            # can merge against it; BENCHMARK uses an empty WarehouseConfig
+            # because arms specify their full config (the merge is then a
+            # no-op pass-through of the arm's delta values).
+            from snowtuner.experiments.model import ExperimentKind
+            if exp.proposed.kind == ExperimentKind.TUNING:
+                control_config = self._load_control_config(exp.proposed.target_warehouse)
+            else:
+                control_config = WarehouseConfig(name="__BENCHMARK_NO_CONTROL__")
+
+            sampled = self._sample_queries(workload_wh, exp.proposed.sample_size)
             if not sampled:
                 self.store.set_status(
                     experiment_id, ExperimentStatus.FAILED,
-                    aborted_reason="no queries available to sample from query_history",
+                    aborted_reason=f"no queries available to sample from "
+                                   f"query_history for warehouse {workload_wh!r}",
                 )
                 return
 
@@ -180,16 +207,27 @@ class ExperimentEngine:
 
             # Step 5: build report from runs.
             runs = self.store.runs_for(experiment_id)
-            control_arm = next(a for a in exp.proposed.arms if a.is_control)
-            non_control = [a.name for a in exp.proposed.arms if not a.is_control]
             # Allocate credits over runs proportional to elapsed.
             self._allocate_credits_to_runs(runs, provisioned)
+
+            # Control-arm resolution:
+            #   TUNING:    the implicit empty-delta arm (Arm.is_control == True)
+            #   BENCHMARK: whichever arm the user designated, or None
+            control_arm_name = exp.proposed.control_arm_name
+            if exp.proposed.kind == ExperimentKind.TUNING and control_arm_name is None:
+                control_arm_name = next(
+                    (a.name for a in exp.proposed.arms if a.is_control), None,
+                )
+            non_control = [
+                a.name for a in exp.proposed.arms if a.name != control_arm_name
+            ]
 
             report = aggregate(
                 experiment_id=experiment_id,
                 runs=runs,
-                control_arm_name=control_arm.name,
+                control_arm_name=control_arm_name,
                 non_control_arms=non_control,
+                kind=exp.proposed.kind,
             )
             self.store.set_report(experiment_id, report)
             self.store.set_status(experiment_id, ExperimentStatus.COMPLETED)

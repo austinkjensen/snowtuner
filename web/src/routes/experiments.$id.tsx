@@ -58,6 +58,8 @@ function ExperimentDetail() {
   if (exp.error) return <div className="p-6 text-sm text-destructive">{String(exp.error)}</div>
   if (!exp.data) return null
   const e = exp.data
+  const linkedWh = e.proposed.target_warehouse ?? e.proposed.workload_warehouse
+  const whRelation = e.proposed.kind === 'benchmark' ? 'workload from' : 'on'
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -69,14 +71,19 @@ function ExperimentDetail() {
         <h1 className="text-2xl font-semibold">
           Experiment #{e.id} · {e.proposed.recipe_name}
         </h1>
+        <Badge variant={e.proposed.kind === 'tuning' ? 'secondary' : 'outline'}>
+          {e.proposed.kind}
+        </Badge>
         <StatusBadge status={e.status} />
-        <Link
-          to="/warehouses/$name"
-          params={{ name: e.proposed.target_warehouse }}
-          className="ml-2 text-sm text-primary hover:underline"
-        >
-          on {e.proposed.target_warehouse} →
-        </Link>
+        {linkedWh && (
+          <Link
+            to="/warehouses/$name"
+            params={{ name: linkedWh }}
+            className="ml-2 text-sm text-primary hover:underline"
+          >
+            {whRelation} {linkedWh} →
+          </Link>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -233,6 +240,7 @@ function ExperimentDetail() {
 
 function ReportCard({ experiment }: { experiment: Experiment }) {
   const r = experiment.report!
+  const isBenchmark = experiment.proposed.kind === 'benchmark'
   return (
     <Card className="mt-4">
       <CardHeader>
@@ -247,7 +255,9 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
       </CardHeader>
       <CardContent className="space-y-4">
         <div>
-          <div className="text-sm font-medium">Best arm</div>
+          <div className="text-sm font-medium">
+            {isBenchmark ? 'Pareto-optimal pick' : 'Best arm'}
+          </div>
           {r.best_arm_name ? (
             <div className="mt-1">
               <Badge variant="default" className="mr-2">
@@ -257,8 +267,9 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
             </div>
           ) : (
             <div className="mt-1 text-sm text-muted-foreground">
-              No arm satisfies the win criteria (credits savings with confidence AND no
-              unacceptable p95 latency regression).
+              {isBenchmark
+                ? 'No arm produced successful runs.'
+                : 'No arm satisfies the win criteria (credits savings with confidence AND no unacceptable p95 latency regression).'}
             </div>
           )}
         </div>
@@ -281,41 +292,84 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
             </div>
           )}
 
-        <table className="w-full text-sm">
-          <thead className="border-b text-left text-xs uppercase text-muted-foreground">
-            <tr>
-              <th className="px-2 py-2">Arm</th>
-              <th className="px-2 py-2 text-right">n</th>
-              <th className="px-2 py-2 text-right">Δ elapsed (ms)</th>
-              <th className="px-2 py-2 text-right">95% CI</th>
-              <th className="px-2 py-2 text-right">Δ credits/q</th>
-              <th className="px-2 py-2 text-right">p (corrected)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {r.arms.map((a) => (
-              <tr key={a.arm_name} className="border-b">
-                <td className="px-2 py-2 font-mono">{a.arm_name}</td>
-                <td className="px-2 py-2 text-right">{a.n_queries_run}</td>
-                <td className="px-2 py-2 text-right font-mono">
-                  {a.elapsed_ms_delta_mean.toFixed(0)}
-                </td>
-                <td className="px-2 py-2 text-right font-mono text-xs">
-                  [{a.elapsed_ms_delta_ci_low.toFixed(0)},{' '}
-                  {a.elapsed_ms_delta_ci_high.toFixed(0)}]
-                </td>
-                <td className="px-2 py-2 text-right font-mono">
-                  {a.credits_per_query_delta_mean.toFixed(5)}
-                </td>
-                <td className="px-2 py-2 text-right font-mono text-xs">
-                  {a.credits_p_value_corrected != null
-                    ? formatP(a.credits_p_value_corrected)
-                    : '—'}
-                </td>
+        {isBenchmark ? (
+          /* Benchmark: absolute stats per arm + Pareto markers */
+          <table className="w-full text-sm">
+            <thead className="border-b text-left text-xs uppercase text-muted-foreground">
+              <tr>
+                <th className="px-2 py-2">Arm</th>
+                <th className="px-2 py-2 text-right">n</th>
+                <th className="px-2 py-2 text-right">Mean elapsed (ms)</th>
+                <th className="px-2 py-2 text-right">p95 elapsed (ms)</th>
+                <th className="px-2 py-2 text-right">Credits / query</th>
+                <th className="px-2 py-2">Frontier</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {r.arms.map((a) => (
+                <tr key={a.arm_name} className="border-b">
+                  <td className="px-2 py-2 font-mono">{a.arm_name}</td>
+                  <td className="px-2 py-2 text-right">{a.n_queries_run}</td>
+                  <td className="px-2 py-2 text-right font-mono">
+                    {a.elapsed_ms_mean.toFixed(0)}
+                  </td>
+                  <td className="px-2 py-2 text-right font-mono">
+                    {a.elapsed_ms_p95.toFixed(0)}
+                  </td>
+                  <td className="px-2 py-2 text-right font-mono">
+                    {a.credits_per_query_mean.toFixed(5)}
+                  </td>
+                  <td className="px-2 py-2">
+                    {a.is_pareto_optimal ? (
+                      <Badge variant="default" className="text-xs">
+                        ★ Pareto
+                      </Badge>
+                    ) : (
+                      <span className="text-muted-foreground text-xs">dominated</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          /* Tuning: paired deltas vs control */
+          <table className="w-full text-sm">
+            <thead className="border-b text-left text-xs uppercase text-muted-foreground">
+              <tr>
+                <th className="px-2 py-2">Arm</th>
+                <th className="px-2 py-2 text-right">n</th>
+                <th className="px-2 py-2 text-right">Δ elapsed (ms)</th>
+                <th className="px-2 py-2 text-right">95% CI</th>
+                <th className="px-2 py-2 text-right">Δ credits/q</th>
+                <th className="px-2 py-2 text-right">p (corrected)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {r.arms.map((a) => (
+                <tr key={a.arm_name} className="border-b">
+                  <td className="px-2 py-2 font-mono">{a.arm_name}</td>
+                  <td className="px-2 py-2 text-right">{a.n_queries_run}</td>
+                  <td className="px-2 py-2 text-right font-mono">
+                    {a.elapsed_ms_delta_mean.toFixed(0)}
+                  </td>
+                  <td className="px-2 py-2 text-right font-mono text-xs">
+                    [{a.elapsed_ms_delta_ci_low.toFixed(0)},{' '}
+                    {a.elapsed_ms_delta_ci_high.toFixed(0)}]
+                  </td>
+                  <td className="px-2 py-2 text-right font-mono">
+                    {a.credits_per_query_delta_mean.toFixed(5)}
+                  </td>
+                  <td className="px-2 py-2 text-right font-mono text-xs">
+                    {a.credits_p_value_corrected != null
+                      ? formatP(a.credits_p_value_corrected)
+                      : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
 
         {r.sample_size_warnings.length > 0 && (
           <div className="rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3">

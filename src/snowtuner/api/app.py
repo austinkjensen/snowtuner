@@ -21,15 +21,22 @@ Endpoints
   GET  /experiments                      List experiments
   GET  /experiments/{id}                 One experiment
   GET  /experiments/{id}/runs            Per-(arm,query,rep) observations
-  POST /experiments/propose              Propose via a preset recipe
+  POST /experiments/propose              Propose tuning experiment via a preset recipe
+  POST /experiments/propose-benchmark    Propose benchmark experiment (absolute-config arms)
   POST /experiments/{id}/accept          Mark ACCEPTED
   POST /experiments/{id}/reject          Mark REJECTED
   POST /experiments/{id}/run             Start engine (background thread)
   POST /experiments/{id}/abort           Mark ABORTED (best-effort engine signal)
+  GET  /queries                          List ingested queries (filtered, paginated)
+  GET  /queries/facets                   Distinct values for filter chips
+  GET  /queries/{id}                     Full detail for one query
+  GET  /query-families                   Aggregated rollup by parameterized hash
 """
 from __future__ import annotations
 
 import threading
+from datetime import datetime
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
@@ -38,9 +45,16 @@ from snowtuner.api.schemas import (
     AutonomousApplicationOut,
     AutonomousConfigOut,
     AutonomousConfigUpsert,
+    BenchmarkArmSpec,
     CredentialStatusOut,
     CredentialVerifyOut,
+    ProposeBenchmarkRequest,
     ProposeExperimentRequest,
+    QueryDetail,
+    QueryFamily,
+    QueryFilterFacets,
+    QueryListResponse,
+    QueryRow,
     RecipeInfo,
     RecommendationOut,
     RecommenderInfo,
@@ -532,6 +546,130 @@ def create_app() -> FastAPI:
         new_id = store.insert(proposed)
         return store.get(new_id)  # type: ignore[return-value]
 
+    @app.post("/experiments/propose-benchmark", response_model=Experiment)
+    def propose_benchmark_experiment(
+        req: ProposeBenchmarkRequest,
+        store: ExperimentStore = Depends(_experiment_store),
+    ) -> Experiment:
+        """Propose a benchmark-kind experiment: compare N absolute configurations
+        against a workload.
+
+        Distinct from `/experiments/propose` because:
+          - No recipe — arms are user-built
+          - No target warehouse to clone control from — arms are absolute
+          - Workload source is explicit (workload_warehouse), not derived
+        """
+        # Validate the workload warehouse exists in our local raw.warehouses.
+        workload_wh = _load_warehouse_config(req.workload_warehouse)
+        if workload_wh is None:
+            raise HTTPException(
+                404,
+                f"workload warehouse {req.workload_warehouse!r} not found in "
+                f"raw.warehouses; run a sync first",
+            )
+        if len(req.arms) < 2:
+            raise HTTPException(
+                422, "benchmark experiments need at least 2 arms to compare",
+            )
+        if req.control_arm_name and req.control_arm_name not in {a.name for a in req.arms}:
+            raise HTTPException(
+                422,
+                f"control_arm_name {req.control_arm_name!r} is not one of the "
+                f"submitted arms: {[a.name for a in req.arms]}",
+            )
+
+        # Build Arms from the spec.  Benchmark arms are full configs encoded
+        # as deltas (every field set); merge() against an empty control will
+        # pass them through verbatim at engine time.
+        from snowtuner.experiments.arm import Arm
+        from snowtuner.experiments.axes import Generation, QASState
+        from snowtuner.experiments.config_delta import WarehouseConfigDelta
+        from snowtuner.experiments.eligibility import check_arm_eligibility
+        from snowtuner.experiments.model import (
+            ExperimentKind,
+            ProposedExperiment,
+        )
+        from snowtuner.experiments.cost_estimate import (
+            CostEstimate,
+            estimate_experiment_cost,
+        )
+        from snowtuner.recommenders.sizes import credit_rate, normalize as normalize_size
+
+        built_arms: list[Arm] = []
+        for spec in req.arms:
+            size = normalize_size(spec.size) if spec.size else None
+            generation = Generation(spec.generation) if spec.generation else None
+            qas_state = QASState(spec.qas_state.lower()) if spec.qas_state else None
+            delta = WarehouseConfigDelta(
+                size=size,
+                generation=generation,
+                qas_state=qas_state,
+                qas_max_scale_factor=spec.qas_max_scale_factor,
+            )
+            arm = Arm.from_delta(delta, name=spec.name)
+            built_arms.append(arm)
+
+        # Run eligibility on each arm against the workload warehouse's config
+        # (used as a stand-in "context"; not as a control source — benchmark
+        # arms don't inherit from it).
+        account = _account_info()
+        for arm in built_arms:
+            arm.eligibility_issues = check_arm_eligibility(arm, workload_wh, account)
+
+        runnable_arms = [a for a in built_arms if not a.has_blocking_issues]
+        if len(runnable_arms) < 2:
+            blocked = [
+                {"arm": a.name, "issues": [
+                    {"severity": i.severity, "message": i.message}
+                    for i in a.eligibility_issues
+                ]}
+                for a in built_arms if a.has_blocking_issues
+            ]
+            raise HTTPException(
+                422,
+                f"after eligibility, fewer than 2 arms can run.  Blocked: {blocked}",
+            )
+
+        # Cost estimate.  Each arm's credit rate comes from its own size
+        # (or XSMALL fallback if unset).
+        sample_stats = _sample_query_stats(req.workload_warehouse, limit=req.sample_size)
+        arm_rates = {
+            a.name: credit_rate(a.delta.size or "XSMALL") for a in runnable_arms
+        }
+        if sample_stats:
+            cost_estimate = estimate_experiment_cost(
+                sample_query_stats=sample_stats,
+                arm_credit_rates_per_hour=arm_rates,
+                reps_per_arm=req.reps_per_arm,
+            )
+        else:
+            cost_estimate = CostEstimate(
+                low_credits=0.0, high_credits=0.0,
+                rationale="cost not estimated (no historical query stats for this workload)",
+            )
+
+        warning_issues = [
+            i for a in runnable_arms for i in a.eligibility_issues
+            if i.severity == "warning"
+        ]
+
+        proposed = ProposedExperiment(
+            kind=ExperimentKind.BENCHMARK,
+            recipe_name="user_built_benchmark",
+            target_warehouse=None,
+            workload_warehouse=req.workload_warehouse.upper(),
+            control_arm_name=req.control_arm_name,
+            hypothesis=req.hypothesis,
+            arms=runnable_arms,
+            sample_size=req.sample_size,
+            reps_per_arm=req.reps_per_arm,
+            cost_estimate=cost_estimate,
+            eligibility_issues=warning_issues,
+            proposed_by="user",
+        )
+        new_id = store.insert(proposed)
+        return store.get(new_id)  # type: ignore[return-value]
+
     @app.post("/experiments/{experiment_id}/accept", response_model=Experiment)
     def accept_experiment(
         experiment_id: int,
@@ -639,6 +777,222 @@ def create_app() -> FastAPI:
         )
         return store.get(experiment_id)  # type: ignore[return-value]
 
+    # ── Queries explorer ──────────────────────────────────────────
+    @app.get("/queries", response_model=QueryListResponse)
+    def list_queries(
+        warehouse: str | None = Query(None, description="Comma-separated warehouse names"),
+        user: str | None = Query(None, description="Comma-separated user names"),
+        query_type: str | None = Query(None, description="Comma-separated query types"),
+        status: str | None = Query(None, description="Comma-separated execution statuses"),
+        parameterized_hash: str | None = Query(None, description="Filter to one family"),
+        start_from: datetime | None = Query(None, description="start_time >= this"),
+        start_to: datetime | None = Query(None, description="start_time <= this"),
+        min_elapsed_ms: int | None = Query(None, ge=0),
+        max_elapsed_ms: int | None = Query(None, ge=0),
+        has_remote_spill: bool | None = Query(None),
+        has_local_spill: bool | None = Query(None),
+        has_queueing: bool | None = Query(None),
+        search: str | None = Query(None, description="Substring search over query text (case-insensitive)"),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> QueryListResponse:
+        where, params = _build_query_filter(
+            warehouse=warehouse, user=user, query_type=query_type, status=status,
+            parameterized_hash=parameterized_hash,
+            start_from=start_from, start_to=start_to,
+            min_elapsed_ms=min_elapsed_ms, max_elapsed_ms=max_elapsed_ms,
+            has_remote_spill=has_remote_spill, has_local_spill=has_local_spill,
+            has_queueing=has_queueing, search=search,
+        )
+        where_sql = f"WHERE {where}" if where else ""
+        conn = get_connection()
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM raw.query_history {where_sql}", params,
+        ).fetchone()[0])
+        rows = conn.execute(
+            f"""
+            SELECT query_id, query_text, query_type, execution_status,
+                   user_name, role_name, warehouse_name, warehouse_size,
+                   start_time, total_elapsed_ms, bytes_scanned,
+                   bytes_spilled_to_local, bytes_spilled_to_remote,
+                   queued_overload_ms, query_parameterized_hash
+            FROM raw.query_history
+            {where_sql}
+            ORDER BY start_time DESC NULLS LAST
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        ).fetchall()
+        return QueryListResponse(
+            rows=[QueryRow(
+                query_id=r[0],
+                query_text_preview=_truncate(r[1], 200),
+                query_type=r[2], execution_status=r[3],
+                user_name=r[4], role_name=r[5],
+                warehouse_name=r[6], warehouse_size=r[7],
+                start_time=r[8], total_elapsed_ms=r[9],
+                bytes_scanned=r[10],
+                bytes_spilled_to_local=r[11], bytes_spilled_to_remote=r[12],
+                queued_overload_ms=r[13],
+                query_parameterized_hash=r[14],
+            ) for r in rows],
+            total=total, limit=limit, offset=offset,
+        )
+
+    @app.get("/queries/facets", response_model=QueryFilterFacets)
+    def query_facets(
+        lookback_days: int = Query(30, ge=1, le=365),
+    ) -> QueryFilterFacets:
+        """Distinct filter values from the last N days of query history.
+
+        Scoped to a window so we don't surface long-departed users / decommissioned
+        warehouses in the filter chips.
+        """
+        conn = get_connection()
+        scope = f"start_time >= now() - INTERVAL {lookback_days} DAYS"
+
+        def _distinct(col: str) -> list[str]:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT {col}
+                FROM raw.query_history
+                WHERE {scope} AND {col} IS NOT NULL
+                ORDER BY {col}
+                """
+            ).fetchall()
+            return [str(r[0]) for r in rows]
+
+        return QueryFilterFacets(
+            warehouses=_distinct("warehouse_name"),
+            users=_distinct("user_name"),
+            query_types=_distinct("query_type"),
+            execution_statuses=_distinct("execution_status"),
+        )
+
+    @app.get("/queries/{query_id}", response_model=QueryDetail)
+    def get_query(query_id: str) -> QueryDetail:
+        row = get_connection().execute(
+            """
+            SELECT query_id, query_text, query_type, execution_status,
+                   user_name, role_name, warehouse_name, warehouse_size,
+                   database_name, schema_name, start_time, end_time,
+                   total_elapsed_ms, compilation_ms, execution_ms,
+                   queued_overload_ms, queued_provisioning_ms,
+                   bytes_scanned, bytes_spilled_to_local, bytes_spilled_to_remote,
+                   query_parameterized_hash
+            FROM raw.query_history
+            WHERE query_id = ?
+            """,
+            [query_id],
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, f"query {query_id!r} not found")
+        return QueryDetail(
+            query_id=row[0], query_text=row[1] or "",
+            query_type=row[2], execution_status=row[3],
+            user_name=row[4], role_name=row[5],
+            warehouse_name=row[6], warehouse_size=row[7],
+            database_name=row[8], schema_name=row[9],
+            start_time=row[10], end_time=row[11],
+            total_elapsed_ms=row[12],
+            compilation_ms=row[13], execution_ms=row[14],
+            queued_overload_ms=row[15], queued_provisioning_ms=row[16],
+            bytes_scanned=row[17],
+            bytes_spilled_to_local=row[18], bytes_spilled_to_remote=row[19],
+            query_parameterized_hash=row[20],
+        )
+
+    @app.get("/query-families", response_model=list[QueryFamily])
+    def list_query_families(
+        warehouse: str | None = Query(None, description="Comma-separated warehouse names"),
+        user: str | None = Query(None, description="Comma-separated user names"),
+        query_type: str | None = Query(None, description="Comma-separated query types"),
+        status: str | None = Query(None, description="Comma-separated execution statuses"),
+        start_from: datetime | None = Query(None),
+        start_to: datetime | None = Query(None),
+        min_elapsed_ms: int | None = Query(None, ge=0),
+        max_elapsed_ms: int | None = Query(None, ge=0),
+        has_remote_spill: bool | None = Query(None),
+        has_local_spill: bool | None = Query(None),
+        search: str | None = Query(None),
+        limit: int = Query(50, ge=1, le=500),
+    ) -> list[QueryFamily]:
+        """Aggregated rollup by query_parameterized_hash.
+
+        Default sort: total_elapsed_ms DESC (the "biggest cost contributors first"
+        view — same impact ranking the experiments sampler uses internally).
+        """
+        where, params = _build_query_filter(
+            warehouse=warehouse, user=user, query_type=query_type, status=status,
+            parameterized_hash=None,
+            start_from=start_from, start_to=start_to,
+            min_elapsed_ms=min_elapsed_ms, max_elapsed_ms=max_elapsed_ms,
+            has_remote_spill=has_remote_spill, has_local_spill=has_local_spill,
+            has_queueing=None, search=search,
+        )
+        # Families need a non-null hash.
+        where = f"({where} AND query_parameterized_hash IS NOT NULL)" if where \
+            else "query_parameterized_hash IS NOT NULL"
+
+        rows = get_connection().execute(
+            f"""
+            WITH filtered AS (
+                SELECT * FROM raw.query_history WHERE {where}
+            ),
+            ranked AS (
+                SELECT
+                    query_parameterized_hash,
+                    query_id,
+                    query_text,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY query_parameterized_hash
+                        ORDER BY start_time DESC
+                    ) AS rn
+                FROM filtered
+            ),
+            reps AS (
+                SELECT query_parameterized_hash, query_id, query_text
+                FROM ranked WHERE rn = 1
+            )
+            SELECT
+                f.query_parameterized_hash,
+                reps.query_id,
+                reps.query_text,
+                COUNT(*) AS occurrence_count,
+                AVG(f.total_elapsed_ms) AS mean_elapsed_ms,
+                quantile_cont(f.total_elapsed_ms, 0.95) AS p95_elapsed_ms,
+                SUM(f.total_elapsed_ms) AS total_elapsed_ms,
+                SUM(f.bytes_scanned) AS total_bytes_scanned,
+                SUM(CASE WHEN f.bytes_spilled_to_remote > 0 THEN 1 ELSE 0 END) AS n_spill_remote,
+                SUM(CASE WHEN f.execution_status <> 'SUCCESS' THEN 1 ELSE 0 END) AS n_failed,
+                MIN(f.start_time) AS first_seen,
+                MAX(f.start_time) AS last_seen,
+                COUNT(DISTINCT f.warehouse_name) AS distinct_warehouses,
+                COUNT(DISTINCT f.user_name) AS distinct_users
+            FROM filtered f
+            JOIN reps USING (query_parameterized_hash)
+            GROUP BY f.query_parameterized_hash, reps.query_id, reps.query_text
+            ORDER BY total_elapsed_ms DESC NULLS LAST
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+        return [QueryFamily(
+            query_parameterized_hash=r[0],
+            representative_query_id=r[1],
+            representative_sql=_truncate(r[2], 300),
+            occurrence_count=int(r[3]),
+            mean_elapsed_ms=float(r[4]) if r[4] is not None else None,
+            p95_elapsed_ms=float(r[5]) if r[5] is not None else None,
+            total_elapsed_ms=int(r[6]) if r[6] is not None else None,
+            total_bytes_scanned=int(r[7]) if r[7] is not None else None,
+            n_spill_remote=int(r[8] or 0),
+            n_failed=int(r[9] or 0),
+            first_seen=r[10], last_seen=r[11],
+            distinct_warehouses=int(r[12] or 0),
+            distinct_users=int(r[13] or 0),
+        ) for r in rows]
+
     # ── Dev helpers ───────────────────────────────────────────────
     @app.post("/seed")
     def seed(req: SeedRequest = SeedRequest()) -> dict[str, int]:
@@ -702,6 +1056,88 @@ def _sample_query_stats(warehouse_name: str, limit: int = 50) -> list[QueryStats
         )
         for r in rows
     ]
+
+
+def _build_query_filter(
+    *,
+    warehouse: str | None,
+    user: str | None,
+    query_type: str | None,
+    status: str | None,
+    parameterized_hash: str | None,
+    start_from: datetime | None,
+    start_to: datetime | None,
+    min_elapsed_ms: int | None,
+    max_elapsed_ms: int | None,
+    has_remote_spill: bool | None,
+    has_local_spill: bool | None,
+    has_queueing: bool | None,
+    search: str | None,
+) -> tuple[str, list[Any]]:
+    """Build a WHERE-clause body (without 'WHERE') + bind params from filter args.
+
+    Multi-value filters accept comma-separated strings ("WH_A,WH_B") and bind
+    each value separately so DuckDB can use indexes.  Returns the empty string
+    if no filters are active.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    def _in_clause(col: str, raw: str | None) -> None:
+        if not raw:
+            return
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        if not values:
+            return
+        placeholders = ", ".join(["?"] * len(values))
+        clauses.append(f"{col} IN ({placeholders})")
+        params.extend(values)
+
+    _in_clause("warehouse_name", warehouse)
+    _in_clause("user_name", user)
+    _in_clause("query_type", query_type)
+    _in_clause("execution_status", status)
+
+    if parameterized_hash:
+        clauses.append("query_parameterized_hash = ?")
+        params.append(parameterized_hash)
+    if start_from:
+        clauses.append("start_time >= ?")
+        params.append(start_from)
+    if start_to:
+        clauses.append("start_time <= ?")
+        params.append(start_to)
+    if min_elapsed_ms is not None:
+        clauses.append("total_elapsed_ms >= ?")
+        params.append(min_elapsed_ms)
+    if max_elapsed_ms is not None:
+        clauses.append("total_elapsed_ms <= ?")
+        params.append(max_elapsed_ms)
+    if has_remote_spill is True:
+        clauses.append("bytes_spilled_to_remote > 0")
+    elif has_remote_spill is False:
+        clauses.append("(bytes_spilled_to_remote IS NULL OR bytes_spilled_to_remote = 0)")
+    if has_local_spill is True:
+        clauses.append("bytes_spilled_to_local > 0")
+    elif has_local_spill is False:
+        clauses.append("(bytes_spilled_to_local IS NULL OR bytes_spilled_to_local = 0)")
+    if has_queueing is True:
+        clauses.append("queued_overload_ms > 0")
+    elif has_queueing is False:
+        clauses.append("(queued_overload_ms IS NULL OR queued_overload_ms = 0)")
+    if search:
+        clauses.append("lower(query_text) LIKE ?")
+        params.append(f"%{search.lower()}%")
+
+    return " AND ".join(clauses), params
+
+
+def _truncate(text: str | None, max_len: int) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
 
 
 def _account_info() -> AccountInfo:

@@ -12,9 +12,11 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as WarehousesRouteImport } from './routes/warehouses'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as RecommendationsRouteImport } from './routes/recommendations'
+import { Route as QueriesRouteImport } from './routes/queries'
 import { Route as ExperimentsRouteImport } from './routes/experiments'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WarehousesIndexRouteImport } from './routes/warehouses.index'
+import { Route as QueriesIndexRouteImport } from './routes/queries.index'
 import { Route as ExperimentsIndexRouteImport } from './routes/experiments.index'
 import { Route as WarehousesNameRouteImport } from './routes/warehouses.$name'
 import { Route as ExperimentsIdRouteImport } from './routes/experiments.$id'
@@ -34,6 +36,11 @@ const RecommendationsRoute = RecommendationsRouteImport.update({
   path: '/recommendations',
   getParentRoute: () => rootRouteImport,
 } as any)
+const QueriesRoute = QueriesRouteImport.update({
+  id: '/queries',
+  path: '/queries',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ExperimentsRoute = ExperimentsRouteImport.update({
   id: '/experiments',
   path: '/experiments',
@@ -48,6 +55,11 @@ const WarehousesIndexRoute = WarehousesIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => WarehousesRoute,
+} as any)
+const QueriesIndexRoute = QueriesIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => QueriesRoute,
 } as any)
 const ExperimentsIndexRoute = ExperimentsIndexRouteImport.update({
   id: '/',
@@ -68,12 +80,14 @@ const ExperimentsIdRoute = ExperimentsIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/experiments': typeof ExperimentsRouteWithChildren
+  '/queries': typeof QueriesRouteWithChildren
   '/recommendations': typeof RecommendationsRoute
   '/settings': typeof SettingsRoute
   '/warehouses': typeof WarehousesRouteWithChildren
   '/experiments/$id': typeof ExperimentsIdRoute
   '/warehouses/$name': typeof WarehousesNameRoute
   '/experiments/': typeof ExperimentsIndexRoute
+  '/queries/': typeof QueriesIndexRoute
   '/warehouses/': typeof WarehousesIndexRoute
 }
 export interface FileRoutesByTo {
@@ -83,18 +97,21 @@ export interface FileRoutesByTo {
   '/experiments/$id': typeof ExperimentsIdRoute
   '/warehouses/$name': typeof WarehousesNameRoute
   '/experiments': typeof ExperimentsIndexRoute
+  '/queries': typeof QueriesIndexRoute
   '/warehouses': typeof WarehousesIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/experiments': typeof ExperimentsRouteWithChildren
+  '/queries': typeof QueriesRouteWithChildren
   '/recommendations': typeof RecommendationsRoute
   '/settings': typeof SettingsRoute
   '/warehouses': typeof WarehousesRouteWithChildren
   '/experiments/$id': typeof ExperimentsIdRoute
   '/warehouses/$name': typeof WarehousesNameRoute
   '/experiments/': typeof ExperimentsIndexRoute
+  '/queries/': typeof QueriesIndexRoute
   '/warehouses/': typeof WarehousesIndexRoute
 }
 export interface FileRouteTypes {
@@ -102,12 +119,14 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/experiments'
+    | '/queries'
     | '/recommendations'
     | '/settings'
     | '/warehouses'
     | '/experiments/$id'
     | '/warehouses/$name'
     | '/experiments/'
+    | '/queries/'
     | '/warehouses/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -117,23 +136,27 @@ export interface FileRouteTypes {
     | '/experiments/$id'
     | '/warehouses/$name'
     | '/experiments'
+    | '/queries'
     | '/warehouses'
   id:
     | '__root__'
     | '/'
     | '/experiments'
+    | '/queries'
     | '/recommendations'
     | '/settings'
     | '/warehouses'
     | '/experiments/$id'
     | '/warehouses/$name'
     | '/experiments/'
+    | '/queries/'
     | '/warehouses/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ExperimentsRoute: typeof ExperimentsRouteWithChildren
+  QueriesRoute: typeof QueriesRouteWithChildren
   RecommendationsRoute: typeof RecommendationsRoute
   SettingsRoute: typeof SettingsRoute
   WarehousesRoute: typeof WarehousesRouteWithChildren
@@ -162,6 +185,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RecommendationsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/queries': {
+      id: '/queries'
+      path: '/queries'
+      fullPath: '/queries'
+      preLoaderRoute: typeof QueriesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/experiments': {
       id: '/experiments'
       path: '/experiments'
@@ -182,6 +212,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/warehouses/'
       preLoaderRoute: typeof WarehousesIndexRouteImport
       parentRoute: typeof WarehousesRoute
+    }
+    '/queries/': {
+      id: '/queries/'
+      path: '/'
+      fullPath: '/queries/'
+      preLoaderRoute: typeof QueriesIndexRouteImport
+      parentRoute: typeof QueriesRoute
     }
     '/experiments/': {
       id: '/experiments/'
@@ -221,6 +258,17 @@ const ExperimentsRouteWithChildren = ExperimentsRoute._addFileChildren(
   ExperimentsRouteChildren,
 )
 
+interface QueriesRouteChildren {
+  QueriesIndexRoute: typeof QueriesIndexRoute
+}
+
+const QueriesRouteChildren: QueriesRouteChildren = {
+  QueriesIndexRoute: QueriesIndexRoute,
+}
+
+const QueriesRouteWithChildren =
+  QueriesRoute._addFileChildren(QueriesRouteChildren)
+
 interface WarehousesRouteChildren {
   WarehousesNameRoute: typeof WarehousesNameRoute
   WarehousesIndexRoute: typeof WarehousesIndexRoute
@@ -238,6 +286,7 @@ const WarehousesRouteWithChildren = WarehousesRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ExperimentsRoute: ExperimentsRouteWithChildren,
+  QueriesRoute: QueriesRouteWithChildren,
   RecommendationsRoute: RecommendationsRoute,
   SettingsRoute: SettingsRoute,
   WarehousesRoute: WarehousesRouteWithChildren,

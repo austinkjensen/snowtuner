@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils'
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard' },
   { to: '/warehouses', label: 'Warehouses' },
+  { to: '/queries', label: 'Queries' },
   { to: '/recommendations', label: 'Recommendations' },
   { to: '/experiments', label: 'Experiments' },
 ] as const

@@ -197,3 +197,118 @@ class AbortExperimentRequest(BaseModel):
     """POST /experiments/{id}/abort body.  Reason is required so the audit
     trail is useful."""
     reason: str
+
+
+class BenchmarkArmSpec(BaseModel):
+    """One arm in a user-built benchmark experiment.
+
+    Each arm fully specifies its config; the engine creates a test warehouse
+    that *is* this config (no merge with a control's current state).  Fields
+    left unset will be defaulted at engine time to sensible values
+    (XSMALL, Gen1, QAS off) so the user doesn't have to specify everything.
+    """
+    name: str
+    size: str | None = None              # e.g. 'XSMALL' through 'X6LARGE'
+    generation: str | None = None        # '1' or '2'
+    qas_state: str | None = None         # 'ON' or 'OFF'
+    qas_max_scale_factor: int | None = None
+
+
+class ProposeBenchmarkRequest(BaseModel):
+    """POST /experiments/propose-benchmark body.
+
+    Distinct endpoint from the recipe-based `propose` because the payload
+    shape is fundamentally different: arms are absolute, not deltas; there's
+    a workload source instead of a target warehouse.
+    """
+    hypothesis: str                       # plain-English statement of what we're testing
+    workload_warehouse: str               # where to sample queries from (v1: a single warehouse)
+    arms: list[BenchmarkArmSpec]
+    control_arm_name: str | None = None   # optional reference arm; None = pure Pareto comparison
+    sample_size: int = 30
+    reps_per_arm: int = 3
+
+
+# ── Queries explorer (v0.2 slice 1) ─────────────────────────────
+
+class QueryRow(BaseModel):
+    """One row in the GET /queries list response — compact, list-view shape."""
+    query_id: str
+    query_text_preview: str   # truncated to ~200 chars for the list
+    query_type: str | None
+    execution_status: str | None
+    user_name: str | None
+    role_name: str | None
+    warehouse_name: str | None
+    warehouse_size: str | None
+    start_time: datetime | None
+    total_elapsed_ms: int | None
+    bytes_scanned: int | None
+    bytes_spilled_to_local: int | None
+    bytes_spilled_to_remote: int | None
+    queued_overload_ms: int | None
+    query_parameterized_hash: str | None
+
+
+class QueryDetail(BaseModel):
+    """Full detail for GET /queries/{id} — everything we have in raw.query_history
+    for one query, used by the side-sheet detail view."""
+    query_id: str
+    query_text: str
+    query_type: str | None
+    execution_status: str | None
+    user_name: str | None
+    role_name: str | None
+    warehouse_name: str | None
+    warehouse_size: str | None
+    database_name: str | None
+    schema_name: str | None
+    start_time: datetime | None
+    end_time: datetime | None
+    total_elapsed_ms: int | None
+    compilation_ms: int | None
+    execution_ms: int | None
+    queued_overload_ms: int | None
+    queued_provisioning_ms: int | None
+    bytes_scanned: int | None
+    bytes_spilled_to_local: int | None
+    bytes_spilled_to_remote: int | None
+    query_parameterized_hash: str | None
+
+
+class QueryFamily(BaseModel):
+    """One row in GET /query-families — the parameterized-hash rollup view.
+
+    A family is a set of queries with the same query_parameterized_hash —
+    same SQL skeleton, different literal values.
+    """
+    query_parameterized_hash: str
+    representative_query_id: str         # one query_id from this family for drilling in
+    representative_sql: str              # truncated preview of one query's text
+    occurrence_count: int
+    mean_elapsed_ms: float | None
+    p95_elapsed_ms: float | None
+    total_elapsed_ms: int | None
+    total_bytes_scanned: int | None
+    n_spill_remote: int
+    n_failed: int
+    first_seen: datetime | None
+    last_seen: datetime | None
+    distinct_warehouses: int
+    distinct_users: int
+
+
+class QueryListResponse(BaseModel):
+    """Wrapped response for GET /queries — includes pagination metadata."""
+    rows: list[QueryRow]
+    total: int                # total matching rows (for pagination UI)
+    limit: int
+    offset: int
+
+
+class QueryFilterFacets(BaseModel):
+    """GET /queries/facets — distinct values for the filter chips."""
+    warehouses: list[str]
+    users: list[str]
+    query_types: list[str]
+    execution_statuses: list[str]

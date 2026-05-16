@@ -21,6 +21,7 @@ from snowtuner.experiments.cost_estimate import CostEstimate
 from snowtuner.experiments.model import (
     ArmObservation,
     Experiment,
+    ExperimentKind,
     ExperimentReport,
     ExperimentRun,
     ExperimentStatus,
@@ -39,6 +40,7 @@ __all__ = [
     "EngineConfig",
     "Experiment",
     "ExperimentEngine",
+    "ExperimentKind",
     "ExperimentReport",
     "ExperimentRun",
     "ExperimentStatus",

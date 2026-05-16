@@ -40,9 +40,28 @@ export type ExperimentStatus =
   | 'FAILED'
   | 'REJECTED'
 
+export type ExperimentKind = 'tuning' | 'benchmark'
+
 export interface RecipeInfo {
   name: string
   summary: string
+}
+
+export interface BenchmarkArmSpec {
+  name: string
+  size?: string | null              // e.g. 'XSMALL' through 'X6LARGE'
+  generation?: string | null        // '1' or '2'
+  qas_state?: string | null         // 'on' or 'off' (case-insensitive on the wire)
+  qas_max_scale_factor?: number | null
+}
+
+export interface ProposeBenchmarkRequest {
+  hypothesis: string
+  workload_warehouse: string
+  arms: BenchmarkArmSpec[]
+  control_arm_name?: string | null
+  sample_size?: number
+  reps_per_arm?: number
 }
 
 export interface CostEstimate {
@@ -73,8 +92,11 @@ export interface Arm {
 }
 
 export interface ProposedExperiment {
+  kind: ExperimentKind
   recipe_name: string
-  target_warehouse: string
+  target_warehouse: string | null
+  workload_warehouse: string | null
+  control_arm_name: string | null
   hypothesis: string
   arms: Arm[]
   sample_size: number
@@ -89,6 +111,12 @@ export interface ArmObservation {
   n_queries_run: number
   n_queries_failed: number
   n_queries_excluded: number
+  // Absolute stats (always populated)
+  elapsed_ms_mean: number
+  elapsed_ms_p50: number
+  elapsed_ms_p95: number
+  credits_per_query_mean: number
+  // Paired-delta stats (zero when no control)
   elapsed_ms_delta_mean: number
   elapsed_ms_delta_p50: number
   elapsed_ms_delta_p95: number
@@ -99,6 +127,8 @@ export interface ArmObservation {
   credits_per_query_delta_ci_high: number
   elapsed_p_value_corrected?: number | null
   credits_p_value_corrected?: number | null
+  // Pareto-frontier flag (benchmark only)
+  is_pareto_optimal: boolean
 }
 
 export interface ExperimentReport {
@@ -132,6 +162,99 @@ export interface Experiment {
   derived_recommendation_id?: number | null
   test_warehouse_names: string[]
   test_warehouses_cleaned: boolean
+}
+
+// ── Queries explorer ──────────────────────────────────────────
+
+export interface QueryRow {
+  query_id: string
+  query_text_preview: string
+  query_type: string | null
+  execution_status: string | null
+  user_name: string | null
+  role_name: string | null
+  warehouse_name: string | null
+  warehouse_size: string | null
+  start_time: string | null
+  total_elapsed_ms: number | null
+  bytes_scanned: number | null
+  bytes_spilled_to_local: number | null
+  bytes_spilled_to_remote: number | null
+  queued_overload_ms: number | null
+  query_parameterized_hash: string | null
+}
+
+export interface QueryDetail {
+  query_id: string
+  query_text: string
+  query_type: string | null
+  execution_status: string | null
+  user_name: string | null
+  role_name: string | null
+  warehouse_name: string | null
+  warehouse_size: string | null
+  database_name: string | null
+  schema_name: string | null
+  start_time: string | null
+  end_time: string | null
+  total_elapsed_ms: number | null
+  compilation_ms: number | null
+  execution_ms: number | null
+  queued_overload_ms: number | null
+  queued_provisioning_ms: number | null
+  bytes_scanned: number | null
+  bytes_spilled_to_local: number | null
+  bytes_spilled_to_remote: number | null
+  query_parameterized_hash: string | null
+}
+
+export interface QueryFamily {
+  query_parameterized_hash: string
+  representative_query_id: string
+  representative_sql: string
+  occurrence_count: number
+  mean_elapsed_ms: number | null
+  p95_elapsed_ms: number | null
+  total_elapsed_ms: number | null
+  total_bytes_scanned: number | null
+  n_spill_remote: number
+  n_failed: number
+  first_seen: string | null
+  last_seen: string | null
+  distinct_warehouses: number
+  distinct_users: number
+}
+
+export interface QueryListResponse {
+  rows: QueryRow[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface QueryFilterFacets {
+  warehouses: string[]
+  users: string[]
+  query_types: string[]
+  execution_statuses: string[]
+}
+
+export interface QueryListFilters {
+  warehouse?: string         // comma-separated
+  user?: string
+  query_type?: string
+  status?: string
+  parameterized_hash?: string
+  start_from?: string
+  start_to?: string
+  min_elapsed_ms?: number
+  max_elapsed_ms?: number
+  has_remote_spill?: boolean
+  has_local_spill?: boolean
+  has_queueing?: boolean
+  search?: string
+  limit?: number
+  offset?: number
 }
 
 export interface ExperimentRun {
@@ -244,6 +367,37 @@ export const api = {
   credentials: () => request<CredentialStatus>('GET', '/credentials'),
   verifyCredentials: () => request<CredentialVerify>('POST', '/credentials/verify'),
 
+  // ── Queries explorer ───────────────────────────────────────────
+  listQueries: (filters?: QueryListFilters) =>
+    request<QueryListResponse>('GET', '/queries', {
+      query: filters
+        ? Object.fromEntries(
+            Object.entries(filters).map(([k, v]) => [
+              k,
+              typeof v === 'boolean' ? String(v) : (v as string | number | undefined),
+            ]),
+          )
+        : undefined,
+    }),
+  getQuery: (id: string) => request<QueryDetail>('GET', `/queries/${encodeURIComponent(id)}`),
+  listQueryFamilies: (
+    filters?: Omit<QueryListFilters, 'parameterized_hash' | 'has_queueing' | 'offset'>,
+  ) =>
+    request<QueryFamily[]>('GET', '/query-families', {
+      query: filters
+        ? Object.fromEntries(
+            Object.entries(filters).map(([k, v]) => [
+              k,
+              typeof v === 'boolean' ? String(v) : (v as string | number | undefined),
+            ]),
+          )
+        : undefined,
+    }),
+  queryFacets: (lookbackDays?: number) =>
+    request<QueryFilterFacets>('GET', '/queries/facets', {
+      query: { lookback_days: lookbackDays },
+    }),
+
   // ── Experiments (v0.2) ─────────────────────────────────────────
   listExperimentRecipes: () => request<RecipeInfo[]>('GET', '/experiments/recipes'),
   listExperiments: (params?: { status?: ExperimentStatus; target_warehouse?: string; limit?: number }) =>
@@ -255,6 +409,8 @@ export const api = {
     request<Experiment>('POST', '/experiments/propose', {
       body: { recipe_name: recipeName, target_warehouse: targetWarehouse },
     }),
+  proposeBenchmarkExperiment: (body: ProposeBenchmarkRequest) =>
+    request<Experiment>('POST', '/experiments/propose-benchmark', { body }),
   acceptExperiment: (id: number) => request<Experiment>('POST', `/experiments/${id}/accept`),
   rejectExperiment: (id: number) => request<Experiment>('POST', `/experiments/${id}/reject`),
   runExperiment: (id: number) => request<Experiment>('POST', `/experiments/${id}/run`),

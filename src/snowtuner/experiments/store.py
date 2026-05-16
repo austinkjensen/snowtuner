@@ -19,6 +19,7 @@ import duckdb
 
 from snowtuner.experiments.model import (
     Experiment,
+    ExperimentKind,
     ExperimentReport,
     ExperimentRun,
     ExperimentStatus,
@@ -29,11 +30,11 @@ from snowtuner.storage.db import naive_utcnow
 
 
 _EXP_COLUMNS = [
-    "id", "recipe_name", "target_warehouse", "hypothesis", "proposed_by",
-    "status", "spec", "cost_estimate", "proposed_at", "accepted_at",
-    "started_at", "completed_at", "aborted_reason", "actual_cost_credits",
-    "cost_cap_hit", "report", "derived_recommendation_id", "test_warehouses",
-    "test_warehouses_cleaned",
+    "id", "kind", "recipe_name", "target_warehouse", "workload_warehouse",
+    "hypothesis", "proposed_by", "status", "spec", "cost_estimate",
+    "proposed_at", "accepted_at", "started_at", "completed_at",
+    "aborted_reason", "actual_cost_credits", "cost_cap_hit", "report",
+    "derived_recommendation_id", "test_warehouses", "test_warehouses_cleaned",
 ]
 
 
@@ -59,14 +60,16 @@ class ExperimentStore:
         row = self.conn.execute(
             """
             INSERT INTO app.experiments
-              (recipe_name, target_warehouse, hypothesis, proposed_by,
-               status, spec, cost_estimate)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (kind, recipe_name, target_warehouse, workload_warehouse,
+               hypothesis, proposed_by, status, spec, cost_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             [
+                proposed.kind.value,
                 proposed.recipe_name,
                 proposed.target_warehouse,
+                proposed.workload_warehouse,
                 proposed.hypothesis,
                 proposed.proposed_by,
                 ExperimentStatus.PROPOSED.value,
@@ -93,6 +96,7 @@ class ExperimentStore:
         *,
         status: ExperimentStatus | None = None,
         target_warehouse: str | None = None,
+        kind: "ExperimentKind | None" = None,
         limit: int = 100,
     ) -> list[Experiment]:
         where: list[str] = []
@@ -103,6 +107,9 @@ class ExperimentStore:
         if target_warehouse is not None:
             where.append("target_warehouse = ?")
             params.append(target_warehouse.upper())
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind.value)
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         params.append(limit)
         cols = ", ".join(_EXP_COLUMNS)

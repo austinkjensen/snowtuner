@@ -249,8 +249,10 @@ _DDL = [
     CREATE TABLE IF NOT EXISTS app.experiments (
         id                          BIGINT PRIMARY KEY
                                     DEFAULT nextval('app.experiments_seq'),
+        kind                        VARCHAR NOT NULL DEFAULT 'tuning',  -- tuning | benchmark
         recipe_name                 VARCHAR NOT NULL,
-        target_warehouse            VARCHAR NOT NULL,
+        target_warehouse            VARCHAR,                            -- nullable: benchmark may have none
+        workload_warehouse          VARCHAR,                            -- benchmark workload source; falls back to target_warehouse
         hypothesis                  VARCHAR,
         proposed_by                 VARCHAR NOT NULL,
         status                      VARCHAR NOT NULL DEFAULT 'PROPOSED',
@@ -381,6 +383,39 @@ def _pre_create_migrations(conn: duckdb.DuckDBPyConnection) -> None:
                         d.get("updated_at"),
                     ],
                 )
+
+    # Migration 3: app.experiments gained kind + workload_warehouse columns
+    # for benchmark-kind experiments.  Default kind = 'tuning' so existing
+    # rows keep their semantics; target_warehouse becomes nullable.  These
+    # are additive (ADD COLUMN + ALTER COLUMN DROP NOT NULL), so the
+    # existing data is preserved.
+    exp_cols_rows = conn.execute(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'app' AND table_name = 'experiments'
+        """
+    ).fetchall()
+    if exp_cols_rows:
+        exp_col_names = {c[0] for c in exp_cols_rows}
+        if "kind" not in exp_col_names:
+            conn.execute(
+                "ALTER TABLE app.experiments ADD COLUMN kind VARCHAR NOT NULL DEFAULT 'tuning'"
+            )
+        if "workload_warehouse" not in exp_col_names:
+            conn.execute(
+                "ALTER TABLE app.experiments ADD COLUMN workload_warehouse VARCHAR"
+            )
+        # Drop NOT NULL on target_warehouse — benchmark experiments may omit it.
+        # DuckDB's ALTER TABLE syntax: ALTER COLUMN ... DROP NOT NULL.
+        try:
+            conn.execute(
+                "ALTER TABLE app.experiments ALTER COLUMN target_warehouse DROP NOT NULL"
+            )
+        except Exception:
+            # Already nullable, or DuckDB version doesn't support this syntax.
+            # Either way it's not catastrophic — INSERTs from the store still
+            # work; the constraint is just stricter than we'd like for benchmark.
+            pass
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:

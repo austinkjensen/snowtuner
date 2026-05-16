@@ -695,6 +695,18 @@ GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE {role};
 
 -- SHOW WAREHOUSES + account-wide observability
 GRANT MONITOR USAGE ON ACCOUNT TO ROLE {role};
+
+-- Unredacted query_text in QUERY_HISTORY across the account.
+-- Without this, Snowflake redacts query_text for queries that were run by
+-- roles snowtuner hasn't been granted MONITOR on — which makes those queries
+-- invisible to the explorer and unreplayable in experiments.  GOVERNANCE_VIEWER
+-- is Snowflake's standard role for "observability across the account" and is
+-- the right default for a self-hosted optimizer (the query text never leaves
+-- your cloud account).
+--
+-- For stricter scoping: comment this out and grant MONITOR per warehouse
+-- instead — e.g. `GRANT MONITOR ON WAREHOUSE ANALYTICS_WH TO ROLE {role};`
+GRANT DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER TO ROLE {role};
 """
 
 

@@ -18,6 +18,7 @@ from scipy import stats as sp_stats
 
 from snowtuner.experiments.model import (
     ArmObservation,
+    ExperimentKind,
     ExperimentReport,
     ExperimentRun,
     RunStatus,
@@ -37,8 +38,9 @@ def aggregate(
     *,
     experiment_id: int,
     runs: list[ExperimentRun],
-    control_arm_name: str,
+    control_arm_name: str | None,
     non_control_arms: list[str],
+    kind: ExperimentKind = ExperimentKind.TUNING,
     objective: str = "minimize_credits_no_latency_regression",
     latency_regression_tolerance: float = DEFAULT_LATENCY_REGRESSION_TOLERANCE,
     annual_query_count_low: float | None = None,
@@ -74,9 +76,11 @@ def aggregate(
         else:
             excluded += 1
 
-    control_rows = by_arm.get(control_arm_name, {})
-    if not control_rows:
-        # No successful control runs — can't compute anything.
+    # Resolve which arms to compute stats for.  For tuning we *require* a
+    # control; for benchmark control is optional.
+    control_rows = by_arm.get(control_arm_name, {}) if control_arm_name else {}
+    if kind == ExperimentKind.TUNING and not control_rows:
+        # No successful control runs — can't compute paired stats.
         return ExperimentReport(
             experiment_id=experiment_id,
             arms=[],
@@ -88,137 +92,189 @@ def aggregate(
             assumptions=_default_assumptions(),
         )
 
-    arm_observations: list[ArmObservation] = []
-    correction_factor = max(1, len(non_control_arms) * 2)  # 2 metrics per arm
+    # The arms we'll report on.  For tuning that's the non-control arms;
+    # for benchmark it's every arm (including any designated control, since
+    # the report is a comparison across all arms).
+    arms_to_observe = list(non_control_arms)
+    if kind == ExperimentKind.BENCHMARK and control_arm_name:
+        # Include the designated reference arm so the report shows its
+        # absolute stats too.
+        arms_to_observe = [control_arm_name, *non_control_arms]
 
-    for arm_name in non_control_arms:
+    arm_observations: list[ArmObservation] = []
+    # Bonferroni correction is computed across paired tests only — irrelevant
+    # for arms with no control.  When there *is* a control we test 2 metrics
+    # × N non-control arms.
+    correction_factor = max(1, len(non_control_arms) * 2) if control_rows else 1
+
+    for arm_name in arms_to_observe:
         arm_rows = by_arm.get(arm_name, {})
+
+        # ── Absolute stats: this arm's own elapsed + credits, no pairing ──
+        abs_elapsed = np.array(
+            [r.elapsed_ms for r in arm_rows.values() if r.elapsed_ms is not None],
+            dtype=float,
+        )
+        abs_credits = np.array(
+            [r.credits_used_estimate for r in arm_rows.values()
+             if r.credits_used_estimate is not None],
+            dtype=float,
+        )
+        abs_elapsed_mean = float(abs_elapsed.mean()) if abs_elapsed.size else 0.0
+        abs_elapsed_p50 = float(np.percentile(abs_elapsed, 50)) if abs_elapsed.size else 0.0
+        abs_elapsed_p95 = float(np.percentile(abs_elapsed, 95)) if abs_elapsed.size else 0.0
+        abs_credits_mean = float(abs_credits.mean()) if abs_credits.size else 0.0
+
+        # ── Paired-delta stats: only meaningful when this arm != control AND
+        # there's a control to pair against ─────────────────────────────────
         elapsed_pairs: list[tuple[float, float]] = []
         credits_pairs: list[tuple[float, float]] = []
         failed_count = 0
-        for key, ctrl in control_rows.items():
-            if key not in arm_rows:
-                failed_count += 1  # treat missing-in-arm as a failure
-                continue
-            a = arm_rows[key]
-            if a.elapsed_ms is None or ctrl.elapsed_ms is None:
-                continue
-            elapsed_pairs.append((float(ctrl.elapsed_ms), float(a.elapsed_ms)))
-            if (
-                a.credits_used_estimate is not None
-                and ctrl.credits_used_estimate is not None
-            ):
-                credits_pairs.append((
-                    float(ctrl.credits_used_estimate),
-                    float(a.credits_used_estimate),
-                ))
+        is_control = (arm_name == control_arm_name)
 
-        n = len(elapsed_pairs)
-        if n < 5:
+        if control_rows and not is_control:
+            for key, ctrl in control_rows.items():
+                if key not in arm_rows:
+                    failed_count += 1
+                    continue
+                a = arm_rows[key]
+                if a.elapsed_ms is None or ctrl.elapsed_ms is None:
+                    continue
+                elapsed_pairs.append((float(ctrl.elapsed_ms), float(a.elapsed_ms)))
+                if (
+                    a.credits_used_estimate is not None
+                    and ctrl.credits_used_estimate is not None
+                ):
+                    credits_pairs.append((
+                        float(ctrl.credits_used_estimate),
+                        float(a.credits_used_estimate),
+                    ))
+
+        n = len(elapsed_pairs) if not is_control else len(arm_rows)
+        if not is_control and n < 5:
             sample_size_warnings.append(
                 f"arm {arm_name!r} has only {n} paired observations; "
                 f"results are not statistically reliable"
             )
 
-        if n == 0:
-            arm_observations.append(ArmObservation(
-                arm_name=arm_name,
-                n_queries_run=0,
-                n_queries_failed=failed_count,
-                n_queries_excluded=0,
-                elapsed_ms_delta_mean=0.0,
-                elapsed_ms_delta_p50=0.0,
-                elapsed_ms_delta_p95=0.0,
-                elapsed_ms_delta_ci_low=0.0,
-                elapsed_ms_delta_ci_high=0.0,
-                credits_per_query_delta_mean=0.0,
-                credits_per_query_delta_ci_low=0.0,
-                credits_per_query_delta_ci_high=0.0,
-            ))
-            continue
+        # Default delta fields to zero (used when no control or arm is control).
+        elapsed_delta_mean = 0.0
+        elapsed_delta_p50 = 0.0
+        elapsed_delta_p95 = 0.0
+        e_ci_low = 0.0
+        e_ci_high = 0.0
+        c_delta_mean = 0.0
+        c_ci_low = 0.0
+        c_ci_high = 0.0
+        e_p_corrected: float | None = None
+        c_p_corrected: float | None = None
 
-        # Paired deltas: arm - control (negative = arm faster/cheaper).
-        elapsed_deltas = np.array([a - c for c, a in elapsed_pairs])
-        elapsed_mean = float(elapsed_deltas.mean())
-        elapsed_p50 = float(np.median(elapsed_deltas))
-        elapsed_p95 = float(np.percentile(elapsed_deltas, 95))
-        e_ci_low, e_ci_high = _ci(elapsed_deltas)
-        e_p = _paired_p_value(elapsed_deltas) if n >= 2 else None
+        if elapsed_pairs:
+            elapsed_deltas = np.array([a - c for c, a in elapsed_pairs])
+            elapsed_delta_mean = float(elapsed_deltas.mean())
+            elapsed_delta_p50 = float(np.median(elapsed_deltas))
+            elapsed_delta_p95 = float(np.percentile(elapsed_deltas, 95))
+            e_ci_low, e_ci_high = _ci(elapsed_deltas)
+            e_p = _paired_p_value(elapsed_deltas) if len(elapsed_deltas) >= 2 else None
+            if e_p is not None:
+                e_p_corrected = min(1.0, e_p * correction_factor)
 
         if credits_pairs:
             credits_deltas = np.array([a - c for c, a in credits_pairs])
-            c_mean = float(credits_deltas.mean())
+            c_delta_mean = float(credits_deltas.mean())
             c_ci_low, c_ci_high = _ci(credits_deltas)
             c_p = _paired_p_value(credits_deltas) if len(credits_deltas) >= 2 else None
-        else:
-            c_mean = 0.0
-            c_ci_low = 0.0
-            c_ci_high = 0.0
-            c_p = None
+            if c_p is not None:
+                c_p_corrected = min(1.0, c_p * correction_factor)
 
         arm_observations.append(ArmObservation(
             arm_name=arm_name,
-            n_queries_run=n,
+            n_queries_run=len(arm_rows),
             n_queries_failed=failed_count,
             n_queries_excluded=0,
-            elapsed_ms_delta_mean=elapsed_mean,
-            elapsed_ms_delta_p50=elapsed_p50,
-            elapsed_ms_delta_p95=elapsed_p95,
+            elapsed_ms_mean=abs_elapsed_mean,
+            elapsed_ms_p50=abs_elapsed_p50,
+            elapsed_ms_p95=abs_elapsed_p95,
+            credits_per_query_mean=abs_credits_mean,
+            elapsed_ms_delta_mean=elapsed_delta_mean,
+            elapsed_ms_delta_p50=elapsed_delta_p50,
+            elapsed_ms_delta_p95=elapsed_delta_p95,
             elapsed_ms_delta_ci_low=e_ci_low,
             elapsed_ms_delta_ci_high=e_ci_high,
-            credits_per_query_delta_mean=c_mean,
+            credits_per_query_delta_mean=c_delta_mean,
             credits_per_query_delta_ci_low=c_ci_low,
             credits_per_query_delta_ci_high=c_ci_high,
-            elapsed_p_value_corrected=(
-                min(1.0, e_p * correction_factor) if e_p is not None else None
-            ),
-            credits_p_value_corrected=(
-                min(1.0, c_p * correction_factor) if c_p is not None else None
-            ),
+            elapsed_p_value_corrected=e_p_corrected,
+            credits_p_value_corrected=c_p_corrected,
         ))
 
-    # Determine best arm via the requested objective.
-    best = _pick_best_arm(
-        arm_observations,
-        objective=objective,
-        latency_regression_tolerance=latency_regression_tolerance,
-        control_p95_elapsed=_control_p95_elapsed(control_rows),
-    )
+    # Determine best arm — branches by kind.
+    if kind == ExperimentKind.TUNING:
+        best = _pick_best_arm_tuning(
+            arm_observations,
+            objective=objective,
+            latency_regression_tolerance=latency_regression_tolerance,
+            control_p95_elapsed=_control_p95_elapsed(control_rows),
+        )
+    else:
+        # Mark Pareto-optimal arms in-place and pick a single "best" arm by
+        # the lowest-credit-on-Pareto-frontier heuristic.
+        _mark_pareto_optimal(arm_observations)
+        best = _pick_best_arm_benchmark(arm_observations)
 
-    # Annual savings projection.
+    # Annual savings projection — tuning only.  For benchmark there's no
+    # baseline against which to compute "savings"; the report surfaces the
+    # Pareto frontier instead.
     annual_savings_lo: float | None = None
     annual_savings_hi: float | None = None
     p95_pct_lo: float | None = None
     p95_pct_hi: float | None = None
-    if best is not None and annual_query_count_low is not None and annual_query_count_high is not None:
-        # Pick the absolute credit delta per query for the best arm.
+    if (
+        kind == ExperimentKind.TUNING
+        and best is not None
+        and annual_query_count_low is not None
+        and annual_query_count_high is not None
+    ):
         best_obs = next(o for o in arm_observations if o.arm_name == best.name)
         # Per-query credit delta: negative = savings.  Convert to savings (positive number).
         per_query_savings = -best_obs.credits_per_query_delta_mean
         annual_savings_lo = per_query_savings * annual_query_count_low
         annual_savings_hi = per_query_savings * annual_query_count_high
-        # Control p95 from raw rows (not pair-based — overall p95).
         ctrl_p95 = _control_p95_elapsed(control_rows)
         if ctrl_p95 > 0:
             p95_pct_lo = 100.0 * best_obs.elapsed_ms_delta_ci_low / ctrl_p95
             p95_pct_hi = 100.0 * best_obs.elapsed_ms_delta_ci_high / ctrl_p95
+
+    corrections: list[str] = []
+    if control_rows:
+        corrections.append(
+            f"Bonferroni: p-values multiplied by {correction_factor} "
+            f"({len(non_control_arms)} non-control arms × 2 metrics)"
+        )
+    if kind == ExperimentKind.BENCHMARK:
+        corrections.append(
+            "Pareto frontier: arms on the frontier are non-dominated on "
+            "(credits_per_query_mean, elapsed_ms_p95).  Single 'best' arm "
+            "is the cheapest on the frontier; full frontier is exposed via "
+            "ArmObservation.is_pareto_optimal."
+        )
 
     return ExperimentReport(
         experiment_id=experiment_id,
         arms=arm_observations,
         best_arm_name=best.name if best else None,
         best_arm_rationale=best.rationale if best else None,
-        best_arm_objective=objective,
+        best_arm_objective=(
+            objective if kind == ExperimentKind.TUNING
+            else "pareto_minimize_credits_then_p95"
+        ),
         projected_annual_savings_low_credits=annual_savings_lo,
         projected_annual_savings_high_credits=annual_savings_hi,
         projected_p95_latency_delta_pct_low=p95_pct_lo,
         projected_p95_latency_delta_pct_high=p95_pct_hi,
         sample_size_warnings=sample_size_warnings,
         excluded_query_count=excluded,
-        statistical_corrections_applied=[
-            f"Bonferroni: p-values multiplied by {correction_factor} "
-            f"({len(non_control_arms)} non-control arms × 2 metrics)"
-        ],
+        statistical_corrections_applied=corrections,
         assumptions=_default_assumptions(),
     )
 
@@ -232,7 +288,7 @@ class _BestArm:
     rationale: str
 
 
-def _pick_best_arm(
+def _pick_best_arm_tuning(
     observations: list[ArmObservation],
     *,
     objective: str,
@@ -274,6 +330,73 @@ def _pick_best_arm(
         f"{-winner.credits_per_query_delta_ci_low:.4f}) and stays within "
         f"+{latency_regression_tolerance*100:.0f}% p95 latency of control"
     )
+    return _BestArm(name=winner.arm_name, rationale=rationale)
+
+
+def _mark_pareto_optimal(observations: list[ArmObservation]) -> None:
+    """Mark each arm as Pareto-optimal on (credits_per_query_mean, elapsed_ms_p95).
+
+    Arm A *dominates* arm B if A is strictly better on at least one metric
+    and not worse on the other.  An arm is Pareto-optimal if no other arm
+    dominates it.  The frontier is the set of optimal arms — they represent
+    the meaningful trade-offs (any non-frontier arm is strictly worse than
+    something on the frontier).
+
+    Mutates ``observations`` in place.
+    """
+    runnable = [o for o in observations if o.n_queries_run > 0]
+    for obs in runnable:
+        dominated = False
+        for other in runnable:
+            if other.arm_name == obs.arm_name:
+                continue
+            # other dominates obs iff:
+            #   other.credits <= obs.credits AND other.p95 <= obs.p95
+            #   AND (other.credits < obs.credits OR other.p95 < obs.p95)
+            other_no_worse = (
+                other.credits_per_query_mean <= obs.credits_per_query_mean
+                and other.elapsed_ms_p95 <= obs.elapsed_ms_p95
+            )
+            other_strictly_better = (
+                other.credits_per_query_mean < obs.credits_per_query_mean
+                or other.elapsed_ms_p95 < obs.elapsed_ms_p95
+            )
+            if other_no_worse and other_strictly_better:
+                dominated = True
+                break
+        obs.is_pareto_optimal = not dominated
+
+
+def _pick_best_arm_benchmark(
+    observations: list[ArmObservation],
+) -> _BestArm | None:
+    """For benchmark: pick the lowest-credit arm on the Pareto frontier.
+
+    No "this saves vs control" gate — every Pareto-optimal arm is a
+    legitimate choice depending on the user's credits-vs-latency preference.
+    We surface a single "best" suggestion by tie-breaking on credits
+    (cheapest wins), but the report shows the full frontier so the user
+    can pick differently.
+    """
+    frontier = [o for o in observations if o.is_pareto_optimal and o.n_queries_run > 0]
+    if not frontier:
+        return None
+    frontier.sort(key=lambda o: (o.credits_per_query_mean, o.elapsed_ms_p95))
+    winner = frontier[0]
+    other_optimal = [o.arm_name for o in frontier if o.arm_name != winner.arm_name]
+    if other_optimal:
+        rationale = (
+            f"arm {winner.arm_name!r} is the cheapest configuration on the "
+            f"Pareto frontier ({winner.credits_per_query_mean:.5f} credits/query, "
+            f"p95 {winner.elapsed_ms_p95:.0f}ms).  Other frontier configurations "
+            f"trade more credits for lower p95: {', '.join(other_optimal)}."
+        )
+    else:
+        rationale = (
+            f"arm {winner.arm_name!r} dominates all others on both credits "
+            f"and p95 elapsed ({winner.credits_per_query_mean:.5f} credits/query, "
+            f"p95 {winner.elapsed_ms_p95:.0f}ms)."
+        )
     return _BestArm(name=winner.arm_name, rationale=rationale)
 
 
