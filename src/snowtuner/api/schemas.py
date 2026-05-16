@@ -312,3 +312,77 @@ class QueryFilterFacets(BaseModel):
     users: list[str]
     query_types: list[str]
     execution_statuses: list[str]
+
+
+# ── Self-documentation (Docs tab) ───────────────────────────────
+
+class CliParam(BaseModel):
+    """One option or argument on a CLI command."""
+    name: str
+    kind: str           # 'option' | 'argument'
+    type: str           # 'STRING' | 'INT' | 'BOOL' | 'CHOICE' | ...
+    help: str = ""
+    required: bool = False
+    is_flag: bool = False
+    default: str | None = None
+    choices: list[str] | None = None    # populated when type == CHOICE
+    multiple: bool = False
+
+
+class CliCommand(BaseModel):
+    """One node in the CLI tree.  Groups have ``subcommands`` populated."""
+    name: str
+    path: list[str]                     # ['snowtuner', 'autonomous', 'enable']
+    help: str = ""
+    short_help: str = ""
+    is_group: bool = False
+    params: list[CliParam] = Field(default_factory=list)
+    subcommands: list["CliCommand"] = Field(default_factory=list)
+
+
+CliCommand.model_rebuild()
+
+
+class McpToolInfo(BaseModel):
+    """One MCP tool registered on the admin server.
+
+    ``parameters`` is the JSON Schema FastMCP generates from the tool
+    function's signature; rendered as a collapsible JSON block in the UI.
+    """
+    name: str
+    description: str = ""
+    parameters: dict | None = None
+
+
+# ── Query groups (slice 2) ──────────────────────────────────────
+
+class CreateQueryGroupRequest(BaseModel):
+    """POST /query-groups body.
+
+    ``filter_spec`` carries the criteria; for static groups, we materialize
+    the current member list at creation time and store it on the row.  The
+    client can pass the same fields it'd otherwise use as URL filters on
+    ``/queries`` — the explorer's "Save current filter as group" action just
+    forwards what's in its current search-params shape, lightly normalized.
+    """
+    name: str
+    description: str | None = None
+    kind: str                                   # 'static' | 'dynamic'
+
+    # Filter criteria.  Comma-separated strings or arrays — the endpoint
+    # normalizes to the model's `list[str]` shape.  Numeric / bool / datetime
+    # fields are passed directly.
+    warehouse_name: list[str] | str | None = None
+    user_name: list[str] | str | None = None
+    role_name: list[str] | str | None = None
+    query_type: list[str] | str | None = None
+    execution_status: list[str] | str | None = None
+    query_parameterized_hash: list[str] | str | None = None
+    start_time_from: datetime | None = None
+    start_time_to: datetime | None = None
+    min_elapsed_ms: int | None = None
+    max_elapsed_ms: int | None = None
+    has_remote_spill: bool | None = None
+    has_local_spill: bool | None = None
+    has_queueing: bool | None = None
+    search: str | None = None

@@ -100,3 +100,35 @@ def close_connection() -> None:
             pass
         _master = None
     _thread_local = threading.local()
+
+
+def reset_database() -> Path:
+    """Close the active DB connection and delete the on-disk DuckDB file(s).
+
+    Pre-release migration strategy: rather than carrying schema-migration shims
+    across versions, ``snowtuner reset`` wipes the local DuckDB and lets the
+    next ``get_connection()`` rebuild it from scratch via ``init_schema``.
+    Returns the path of the file that was (now) deleted, for logging.
+
+    Caveats:
+
+    * **Local only.**  Does not touch Snowflake.  Any orphaned
+      ``SNOWTUNER_EXP_*`` test warehouses created by a crashed experiment
+      will become invisible after reset — run ``snowtuner experiments
+      recover`` FIRST if you have any.
+    * **App-state loss.**  ``app.recommendations``, ``app.experiments``,
+      ``app.autonomous_applications`` are wiped.  Recommendations regenerate
+      on the next ``snowtuner run``; experiments and the apply audit log are
+      lost.
+    * **Credentials/keys are not touched.**  ``~/.snowtuner/creds.toml`` and
+      the RSA private key file remain untouched.
+    """
+    close_connection()
+    path = db_path()
+    if path.exists():
+        path.unlink()
+    # DuckDB may leave a WAL file alongside the main file.
+    wal = path.with_suffix(path.suffix + ".wal")
+    if wal.exists():
+        wal.unlink()
+    return path

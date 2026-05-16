@@ -292,141 +292,49 @@ _DDL = [
         PRIMARY KEY (experiment_id, arm_name, rep_index, sampled_query_id)
     )
     """,
+    # ── v0.2 query groups ─────────────────────────────────────────
+    # Saved sets of queries the user can apply as a workload filter or feed
+    # into an experiment.  Two kinds:
+    #   - static  : snapshot at creation; immutable membership.  filter_spec
+    #               is preserved for provenance but not re-evaluated.
+    #   - dynamic : live-evaluated against raw.query_history on every read.
+    # Groups are immutable in this slice (no edit-in-place).  Versioning is
+    # a future concern.
+    """
+    CREATE SEQUENCE IF NOT EXISTS app.query_groups_seq
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS app.query_groups (
+        id                  BIGINT PRIMARY KEY
+                            DEFAULT nextval('app.query_groups_seq'),
+        name                VARCHAR NOT NULL,
+        description         VARCHAR,
+        kind                VARCHAR NOT NULL,                 -- 'static' | 'dynamic'
+        filter_spec         JSON NOT NULL,                    -- QueryFilterSpec
+        snapshot_query_ids  JSON,                              -- static only; JSON array of query_ids
+        snapshot_at         TIMESTAMP,                         -- when the static snapshot was taken
+        created_at          TIMESTAMP NOT NULL DEFAULT current_timestamp,
+        created_by          VARCHAR NOT NULL DEFAULT 'user'
+    )
+    """,
 ]
 
 
-def _pre_create_migrations(conn: duckdb.DuckDBPyConnection) -> None:
-    """Forward-only schema migrations applied before CREATE TABLE IF NOT EXISTS DDLs.
-
-    We don't support upgrading from a released version yet, so each migration
-    here just drops a table when its old shape is detected and lets the DDL
-    below re-create it with the new shape.  This is acceptable pre-release
-    because raw.* is fully repopulatable from a sync.
-    """
-    # Migration 1: drop raw.warehouse_events_history if its shape doesn't
-    # match the current design (synthetic event_id PK + cluster_count column).
-    # We've gone through a couple of schema iterations on this table:
-    #   v1: event_id BIGINT PK pulled from Snowflake (Snowflake doesn't expose it)
-    #   v2: composite PK over (warehouse_id, timestamp, event_name, cluster_number)
-    #   v3 (current): synthetic event_id BIGINT PK we hash ourselves
-    # If the existing table is missing either marker (event_id or cluster_count),
-    # it's a pre-v3 shape and we drop+recreate.
-    cols_rows = conn.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'raw' AND table_name = 'warehouse_events_history'
-        """
-    ).fetchall()
-    if cols_rows:
-        col_names = {c[0] for c in cols_rows}
-        if "event_id" not in col_names or "cluster_count" not in col_names:
-            conn.execute("DROP TABLE raw.warehouse_events_history")
-            conn.execute(
-                "DELETE FROM app.sync_watermarks WHERE source_name = 'warehouse_events_history'"
-            )
-
-    # Migration 2: app.autonomous_config gained a `knob` column for per-knob
-    # granularity (so e.g. ALTER_WAREHOUSE/AUTO_SUSPEND can be autonomous
-    # without auto-applying WAREHOUSE_SIZE on the same warehouse).  Existing
-    # rows are migrated to ``knob = '*'`` (catch-all), preserving prior behavior.
-    cfg_cols = conn.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'app' AND table_name = 'autonomous_config'
-        ORDER BY ordinal_position
-        """
-    ).fetchall()
-    if cfg_cols:
-        cfg_col_names = [c[0] for c in cfg_cols]
-        if "knob" not in cfg_col_names:
-            saved = conn.execute(
-                "SELECT * FROM app.autonomous_config"
-            ).fetchall()
-            conn.execute("DROP TABLE app.autonomous_config")
-            # The CREATE in _DDL below will rebuild with the new shape.  We
-            # pre-create here so the row replays land in the new shape; the
-            # IF NOT EXISTS in the DDL step then becomes a no-op.
-            conn.execute(
-                """
-                CREATE TABLE app.autonomous_config (
-                    action_type            VARCHAR NOT NULL,
-                    warehouse_name         VARCHAR NOT NULL,
-                    knob                   VARCHAR NOT NULL DEFAULT '*',
-                    enabled                BOOLEAN NOT NULL DEFAULT FALSE,
-                    confidence_threshold   DOUBLE NOT NULL DEFAULT 0.85,
-                    cooldown_hours         INTEGER NOT NULL DEFAULT 24,
-                    max_rollbacks_per_week INTEGER NOT NULL DEFAULT 2,
-                    circuit_open_until     TIMESTAMP,
-                    updated_at             TIMESTAMP DEFAULT current_timestamp,
-                    PRIMARY KEY (action_type, warehouse_name, knob)
-                )
-                """
-            )
-            for row in saved:
-                d = dict(zip(cfg_col_names, row))
-                conn.execute(
-                    """
-                    INSERT INTO app.autonomous_config
-                      (action_type, warehouse_name, knob, enabled,
-                       confidence_threshold, cooldown_hours,
-                       max_rollbacks_per_week, circuit_open_until, updated_at)
-                    VALUES (?, ?, '*', ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        d["action_type"],
-                        d["warehouse_name"],
-                        d.get("enabled", False),
-                        d.get("confidence_threshold", 0.85),
-                        d.get("cooldown_hours", 24),
-                        d.get("max_rollbacks_per_week", 2),
-                        d.get("circuit_open_until"),
-                        d.get("updated_at"),
-                    ],
-                )
-
-    # Migration 3: app.experiments gained kind + workload_warehouse columns
-    # for benchmark-kind experiments.  Default kind = 'tuning' so existing
-    # rows keep their semantics; target_warehouse becomes nullable.  These
-    # are additive (ADD COLUMN + ALTER COLUMN DROP NOT NULL), so the
-    # existing data is preserved.
-    exp_cols_rows = conn.execute(
-        """
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'app' AND table_name = 'experiments'
-        """
-    ).fetchall()
-    if exp_cols_rows:
-        exp_col_names = {c[0] for c in exp_cols_rows}
-        if "kind" not in exp_col_names:
-            conn.execute(
-                "ALTER TABLE app.experiments ADD COLUMN kind VARCHAR NOT NULL DEFAULT 'tuning'"
-            )
-        if "workload_warehouse" not in exp_col_names:
-            conn.execute(
-                "ALTER TABLE app.experiments ADD COLUMN workload_warehouse VARCHAR"
-            )
-        # Drop NOT NULL on target_warehouse — benchmark experiments may omit it.
-        # DuckDB's ALTER TABLE syntax: ALTER COLUMN ... DROP NOT NULL.
-        try:
-            conn.execute(
-                "ALTER TABLE app.experiments ALTER COLUMN target_warehouse DROP NOT NULL"
-            )
-        except Exception:
-            # Already nullable, or DuckDB version doesn't support this syntax.
-            # Either way it's not catastrophic — INSERTs from the store still
-            # work; the constraint is just stricter than we'd like for benchmark.
-            pass
-
-
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create all schemas and tables if they don't exist. Safe to call repeatedly."""
+    """Create all schemas and tables if they don't exist. Safe to call repeatedly.
+
+    Pre-release policy: no in-place migrations.  The DDL below is the canonical
+    shape; if a user's on-disk database has an older schema, the right move is
+    ``snowtuner reset`` (which wipes the local DuckDB file and re-initializes
+    from these DDLs) followed by ``snowtuner sync`` to repopulate ``raw.*``.
+
+    This keeps the codebase honest while we're still iterating on shapes
+    weekly.  Once we cut v1.0 we'll add a real migration framework; until
+    then, ``raw.*`` is fully repopulatable from Snowflake and ``app.*`` state
+    is recoverable from history (recommendations, experiments) or
+    regeneratable by re-running the orchestrator.
+    """
     for s in _SCHEMAS:
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
-    # Migrations run before DDLs so the DDLs can recreate dropped tables.
-    try:
-        _pre_create_migrations(conn)
-    except duckdb.CatalogException:
-        # First-ever init: app.sync_watermarks may not exist yet.  Safe to skip.
-        pass
     for stmt in _DDL:
         conn.execute(stmt)

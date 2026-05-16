@@ -14,6 +14,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as RecommendationsRouteImport } from './routes/recommendations'
 import { Route as QueriesRouteImport } from './routes/queries'
 import { Route as ExperimentsRouteImport } from './routes/experiments'
+import { Route as DocsRouteImport } from './routes/docs'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WarehousesIndexRouteImport } from './routes/warehouses.index'
 import { Route as QueriesIndexRouteImport } from './routes/queries.index'
@@ -44,6 +45,11 @@ const QueriesRoute = QueriesRouteImport.update({
 const ExperimentsRoute = ExperimentsRouteImport.update({
   id: '/experiments',
   path: '/experiments',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DocsRoute = DocsRouteImport.update({
+  id: '/docs',
+  path: '/docs',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -79,6 +85,7 @@ const ExperimentsIdRoute = ExperimentsIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/docs': typeof DocsRoute
   '/experiments': typeof ExperimentsRouteWithChildren
   '/queries': typeof QueriesRouteWithChildren
   '/recommendations': typeof RecommendationsRoute
@@ -92,6 +99,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/docs': typeof DocsRoute
   '/recommendations': typeof RecommendationsRoute
   '/settings': typeof SettingsRoute
   '/experiments/$id': typeof ExperimentsIdRoute
@@ -103,6 +111,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/docs': typeof DocsRoute
   '/experiments': typeof ExperimentsRouteWithChildren
   '/queries': typeof QueriesRouteWithChildren
   '/recommendations': typeof RecommendationsRoute
@@ -118,6 +127,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/docs'
     | '/experiments'
     | '/queries'
     | '/recommendations'
@@ -131,6 +141,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/docs'
     | '/recommendations'
     | '/settings'
     | '/experiments/$id'
@@ -141,6 +152,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/docs'
     | '/experiments'
     | '/queries'
     | '/recommendations'
@@ -155,6 +167,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  DocsRoute: typeof DocsRoute
   ExperimentsRoute: typeof ExperimentsRouteWithChildren
   QueriesRoute: typeof QueriesRouteWithChildren
   RecommendationsRoute: typeof RecommendationsRoute
@@ -197,6 +210,13 @@ declare module '@tanstack/react-router' {
       path: '/experiments'
       fullPath: '/experiments'
       preLoaderRoute: typeof ExperimentsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/docs': {
+      id: '/docs'
+      path: '/docs'
+      fullPath: '/docs'
+      preLoaderRoute: typeof DocsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -285,6 +305,7 @@ const WarehousesRouteWithChildren = WarehousesRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  DocsRoute: DocsRoute,
   ExperimentsRoute: ExperimentsRouteWithChildren,
   QueriesRoute: QueriesRouteWithChildren,
   RecommendationsRoute: RecommendationsRoute,

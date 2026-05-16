@@ -52,6 +52,83 @@ def seed(days: int) -> None:
 
 
 @cli.command()
+@click.option("--yes", is_flag=True, default=False,
+              help="Skip the confirmation prompt.  Useful for scripted resets.")
+def reset(yes: bool) -> None:
+    """Wipe the local snowtuner.duckdb and re-initialize from scratch.
+
+    Pre-release we don't ship schema migrations; when the schema changes,
+    upgrade by running this command then [cyan]snowtuner sync[/cyan] to
+    repopulate raw.* from Snowflake.
+
+    DOES NOT TOUCH: credentials (~/.snowtuner/creds.toml), the RSA key,
+    or anything on Snowflake.
+
+    DOES WIPE: app.recommendations, app.experiments, app.autonomous_applications,
+    app.training_state, app.sync_watermarks, and all of raw.* and features.*.
+
+    If you have orphaned SNOWTUNER_EXP_* test warehouses on Snowflake from a
+    crashed experiment, run [cyan]snowtuner experiments recover[/cyan] FIRST —
+    after reset, snowtuner forgets their names and can't clean them up
+    for you.
+    """
+    from snowtuner.storage.db import db_path, reset_database
+
+    # Pre-flight: check if any experiments have un-cleaned test warehouses.
+    # If we can't even open the DB cleanly (schema mismatch from a prior
+    # version), skip the check and surface a generic warning.
+    orphan_backlog: list = []
+    try:
+        from snowtuner.experiments import ExperimentStore
+        store = ExperimentStore(get_connection())
+        orphan_backlog = store.needing_cleanup()
+    except Exception:
+        orphan_backlog = []
+
+    path = db_path()
+    if not path.exists():
+        console.print(f"[dim]Nothing to delete — {path} doesn't exist yet.[/dim]")
+    else:
+        size_mb = path.stat().st_size / (1024 * 1024)
+        console.print(
+            f"[bold]This will delete[/bold] [cyan]{path}[/cyan] "
+            f"([dim]{size_mb:.1f} MB[/dim])"
+        )
+
+    if orphan_backlog:
+        console.print()
+        console.print(
+            f"[yellow]Warning:[/yellow] {len(orphan_backlog)} experiment(s) have "
+            f"un-cleaned test warehouses on Snowflake."
+        )
+        for exp in orphan_backlog:
+            names = ", ".join(exp.test_warehouse_names) or "(none recorded)"
+            console.print(f"  experiment #{exp.id}: {names}")
+        console.print(
+            "[yellow]Recommended:[/yellow] cancel this command, run "
+            "[cyan]snowtuner experiments recover[/cyan] first to drop them via "
+            "Snowflake, then re-run [cyan]snowtuner reset[/cyan]."
+        )
+        console.print()
+
+    if not yes:
+        if not click.confirm("Proceed with reset?", default=False):
+            console.print("[dim]Cancelled.[/dim]")
+            raise SystemExit(0)
+
+    deleted = reset_database()
+    console.print(f"[green]Wiped[/green] {deleted}")
+
+    # Trigger fresh init so the file exists with the current schema.
+    get_connection()
+    console.print(f"[green]Recreated[/green] with current schema.")
+    console.print(
+        "Next steps: [cyan]snowtuner sync[/cyan] to repopulate raw.*, then "
+        "[cyan]snowtuner run[/cyan] to regenerate recommendations."
+    )
+
+
+@cli.command()
 @click.option("--lookback-days", default=14, show_default=True,
               help="On sources with no stored watermark yet, look back this far.")
 @click.option("--source", "source_filter", default=None,

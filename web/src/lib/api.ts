@@ -239,6 +239,90 @@ export interface QueryFilterFacets {
   execution_statuses: string[]
 }
 
+// ── Query groups ──────────────────────────────────────────────
+
+export type QueryGroupKind = 'static' | 'dynamic'
+
+export interface QueryFilterSpec {
+  warehouse_name?: string[] | null
+  user_name?: string[] | null
+  role_name?: string[] | null
+  query_type?: string[] | null
+  execution_status?: string[] | null
+  query_parameterized_hash?: string[] | null
+  start_time_from?: string | null
+  start_time_to?: string | null
+  min_elapsed_ms?: number | null
+  max_elapsed_ms?: number | null
+  has_remote_spill?: boolean | null
+  has_local_spill?: boolean | null
+  has_queueing?: boolean | null
+  search?: string | null
+}
+
+export interface QueryGroup {
+  id: number
+  name: string
+  description: string | null
+  kind: QueryGroupKind
+  filter_spec: QueryFilterSpec
+  snapshot_query_ids: string[] | null
+  snapshot_at: string | null
+  created_at: string
+  created_by: string
+  member_count: number | null
+}
+
+export interface CreateQueryGroupBody {
+  name: string
+  description?: string | null
+  kind: QueryGroupKind
+  // Match the URL filter convention — strings or arrays both accepted by the server.
+  warehouse_name?: string | null
+  user_name?: string | null
+  query_type?: string | null
+  execution_status?: string | null
+  query_parameterized_hash?: string | null
+  start_time_from?: string | null
+  start_time_to?: string | null
+  min_elapsed_ms?: number | null
+  max_elapsed_ms?: number | null
+  has_remote_spill?: boolean | null
+  has_local_spill?: boolean | null
+  has_queueing?: boolean | null
+  search?: string | null
+}
+
+// ── Self-documentation types ──────────────────────────────────
+
+export interface CliParam {
+  name: string
+  kind: 'option' | 'argument'
+  type: string
+  help: string
+  required: boolean
+  is_flag: boolean
+  default: string | null
+  choices: string[] | null
+  multiple: boolean
+}
+
+export interface CliCommand {
+  name: string
+  path: string[]
+  help: string
+  short_help: string
+  is_group: boolean
+  params: CliParam[]
+  subcommands: CliCommand[]
+}
+
+export interface McpToolInfo {
+  name: string
+  description: string
+  parameters: Record<string, unknown> | null
+}
+
 export interface QueryListFilters {
   warehouse?: string         // comma-separated
   user?: string
@@ -397,6 +481,21 @@ export const api = {
     request<QueryFilterFacets>('GET', '/queries/facets', {
       query: { lookback_days: lookbackDays },
     }),
+
+  // ── Query groups ───────────────────────────────────────────────
+  listQueryGroups: (kind?: QueryGroupKind) =>
+    request<QueryGroup[]>('GET', '/query-groups', { query: { kind } }),
+  getQueryGroup: (id: number) => request<QueryGroup>('GET', `/query-groups/${id}`),
+  createQueryGroup: (body: CreateQueryGroupBody) =>
+    request<QueryGroup>('POST', '/query-groups', { body }),
+  deleteQueryGroup: (id: number) =>
+    request<{ status: string; id: string }>('DELETE', `/query-groups/${id}`),
+  queryGroupMembers: (id: number, params?: { limit?: number; offset?: number }) =>
+    request<QueryListResponse>('GET', `/query-groups/${id}/members`, { query: params }),
+
+  // ── Self-documentation (Docs tab) ─────────────────────────────
+  cliHelp: () => request<CliCommand>('GET', '/cli-help'),
+  mcpTools: () => request<McpToolInfo[]>('GET', '/mcp-tools'),
 
   // ── Experiments (v0.2) ─────────────────────────────────────────
   listExperimentRecipes: () => request<RecipeInfo[]>('GET', '/experiments/recipes'),

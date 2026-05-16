@@ -50,8 +50,11 @@ class QueryStats:
     bytes_scanned: int | None
 
 
-# Per-arm fixed overhead — suspend/resume cycles for cache control + the time
-# the test warehouse spends idle but provisioned.  Conservative estimate;
+# Per-arm fixed overhead — initial warehouse resume from suspended +
+# QUERY_HISTORY metric-polling waits between queries.  We provision arms with
+# INITIALLY_SUSPENDED = TRUE so the first query pays a one-time resume cost;
+# subsequent queries don't suspend/resume between reps (we disable
+# USE_CACHED_RESULT at session level instead).  Conservative estimate;
 # refined empirically from completed-experiment data later.
 _PER_ARM_OVERHEAD_SECONDS = 30.0
 _VARIANCE_FACTOR_LOW = 0.7
@@ -96,9 +99,9 @@ def estimate_experiment_cost(
     rationale = (
         f"{len(sample_query_stats)} sample queries × {reps_per_arm} reps × "
         f"{len(arm_credit_rates_per_hour)} arms.  "
-        f"Per-arm overhead {_PER_ARM_OVERHEAD_SECONDS:.0f}s for cache-clearing "
-        f"suspend/resume cycles.  Variance band ±50% covers query elapsed-time "
-        f"jitter under varying load.\n"
+        f"Per-arm overhead {_PER_ARM_OVERHEAD_SECONDS:.0f}s for initial warehouse "
+        f"resume + QUERY_HISTORY metric polling between queries.  Variance band "
+        f"±50% covers query elapsed-time jitter under varying load.\n"
         + "\n".join(arm_cost_lines)
     )
 

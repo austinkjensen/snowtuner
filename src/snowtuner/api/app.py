@@ -46,8 +46,12 @@ from snowtuner.api.schemas import (
     AutonomousConfigOut,
     AutonomousConfigUpsert,
     BenchmarkArmSpec,
+    CliCommand,
+    CliParam,
+    CreateQueryGroupRequest,
     CredentialStatusOut,
     CredentialVerifyOut,
+    McpToolInfo,
     ProposeBenchmarkRequest,
     ProposeExperimentRequest,
     QueryDetail,
@@ -83,6 +87,12 @@ from snowtuner.experiments.config_delta import WarehouseConfig
 from snowtuner.experiments.cost_estimate import QueryStats
 from snowtuner.experiments.eligibility import AccountInfo
 from snowtuner.experiments.recipes import PRESET_RECIPES
+from snowtuner.query_groups import (
+    QueryFilterSpec,
+    QueryGroup,
+    QueryGroupKind,
+    QueryGroupStore,
+)
 from snowtuner.ingestion.snowflake_client import SnowflakeClient
 from snowtuner.features import DEFAULT_TRANSFORMS
 from snowtuner.features.base import FeaturePipeline
@@ -97,6 +107,7 @@ from snowtuner.recommenders.registry import (
 )
 from snowtuner.seed import seed_demo_data
 from snowtuner.storage import get_connection
+from snowtuner.storage.db import naive_utcnow
 
 
 # ---- Dependencies (per-request so the test harness can override) ----
@@ -993,6 +1004,189 @@ def create_app() -> FastAPI:
             distinct_users=int(r[13] or 0),
         ) for r in rows]
 
+    # ── Query groups (slice 2) ────────────────────────────────────
+    def _group_store() -> QueryGroupStore:
+        return QueryGroupStore(get_connection())
+
+    @app.post("/query-groups", response_model=QueryGroup)
+    def create_query_group(
+        req: CreateQueryGroupRequest,
+        store: QueryGroupStore = Depends(_group_store),
+    ) -> QueryGroup:
+        try:
+            kind = QueryGroupKind(req.kind)
+        except ValueError:
+            raise HTTPException(
+                400, f"unknown kind {req.kind!r}; must be 'static' or 'dynamic'",
+            )
+
+        spec = _filter_spec_from_create_req(req)
+
+        # For static groups, snapshot the matching query_ids at creation time.
+        # For dynamic groups, the filter is the canonical definition and members
+        # are re-evaluated on every read.
+        snapshot_ids: list[str] | None = None
+        snapshot_at = None
+        if kind == QueryGroupKind.STATIC:
+            where, params = _build_filter_from_spec(spec)
+            where_sql = f"WHERE {where}" if where else ""
+            rows = get_connection().execute(
+                f"SELECT query_id FROM raw.query_history {where_sql}", params,
+            ).fetchall()
+            snapshot_ids = [r[0] for r in rows]
+            snapshot_at = naive_utcnow()
+
+        new_id = store.insert(
+            name=req.name, description=req.description, kind=kind,
+            filter_spec=spec, snapshot_query_ids=snapshot_ids,
+            snapshot_at=snapshot_at,
+        )
+        # Re-fetch + decorate with member_count.
+        group = store.get(new_id)
+        if group is None:
+            raise HTTPException(500, "insert succeeded but read-back failed")
+        group.member_count = _group_member_count(group)
+        return group
+
+    @app.get("/query-groups", response_model=list[QueryGroup])
+    def list_query_groups(
+        kind: str | None = Query(None, description="Filter to 'static' or 'dynamic'"),
+        limit: int = Query(200, ge=1, le=500),
+        store: QueryGroupStore = Depends(_group_store),
+    ) -> list[QueryGroup]:
+        kind_enum: QueryGroupKind | None = None
+        if kind is not None:
+            try:
+                kind_enum = QueryGroupKind(kind)
+            except ValueError:
+                raise HTTPException(400, f"unknown kind {kind!r}")
+        groups = store.list(kind=kind_enum, limit=limit)
+        for g in groups:
+            g.member_count = _group_member_count(g)
+        return groups
+
+    @app.get("/query-groups/{group_id}", response_model=QueryGroup)
+    def get_query_group(
+        group_id: int,
+        store: QueryGroupStore = Depends(_group_store),
+    ) -> QueryGroup:
+        group = store.get(group_id)
+        if group is None:
+            raise HTTPException(404, f"query group {group_id} not found")
+        group.member_count = _group_member_count(group)
+        return group
+
+    @app.delete("/query-groups/{group_id}")
+    def delete_query_group(
+        group_id: int,
+        store: QueryGroupStore = Depends(_group_store),
+    ) -> dict[str, str]:
+        if not store.delete(group_id):
+            raise HTTPException(404, f"query group {group_id} not found")
+        return {"status": "deleted", "id": str(group_id)}
+
+    @app.get("/query-groups/{group_id}/members", response_model=QueryListResponse)
+    def query_group_members(
+        group_id: int,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        store: QueryGroupStore = Depends(_group_store),
+    ) -> QueryListResponse:
+        group = store.get(group_id)
+        if group is None:
+            raise HTTPException(404, f"query group {group_id} not found")
+
+        conn = get_connection()
+        # Static: members = the frozen snapshot; paginate against that list.
+        if group.kind == QueryGroupKind.STATIC:
+            ids = group.snapshot_query_ids or []
+            total = len(ids)
+            slice_ids = ids[offset : offset + limit]
+            if not slice_ids:
+                return QueryListResponse(rows=[], total=total, limit=limit, offset=offset)
+            placeholders = ", ".join(["?"] * len(slice_ids))
+            rows = conn.execute(
+                f"""
+                SELECT query_id, query_text, query_type, execution_status,
+                       user_name, role_name, warehouse_name, warehouse_size,
+                       start_time, total_elapsed_ms, bytes_scanned,
+                       bytes_spilled_to_local, bytes_spilled_to_remote,
+                       queued_overload_ms, query_parameterized_hash
+                FROM raw.query_history
+                WHERE query_id IN ({placeholders})
+                ORDER BY start_time DESC NULLS LAST
+                """,
+                slice_ids,
+            ).fetchall()
+        else:
+            # Dynamic: apply the filter spec live.
+            where, params = _build_filter_from_spec(group.filter_spec)
+            where_sql = f"WHERE {where}" if where else ""
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM raw.query_history {where_sql}", params,
+            ).fetchone()[0])
+            rows = conn.execute(
+                f"""
+                SELECT query_id, query_text, query_type, execution_status,
+                       user_name, role_name, warehouse_name, warehouse_size,
+                       start_time, total_elapsed_ms, bytes_scanned,
+                       bytes_spilled_to_local, bytes_spilled_to_remote,
+                       queued_overload_ms, query_parameterized_hash
+                FROM raw.query_history
+                {where_sql}
+                ORDER BY start_time DESC NULLS LAST
+                LIMIT ? OFFSET ?
+                """,
+                params + [limit, offset],
+            ).fetchall()
+
+        return QueryListResponse(
+            rows=[QueryRow(
+                query_id=r[0],
+                query_text_preview=_truncate(r[1], 200),
+                query_type=r[2], execution_status=r[3],
+                user_name=r[4], role_name=r[5],
+                warehouse_name=r[6], warehouse_size=r[7],
+                start_time=r[8], total_elapsed_ms=r[9],
+                bytes_scanned=r[10],
+                bytes_spilled_to_local=r[11], bytes_spilled_to_remote=r[12],
+                queued_overload_ms=r[13],
+                query_parameterized_hash=r[14],
+            ) for r in rows],
+            total=total, limit=limit, offset=offset,
+        )
+
+    # ── Self-documentation (Docs tab) ─────────────────────────────
+    @app.get("/cli-help", response_model=CliCommand)
+    def cli_help() -> CliCommand:
+        """Introspect the snowtuner CLI and return a structured tree of commands.
+
+        Used by the web UI's Docs tab to render an auto-generated CLI reference.
+        The tree mirrors what `snowtuner --help` shows in the terminal, but
+        recursive — each group's subcommands are included inline.
+        """
+        from snowtuner.cli import cli as snowtuner_cli
+        return _introspect_click_command(snowtuner_cli, "snowtuner", ["snowtuner"])
+
+    @app.get("/mcp-tools", response_model=list[McpToolInfo])
+    def mcp_tools_list() -> list[McpToolInfo]:
+        """List MCP tools registered on the admin server with descriptions and
+        JSON-schema parameter specs.  Used by the web UI's Docs tab."""
+        from snowtuner.mcp.admin import mcp as admin_mcp
+        tools = admin_mcp._tool_manager.list_tools()  # noqa: SLF001
+        out: list[McpToolInfo] = []
+        for t in tools:
+            params = getattr(t, "parameters", None)
+            if params is None:
+                # Some FastMCP versions stash the schema as ``inputSchema``.
+                params = getattr(t, "inputSchema", None)
+            out.append(McpToolInfo(
+                name=t.name,
+                description=(getattr(t, "description", "") or "").strip(),
+                parameters=params,
+            ))
+        return out
+
     # ── Dev helpers ───────────────────────────────────────────────
     @app.post("/seed")
     def seed(req: SeedRequest = SeedRequest()) -> dict[str, int]:
@@ -1074,62 +1268,35 @@ def _build_query_filter(
     has_queueing: bool | None,
     search: str | None,
 ) -> tuple[str, list[Any]]:
-    """Build a WHERE-clause body (without 'WHERE') + bind params from filter args.
+    """Build a WHERE-clause body + bind params from URL-style filter args.
 
-    Multi-value filters accept comma-separated strings ("WH_A,WH_B") and bind
-    each value separately so DuckDB can use indexes.  Returns the empty string
-    if no filters are active.
+    Multi-value filters accept comma-separated strings ("WH_A,WH_B").
+    Converts to a ``QueryFilterSpec`` and delegates to
+    ``_build_filter_from_spec`` so both URL filtering and group-spec
+    filtering go through one codepath.
     """
-    clauses: list[str] = []
-    params: list[Any] = []
-
-    def _in_clause(col: str, raw: str | None) -> None:
+    def _split(raw: str | None) -> list[str] | None:
         if not raw:
-            return
+            return None
         values = [v.strip() for v in raw.split(",") if v.strip()]
-        if not values:
-            return
-        placeholders = ", ".join(["?"] * len(values))
-        clauses.append(f"{col} IN ({placeholders})")
-        params.extend(values)
+        return values or None
 
-    _in_clause("warehouse_name", warehouse)
-    _in_clause("user_name", user)
-    _in_clause("query_type", query_type)
-    _in_clause("execution_status", status)
-
-    if parameterized_hash:
-        clauses.append("query_parameterized_hash = ?")
-        params.append(parameterized_hash)
-    if start_from:
-        clauses.append("start_time >= ?")
-        params.append(start_from)
-    if start_to:
-        clauses.append("start_time <= ?")
-        params.append(start_to)
-    if min_elapsed_ms is not None:
-        clauses.append("total_elapsed_ms >= ?")
-        params.append(min_elapsed_ms)
-    if max_elapsed_ms is not None:
-        clauses.append("total_elapsed_ms <= ?")
-        params.append(max_elapsed_ms)
-    if has_remote_spill is True:
-        clauses.append("bytes_spilled_to_remote > 0")
-    elif has_remote_spill is False:
-        clauses.append("(bytes_spilled_to_remote IS NULL OR bytes_spilled_to_remote = 0)")
-    if has_local_spill is True:
-        clauses.append("bytes_spilled_to_local > 0")
-    elif has_local_spill is False:
-        clauses.append("(bytes_spilled_to_local IS NULL OR bytes_spilled_to_local = 0)")
-    if has_queueing is True:
-        clauses.append("queued_overload_ms > 0")
-    elif has_queueing is False:
-        clauses.append("(queued_overload_ms IS NULL OR queued_overload_ms = 0)")
-    if search:
-        clauses.append("lower(query_text) LIKE ?")
-        params.append(f"%{search.lower()}%")
-
-    return " AND ".join(clauses), params
+    spec = QueryFilterSpec(
+        warehouse_name=_split(warehouse),
+        user_name=_split(user),
+        query_type=_split(query_type),
+        execution_status=_split(status),
+        query_parameterized_hash=[parameterized_hash] if parameterized_hash else None,
+        start_time_from=start_from,
+        start_time_to=start_to,
+        min_elapsed_ms=min_elapsed_ms,
+        max_elapsed_ms=max_elapsed_ms,
+        has_remote_spill=has_remote_spill,
+        has_local_spill=has_local_spill,
+        has_queueing=has_queueing,
+        search=search,
+    )
+    return _build_filter_from_spec(spec)
 
 
 def _truncate(text: str | None, max_len: int) -> str:
@@ -1138,6 +1305,116 @@ def _truncate(text: str | None, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 1] + "…"
+
+
+def _filter_spec_from_create_req(req: CreateQueryGroupRequest) -> QueryFilterSpec:
+    """Normalize ``CreateQueryGroupRequest``'s lax field types into a
+    canonical ``QueryFilterSpec``.
+
+    The request accepts ``list[str] | str | None`` for IN-filters to match
+    the URL-filter convention on ``/queries`` (comma-separated string).  We
+    split strings into lists here so the spec model has a single shape.
+    """
+    def _to_list(v) -> list[str] | None:
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [s.strip() for s in v if s and s.strip()] or None
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            return parts or None
+        return None
+
+    return QueryFilterSpec(
+        warehouse_name=_to_list(req.warehouse_name),
+        user_name=_to_list(req.user_name),
+        role_name=_to_list(req.role_name),
+        query_type=_to_list(req.query_type),
+        execution_status=_to_list(req.execution_status),
+        query_parameterized_hash=_to_list(req.query_parameterized_hash),
+        start_time_from=req.start_time_from,
+        start_time_to=req.start_time_to,
+        min_elapsed_ms=req.min_elapsed_ms,
+        max_elapsed_ms=req.max_elapsed_ms,
+        has_remote_spill=req.has_remote_spill,
+        has_local_spill=req.has_local_spill,
+        has_queueing=req.has_queueing,
+        search=req.search,
+    )
+
+
+def _build_filter_from_spec(
+    spec: QueryFilterSpec,
+) -> tuple[str, list[Any]]:
+    """Build a SQL WHERE-clause body + bind params from a ``QueryFilterSpec``.
+
+    This is the canonical filter-to-SQL function; ``_build_query_filter`` (the
+    URL-params variant) converts to a spec and delegates here, so both
+    surfaces share one source of truth.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    def _in_clause(col: str, values: list[str] | None) -> None:
+        if not values:
+            return
+        placeholders = ", ".join(["?"] * len(values))
+        clauses.append(f"{col} IN ({placeholders})")
+        params.extend(values)
+
+    _in_clause("warehouse_name", spec.warehouse_name)
+    _in_clause("user_name", spec.user_name)
+    _in_clause("role_name", spec.role_name)
+    _in_clause("query_type", spec.query_type)
+    _in_clause("execution_status", spec.execution_status)
+    _in_clause("query_parameterized_hash", spec.query_parameterized_hash)
+
+    if spec.start_time_from:
+        clauses.append("start_time >= ?")
+        params.append(spec.start_time_from)
+    if spec.start_time_to:
+        clauses.append("start_time <= ?")
+        params.append(spec.start_time_to)
+    if spec.min_elapsed_ms is not None:
+        clauses.append("total_elapsed_ms >= ?")
+        params.append(spec.min_elapsed_ms)
+    if spec.max_elapsed_ms is not None:
+        clauses.append("total_elapsed_ms <= ?")
+        params.append(spec.max_elapsed_ms)
+    if spec.has_remote_spill is True:
+        clauses.append("bytes_spilled_to_remote > 0")
+    elif spec.has_remote_spill is False:
+        clauses.append("(bytes_spilled_to_remote IS NULL OR bytes_spilled_to_remote = 0)")
+    if spec.has_local_spill is True:
+        clauses.append("bytes_spilled_to_local > 0")
+    elif spec.has_local_spill is False:
+        clauses.append("(bytes_spilled_to_local IS NULL OR bytes_spilled_to_local = 0)")
+    if spec.has_queueing is True:
+        clauses.append("queued_overload_ms > 0")
+    elif spec.has_queueing is False:
+        clauses.append("(queued_overload_ms IS NULL OR queued_overload_ms = 0)")
+    if spec.search:
+        clauses.append("lower(query_text) LIKE ?")
+        params.append(f"%{spec.search.lower()}%")
+
+    return " AND ".join(clauses), params
+
+
+def _group_member_count(group: QueryGroup) -> int:
+    """Compute the current member count for a group.
+
+    Static: just the snapshot length.  Dynamic: live ``COUNT(*)`` against the
+    filter spec.  Used by the API endpoint to decorate ``QueryGroup`` responses;
+    not stored on the row because for dynamic groups it'd be stale immediately.
+    """
+    if group.kind == QueryGroupKind.STATIC:
+        return len(group.snapshot_query_ids or [])
+    where, params = _build_filter_from_spec(group.filter_spec)
+    where_sql = f"WHERE {where}" if where else ""
+    row = get_connection().execute(
+        f"SELECT COUNT(*) FROM raw.query_history {where_sql}", params,
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def _account_info() -> AccountInfo:
@@ -1153,4 +1430,71 @@ def _account_info() -> AccountInfo:
         edition="ENTERPRISE",
         gen2_supported_in_region=True,
         qas_available=True,
+    )
+
+
+def _introspect_click_command(
+    cmd: Any, name: str, path: list[str],
+) -> CliCommand:
+    """Walk a Click ``Command`` / ``Group`` and turn it into a serializable
+    ``CliCommand`` tree.  Used by ``GET /cli-help`` so the web UI can render
+    auto-generated CLI docs without re-parsing terminal output.
+    """
+    import click
+
+    is_group = isinstance(cmd, click.Group)
+    params: list[CliParam] = []
+    for p in cmd.params:
+        if isinstance(p, click.Option):
+            kind = "option"
+            choices: list[str] | None = None
+            if isinstance(p.type, click.Choice):
+                choices = list(p.type.choices)
+            default = None
+            if p.default is not None and p.default is not False:
+                default = str(p.default)
+            type_name = (
+                "CHOICE" if choices else getattr(p.type, "name", str(p.type)).upper()
+            )
+            params.append(CliParam(
+                name=(p.opts[0] if p.opts else p.name) or "",
+                kind=kind,
+                type=type_name,
+                help=p.help or "",
+                required=bool(p.required),
+                is_flag=bool(getattr(p, "is_flag", False)),
+                default=default,
+                choices=choices,
+                multiple=bool(getattr(p, "multiple", False)),
+            ))
+        elif isinstance(p, click.Argument):
+            type_name = getattr(p.type, "name", str(p.type)).upper()
+            params.append(CliParam(
+                name=p.name or "",
+                kind="argument",
+                type=type_name,
+                help="",
+                required=bool(p.required),
+                is_flag=False,
+                default=None,
+                choices=None,
+                multiple=bool(getattr(p, "nargs", 1) != 1),
+            ))
+
+    subcommands: list[CliCommand] = []
+    if is_group:
+        for subname in sorted(cmd.commands.keys()):
+            subcmd = cmd.commands[subname]
+            subcommands.append(
+                _introspect_click_command(subcmd, subname, path + [subname]),
+            )
+
+    return CliCommand(
+        name=name,
+        path=path,
+        help=(cmd.help or cmd.__doc__ or "").strip(),
+        short_help=(cmd.short_help or "").strip(),
+        is_group=is_group,
+        params=params,
+        subcommands=subcommands,
     )
