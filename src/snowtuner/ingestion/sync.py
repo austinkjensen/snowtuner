@@ -80,3 +80,38 @@ def sync_all(
         except Exception as e:
             errors.append(SyncError(source_name=s.name, error=f"{type(e).__name__}: {e}"))
     return results, errors
+
+
+def backfill(
+    sources: Iterable[Source],
+    client: SnowflakeClient,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    days: int,
+) -> tuple[list[SyncResult], list[SyncError]]:
+    """Re-pull historical data for the targeted sources without touching app.* state.
+
+    Mechanism: DELETE the high-water mark for each source, then ``sync_all``
+    with ``initial_lookback_days=days``.  Because every ``raw.*`` table
+    upserts on a PK (real or synthesized), overlapping rows are no-ops.
+
+    This is the right primitive for "I want more history than the
+    default 14-day initial lookback" or "I want to refetch the last 30
+    days because I think something was redacted." It does NOT touch:
+
+      * ``app.recommendations`` (accept/reject decisions preserved)
+      * ``app.experiments`` + ``app.experiment_runs`` (reports preserved)
+      * ``app.autonomous_*`` (configs + audit trail preserved)
+      * ``app.query_groups`` (saved user-built groups preserved)
+      * ``features.*`` (recomputable via the next ``snowtuner features`` run)
+
+    For sources without a watermark (``WarehousesSource`` is full-refresh),
+    backfill is a no-op — they always reflect the current state of Snowflake.
+    """
+    for s in sources:
+        if s.watermark_column:
+            conn.execute(
+                "DELETE FROM app.sync_watermarks WHERE source_name = ?",
+                [s.name],
+            )
+    return sync_all(sources, client, conn, initial_lookback_days=days)

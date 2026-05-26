@@ -45,6 +45,9 @@ def default_registry() -> RecommenderRegistry:
     from snowtuner.recommenders.builtins.auto_suspend_survival import (
         AutoSuspendSurvivalTuner,
     )
+    from snowtuner.recommenders.builtins.gen2_candidate_finder import (
+        Gen2CandidateFinder,
+    )
     from snowtuner.recommenders.builtins.rule_based_right_sizer import (
         RuleBasedRightSizer,
     )
@@ -52,4 +55,9 @@ def default_registry() -> RecommenderRegistry:
     reg = RecommenderRegistry()
     reg.register(AutoSuspendSurvivalTuner())
     reg.register(RuleBasedRightSizer())
+    # Candidate finder for Gen1→Gen2 experiments.  Doesn't emit direct
+    # recommendations — only proposes experiments via propose_experiments().
+    # The eventual AlterWarehouse rec comes from experiments/derive.py once
+    # the experiment completes.
+    reg.register(Gen2CandidateFinder())
     return reg

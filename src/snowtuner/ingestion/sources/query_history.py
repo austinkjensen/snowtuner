@@ -25,6 +25,19 @@ class QueryHistorySource(Source):
     target_table = "raw.query_history"
     watermark_column = "start_time"
 
+    # Schema drift inputs — see Source base class.
+    source_view = "SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY"
+    expected_source_columns = [
+        "query_id", "query_text", "query_type", "execution_status", "user_name",
+        "role_name", "warehouse_name", "warehouse_size", "database_name",
+        "schema_name", "start_time", "end_time", "total_elapsed_time",
+        "compilation_time", "execution_time", "queued_overload_time",
+        "queued_provisioning_time", "bytes_scanned",
+        "bytes_spilled_to_local_storage", "bytes_spilled_to_remote_storage",
+        "rows_produced", "credits_used_cloud_services", "query_hash",
+        "query_parameterized_hash", "error_message",
+    ]
+
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "start_time >= %s" if since else "TRUE"
         params: list = [since] if since else []

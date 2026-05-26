@@ -27,6 +27,7 @@ from typing import Callable
 import duckdb
 
 from snowtuner.experiments.config_delta import WarehouseConfig
+from snowtuner.experiments.cost_estimate import QueryStats
 from snowtuner.experiments.model import (
     ExperimentRun,
     ExperimentStatus,
@@ -38,7 +39,7 @@ from snowtuner.experiments.provisioning import (
     render_drop_warehouse_sql,
     test_warehouse_name,
 )
-from snowtuner.experiments.replay import prepare_session, replay_one
+from snowtuner.experiments.replay import replay_one
 from snowtuner.experiments.sampling import SampledQuery, SamplingStrategy, StratifiedByFamily
 from snowtuner.experiments.stats import aggregate
 from snowtuner.experiments.store import ExperimentStore
@@ -167,14 +168,31 @@ class ExperimentEngine:
             else:
                 control_config = WarehouseConfig(name="__BENCHMARK_NO_CONTROL__")
 
-            sampled = self._sample_queries(workload_wh, exp.proposed.sample_size)
-            if not sampled:
-                self.store.set_status(
-                    experiment_id, ExperimentStatus.FAILED,
-                    aborted_reason=f"no queries available to sample from "
-                                   f"query_history for warehouse {workload_wh!r}",
-                )
-                return
+            # Phase 3: read the frozen sample picked at propose-time.  This
+            # is the canonical path; legacy experiments without a frozen
+            # list fall through to live sampling for back-compat.
+            if exp.proposed.sampled_query_ids:
+                sampled = self._load_sampled_queries(exp.proposed.sampled_query_ids)
+                if not sampled:
+                    self.store.set_status(
+                        experiment_id, ExperimentStatus.FAILED,
+                        aborted_reason=(
+                            "no replayable queries from the frozen workload; "
+                            "the rows may have been deleted from raw.query_history"
+                        ),
+                    )
+                    return
+            else:
+                # Legacy path: experiment was proposed before Phase 3 froze
+                # the sample.  Run the warehouse-based sampler now.
+                sampled = self._sample_queries(workload_wh, exp.proposed.sample_size)
+                if not sampled:
+                    self.store.set_status(
+                        experiment_id, ExperimentStatus.FAILED,
+                        aborted_reason=f"no queries available to sample from "
+                                       f"query_history for warehouse {workload_wh!r}",
+                    )
+                    return
 
             # Step 2: persist test warehouse names BEFORE creating them, so a
             # crash mid-CREATE doesn't strand them.
@@ -292,9 +310,61 @@ class ExperimentEngine:
     def _sample_queries(
         self, target_warehouse: str, sample_size: int,
     ) -> list[SampledQuery]:
-        """Pick representative queries to replay.  Trims to ``sample_size``."""
+        """Pick representative queries to replay.  Trims to ``sample_size``.
+
+        Legacy path — only invoked for experiments proposed before Phase 3,
+        where ``ProposedExperiment.sampled_query_ids`` is empty.
+        """
         samples = self.sampler.select(self.duck, target_warehouse)
         return samples[:sample_size]
+
+    def _load_sampled_queries(
+        self, query_ids: list[str],
+    ) -> list[SampledQuery]:
+        """Materialize ``SampledQuery`` objects from the frozen ID list.
+
+        Used at engine run-time for experiments that resolved their workload
+        at propose-time (Phase 3 path).  Preserves the order of ``query_ids``
+        so the replay ordering matches what the user saw in the preview.
+
+        Queries that have since vanished from ``raw.query_history`` (e.g.
+        the user re-synced and the row aged out) are silently dropped — the
+        engine reports the run as having fewer queries; the caller surfaces
+        a 0-result via the same failure path used elsewhere.
+        """
+        if not query_ids:
+            return []
+        placeholders = ", ".join(["?"] * len(query_ids))
+        rows = self.duck.execute(
+            f"""
+            SELECT
+                query_id, query_text, query_parameterized_hash,
+                total_elapsed_ms, bytes_scanned
+            FROM raw.query_history
+            WHERE query_id IN ({placeholders})
+            """,
+            query_ids,
+        ).fetchall()
+        by_id = {r[0]: r for r in rows}
+
+        out: list[SampledQuery] = []
+        for qid in query_ids:
+            r = by_id.get(qid)
+            if r is None:
+                continue
+            _, qtext, phash, elapsed, bytes_scanned = r
+            out.append(SampledQuery(
+                query_id=qid,
+                parameterized_hash=phash or "",
+                representative_sql=qtext,
+                historical=QueryStats(
+                    query_id=qid,
+                    p50_elapsed_ms=float(elapsed or 0),
+                    mean_elapsed_ms=float(elapsed or 0),
+                    bytes_scanned=int(bytes_scanned) if bytes_scanned is not None else None,
+                ),
+            ))
+        return out
 
     def _run_replay_loop(
         self,

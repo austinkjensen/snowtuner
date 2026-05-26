@@ -44,6 +44,17 @@ class Source(ABC):
     # means "no cap" — only safe for small sources like SHOW WAREHOUSES.
     default_initial_lookback_days: int | None = 14
 
+    # Schema drift detection (v0.2).
+    # ``source_view`` is the fully-qualified Snowflake view the source pulls
+    # from, e.g. ``'SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY'``.  Sources backed
+    # by ``SHOW`` commands or table functions set this to None and are
+    # skipped by drift checks.
+    # ``expected_source_columns`` is the list of column names the source's
+    # SELECT pulls from that view, lowercased.  The drift checker diffs this
+    # against ``INFORMATION_SCHEMA.COLUMNS`` for the view.
+    source_view: str | None = None
+    expected_source_columns: list[str] = []
+
     @abstractmethod
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         """Pull rows from Snowflake since the watermark."""

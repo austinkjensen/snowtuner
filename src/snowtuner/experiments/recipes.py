@@ -24,7 +24,7 @@ from snowtuner.experiments.config_delta import WarehouseConfig, WarehouseConfigD
 from snowtuner.experiments.cost_estimate import CostEstimate, QueryStats, estimate_experiment_cost
 from snowtuner.experiments.eligibility import AccountInfo, check_arm_eligibility
 from snowtuner.experiments.model import ProposedExperiment
-from snowtuner.recommenders.sizes import SIZES, credit_rate, step
+from snowtuner.recommenders.sizes import credit_rate, step
 
 # Default knobs used by every recipe; recipes that need to deviate set their own.
 _DEFAULT_SAMPLE_SIZE = 30  # 6 families × 5 queries

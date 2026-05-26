@@ -1,7 +1,7 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
-import { ArrowLeft, Beaker, CheckCircle2, AlertTriangle, XCircle } from 'lucide-react'
+import { ArrowLeft, Beaker, CheckCircle2, AlertTriangle, XCircle, Trash2, ListChecks } from 'lucide-react'
 import { api, type Experiment, type ExperimentStatus } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -178,6 +178,10 @@ function ExperimentDetail() {
         </Card>
       </div>
 
+      {/* Workload (Phase 3) — frozen list of queries the engine will replay.
+          Editable only while PROPOSED. */}
+      <WorkloadCard experiment={e} />
+
       <Card className="mt-4">
         <CardHeader>
           <CardTitle>Arms ({e.proposed.arms.length})</CardTitle>
@@ -202,10 +206,10 @@ function ExperimentDetail() {
                       .join(', ') || <span className="text-muted-foreground">control</span>}
                   </td>
                   <td className="px-2 py-2 text-xs">
-                    {arm.eligibility_issues.length === 0 ? (
+                    {(arm.eligibility_issues ?? []).length === 0 ? (
                       <span className="text-muted-foreground">—</span>
                     ) : (
-                      arm.eligibility_issues.map((i, idx) => (
+                      (arm.eligibility_issues ?? []).map((i, idx) => (
                         <div
                           key={idx}
                           className={i.severity === 'error' ? 'text-destructive' : 'text-yellow-600'}
@@ -236,6 +240,173 @@ function ExperimentDetail() {
       )}
     </div>
   )
+}
+
+// ── Workload card (Phase 3) ──────────────────────────────────────────
+//
+// The list of queries the engine will replay.  Resolved at propose-time
+// (auto-sampled from a warehouse OR loaded from a saved group's members).
+// While the experiment is PROPOSED, each row has a trash button that
+// removes the query from the workload (server re-estimates cost).  After
+// acceptance the list is read-only.
+//
+// Clicking a row opens the query in /queries?detail=<id> in a new tab so
+// the user can see the full SQL without losing the experiment context.
+
+function WorkloadCard({ experiment }: { experiment: Experiment }) {
+  const e = experiment
+  const ids = e.proposed.sampled_query_ids ?? []
+  const sourceLabel = workloadSourceLabel(e.proposed.workload_source, ids.length)
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <ListChecks className="h-5 w-5 text-primary/80" />
+          Workload ({ids.length})
+          <Badge variant="outline" className="ml-2 font-normal">
+            {sourceLabel}
+          </Badge>
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {/* sample_warnings = non-blocking issues from propose-time resolution
+            (e.g. "group has 18 eligible members, requested 30"). */}
+        {(e.proposed.sample_warnings ?? []).length > 0 && (
+          <div className="mb-3 rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3 text-xs">
+            <div className="mb-1 font-medium text-yellow-700">
+              Resolution warnings
+            </div>
+            <ul className="list-disc space-y-0.5 pl-4 text-muted-foreground">
+              {(e.proposed.sample_warnings ?? []).map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {ids.length === 0 ? (
+          <div className="text-sm text-muted-foreground">
+            No frozen workload — this is an older experiment proposed before
+            Phase 3.  Queries will be sampled live at engine run-time.
+          </div>
+        ) : (
+          <WorkloadList
+            experimentId={e.id}
+            queryIds={ids}
+            editable={e.status === 'PROPOSED'}
+          />
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function workloadSourceLabel(source: string, count: number): string {
+  if (source === 'auto') return `auto-sampled · ${count} queries`
+  if (source.startsWith('group:')) {
+    const id = source.split(':', 2)[1]
+    return `saved group #${id} · ${count} queries`
+  }
+  return source
+}
+
+function WorkloadList({
+  experimentId,
+  queryIds,
+  editable,
+}: {
+  experimentId: number
+  queryIds: string[]
+  editable: boolean
+}) {
+  const qc = useQueryClient()
+  // Fetch the query previews in parallel.  We could add a bulk endpoint
+  // later; for now N small calls is fine (N ≤ 30 by default).
+  const detail = useQuery({
+    queryKey: ['experiment-workload', experimentId, queryIds.join(',')],
+    queryFn: async () => {
+      const rows = await Promise.all(
+        queryIds.map((id) => api.getQuery(id).catch(() => null)),
+      )
+      return rows.map((d, i) => ({
+        query_id: queryIds[i],
+        text: d?.query_text ?? '(unavailable)',
+        elapsed_ms: d?.total_elapsed_ms ?? null,
+        warehouse: d?.warehouse_name ?? null,
+      }))
+    },
+  })
+  const remove = useMutation({
+    mutationFn: (queryId: string) => api.removeSampledQuery(experimentId, queryId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['experiment', experimentId] })
+      qc.invalidateQueries({ queryKey: ['experiment-workload', experimentId] })
+    },
+  })
+
+  if (detail.isLoading) {
+    return <div className="text-sm text-muted-foreground">Loading…</div>
+  }
+  const rows = detail.data ?? []
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="border-b text-left text-xs uppercase text-muted-foreground">
+          <tr>
+            <th className="px-2 py-2">SQL preview</th>
+            <th className="px-2 py-2 whitespace-nowrap">Warehouse</th>
+            <th className="px-2 py-2 text-right whitespace-nowrap">Historical elapsed</th>
+            {editable && <th className="px-2 py-2"></th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.query_id} className="border-b hover:bg-muted/30">
+              <td className="px-2 py-2 font-mono text-xs">
+                <a
+                  href={`/queries?detail=${encodeURIComponent(r.query_id)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block max-w-xl truncate text-primary hover:underline"
+                  title={r.text}
+                >
+                  {r.text.slice(0, 160) || '(empty)'}
+                </a>
+              </td>
+              <td className="px-2 py-2 text-xs max-w-[12rem] truncate" title={r.warehouse ?? ''}>
+                {r.warehouse ?? '—'}
+              </td>
+              <td className="px-2 py-2 text-right font-mono text-xs whitespace-nowrap">
+                {r.elapsed_ms != null ? fmtMs(r.elapsed_ms) : '—'}
+              </td>
+              {editable && (
+                <td className="px-2 py-2 text-right">
+                  <button
+                    onClick={() => remove.mutate(r.query_id)}
+                    disabled={remove.isPending}
+                    className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+                    title="Remove from workload"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {remove.error && (
+        <div className="mt-2 text-xs text-destructive">
+          {String(remove.error)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`
+  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`
 }
 
 function ReportCard({ experiment }: { experiment: Experiment }) {
@@ -371,11 +542,11 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
           </table>
         )}
 
-        {r.sample_size_warnings.length > 0 && (
+        {(r.sample_size_warnings ?? []).length > 0 && (
           <div className="rounded-md border border-yellow-500/30 bg-yellow-500/5 p-3">
             <div className="text-sm font-medium text-yellow-700">Sample-size warnings</div>
             <ul className="mt-1 space-y-0.5 text-xs">
-              {r.sample_size_warnings.map((w, i) => (
+              {(r.sample_size_warnings ?? []).map((w, i) => (
                 <li key={i}>• {w}</li>
               ))}
             </ul>
@@ -388,7 +559,7 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
             <div>
               <strong>Corrections:</strong>
               <ul className="ml-4 list-disc">
-                {r.statistical_corrections_applied.map((c, i) => (
+                {(r.statistical_corrections_applied ?? []).map((c, i) => (
                   <li key={i}>{c}</li>
                 ))}
               </ul>
@@ -396,7 +567,7 @@ function ReportCard({ experiment }: { experiment: Experiment }) {
             <div>
               <strong>Assumptions:</strong>
               <ul className="ml-4 list-disc">
-                {r.assumptions.map((a, i) => (
+                {(r.assumptions ?? []).map((a, i) => (
                   <li key={i}>{a}</li>
                 ))}
               </ul>

@@ -18,7 +18,6 @@ from snowtuner.autonomous import (
     AutonomousApplicationStore,
     AutonomousConfigStore,
     AutonomousRunner,
-    CATCH_ALL,
 )
 from snowtuner.experiments import ExperimentStatus
 from snowtuner.features import DEFAULT_TRANSFORMS
@@ -54,18 +53,34 @@ def seed(days: int) -> None:
 @cli.command()
 @click.option("--yes", is_flag=True, default=False,
               help="Skip the confirmation prompt.  Useful for scripted resets.")
-def reset(yes: bool) -> None:
+@click.option("--include-user-config", is_flag=True, default=False,
+              help="Also wipe app.query_groups + app.autonomous_config "
+                   "(by default these are preserved across reset).")
+def reset(yes: bool, include_user_config: bool) -> None:
     """Wipe the local snowtuner.duckdb and re-initialize from scratch.
 
     Pre-release we don't ship schema migrations; when the schema changes,
     upgrade by running this command then [cyan]snowtuner sync[/cyan] to
     repopulate raw.* from Snowflake.
 
-    DOES NOT TOUCH: credentials (~/.snowtuner/creds.toml), the RSA key,
-    or anything on Snowflake.
+    [bold]Preservation defaults (v0.2):[/bold]
 
-    DOES WIPE: app.recommendations, app.experiments, app.autonomous_applications,
-    app.training_state, app.sync_watermarks, and all of raw.* and features.*.
+    \b
+      app.query_groups       — PRESERVED (override with --include-user-config)
+      app.autonomous_config  — PRESERVED (override with --include-user-config)
+      app.autonomous_applications — archived to ~/.snowtuner/audit-archive/
+                                    BEFORE deletion (always-on)
+
+    [bold]Still wiped:[/bold] app.recommendations, app.experiments,
+    app.experiment_runs, app.training_state, app.sync_watermarks,
+    all of raw.* and features.*.
+
+    [bold]Does not touch:[/bold] credentials (~/.snowtuner/creds.toml),
+    the RSA key, or anything on Snowflake.
+
+    For a backfill-only workflow ("I want more history"), use
+    [cyan]snowtuner backfill --days N[/cyan] instead — it preserves
+    everything in app.* and just resets the sync watermarks.
 
     If you have orphaned SNOWTUNER_EXP_* test warehouses on Snowflake from a
     crashed experiment, run [cyan]snowtuner experiments recover[/cyan] FIRST —
@@ -116,11 +131,50 @@ def reset(yes: bool) -> None:
             console.print("[dim]Cancelled.[/dim]")
             raise SystemExit(0)
 
-    deleted = reset_database()
-    console.print(f"[green]Wiped[/green] {deleted}")
+    # Pre-flight: count what's about to be preserved + archived so the user
+    # sees the impact before confirming.  Best-effort — schema mismatches
+    # from a prior version may make this fail, in which case we just skip.
+    preserved_groups_n = 0
+    preserved_configs_n = 0
+    audit_n = 0
+    try:
+        from snowtuner.autonomous import (
+            AutonomousConfigStore,
+            AutonomousApplicationStore,
+        )
+        from snowtuner.query_groups import QueryGroupStore
+        conn = get_connection()
+        if not include_user_config:
+            preserved_groups_n = len(QueryGroupStore(conn).list(limit=10_000))
+            preserved_configs_n = len(AutonomousConfigStore(conn).list())
+        audit_n = len(AutonomousApplicationStore(conn).list(limit=10_000))
+    except Exception:
+        pass
 
-    # Trigger fresh init so the file exists with the current schema.
-    get_connection()
+    if preserved_groups_n or preserved_configs_n:
+        console.print(
+            f"[dim]Preserving across reset:[/dim] {preserved_groups_n} query "
+            f"group(s), {preserved_configs_n} autonomous config(s)"
+        )
+    if include_user_config and (preserved_groups_n or preserved_configs_n):
+        console.print(
+            f"[yellow]--include-user-config:[/yellow] user-authored config "
+            f"WILL be wiped"
+        )
+    if audit_n:
+        console.print(
+            f"[dim]Archiving:[/dim] {audit_n} autonomous-application audit "
+            f"row(s) → ~/.snowtuner/audit-archive/"
+        )
+
+    deleted = reset_database(include_user_config=include_user_config)
+    console.print(f"[green]Wiped[/green] {deleted}")
+    if preserved_groups_n or preserved_configs_n:
+        console.print(
+            f"[green]Restored[/green] {preserved_groups_n} query group(s), "
+            f"{preserved_configs_n} autonomous config(s)"
+        )
+
     console.print(f"[green]Recreated[/green] with current schema.")
     console.print(
         "Next steps: [cyan]snowtuner sync[/cyan] to repopulate raw.*, then "
@@ -182,9 +236,156 @@ def sync(lookback_days: int, source_filter: str | None) -> None:
 
 
 @cli.command()
+@click.option("--days", type=int, required=True,
+              help="Lookback window in days.  Source watermarks are reset to "
+                   "(now - days) before re-syncing.")
+@click.option("--source", "source_filter", default=None,
+              help="Backfill only one source by name (e.g. 'query_history').  "
+                   "Default: all incremental sources.")
+def backfill(days: int, source_filter: str | None) -> None:
+    """Re-pull a wider historical window without destroying app.* state.
+
+    Unlike [cyan]snowtuner reset[/cyan], this preserves:
+        recommendations, experiments + reports, autonomous configs + audit,
+        saved query groups, derived features.
+
+    Mechanism: DELETE the sync watermark for each targeted source, then
+    re-sync with [cyan]--lookback-days=DAYS[/cyan].  Idempotent because
+    raw.* tables upsert on a PK; overlapping rows are no-ops.
+    """
+    from snowtuner.ingestion.sync import backfill as do_backfill
+
+    conn = get_connection()
+    try:
+        client = SnowflakeClient.from_resolver()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    sources = list(DEFAULT_SOURCES)
+    if source_filter:
+        sources = [s for s in sources if s.name == source_filter]
+        if not sources:
+            names = ", ".join(s.name for s in DEFAULT_SOURCES)
+            console.print(f"[red]No source named {source_filter!r}.[/red]  "
+                          f"Available: {names}")
+            raise SystemExit(1)
+
+    # Filter to sources that actually have a watermark — full-refresh sources
+    # like ``warehouses`` ignore the lookback concept.
+    incremental = [s for s in sources if s.watermark_column]
+    skipped = [s for s in sources if not s.watermark_column]
+    if skipped:
+        console.print(
+            f"[dim]Skipping {len(skipped)} full-refresh source(s) "
+            f"(no watermark): {', '.join(s.name for s in skipped)}[/dim]"
+        )
+    if not incremental:
+        console.print(
+            "[yellow]No incremental sources to backfill.[/yellow]"
+        )
+        return
+
+    console.print(
+        f"[bold]Backfilling[/bold] {len(incremental)} source(s) "
+        f"with [cyan]{days}d[/cyan] lookback…  "
+        f"[dim](app.* state preserved)[/dim]"
+    )
+    results, errors = do_backfill(incremental, client, conn, days=days)
+    client.close()
+
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("Source")
+    tbl.add_column("Rows", justify="right")
+    tbl.add_column("High water")
+    tbl.add_column("Duration", justify="right")
+    for r in results:
+        tbl.add_row(
+            r.source_name, str(r.rows_ingested),
+            str(r.high_water or "—"),
+            f"{r.duration_seconds:.2f}s",
+        )
+    console.print(tbl)
+
+    if errors:
+        console.print("\n[red]Errors:[/red]")
+        for e in errors:
+            console.print(f"  • [bold]{e.source_name}[/bold]: {e.error}")
+        raise SystemExit(2)
+
+    console.print(
+        "[green]Backfill complete.[/green]  "
+        "Run [cyan]snowtuner features[/cyan] or [cyan]snowtuner run[/cyan] "
+        "if you want derived features rebuilt from the new raw data."
+    )
+
+
+@cli.command("check-schema")
+def check_schema() -> None:
+    """Detect schema drift between local sources and Snowflake's views.
+
+    Warns when Snowflake's QUERY_HISTORY (and friends) added or removed
+    columns since the source was written.  Warn-only — no changes are
+    applied.  Use this before debugging "sync compile error".
+    """
+    from snowtuner.credentials import CredentialResolver
+    from snowtuner.ingestion.drift import check_drift
+    from snowtuner.ingestion.snowflake_client import SnowflakeClient
+
+    resolver = CredentialResolver()
+    result = resolver.load()
+    if result is None:
+        console.print(
+            "[red]No Snowflake credentials configured.  "
+            "Run [bold]snowtuner init[/bold] first.[/red]"
+        )
+        raise click.Abort()
+    client = SnowflakeClient(result.credentials)
+    report = check_drift(client, list(DEFAULT_SOURCES))
+
+    any_drift = False
+    for s in report.sources:
+        if s.error:
+            console.print(
+                f"[yellow]⚠ {s.source_name}[/yellow] "
+                f"({s.source_view}): drift check failed — {s.error}"
+            )
+            continue
+        if not s.has_drift:
+            console.print(
+                f"[green]✓ {s.source_name}[/green] "
+                f"({s.source_view}): no drift "
+                f"({len(s.expected_columns)} columns match)"
+            )
+            continue
+        any_drift = True
+        severity = "red" if s.is_actionable else "yellow"
+        console.print(
+            f"[{severity}]"
+            f"{'✗' if s.is_actionable else '⚠'} {s.source_name}[/{severity}] "
+            f"({s.source_view}):"
+        )
+        if s.missing_from_snowflake:
+            console.print(
+                f"  [red]missing from Snowflake "
+                f"(sync will fail):[/red] "
+                f"{', '.join(s.missing_from_snowflake)}"
+            )
+        if s.extra_in_snowflake:
+            console.print(
+                f"  [dim]extra in Snowflake "
+                f"(not mirrored locally):[/dim] "
+                f"{', '.join(s.extra_in_snowflake)}"
+            )
+    if report.any_actionable:
+        raise click.exceptions.Exit(code=1)
+    if not any_drift:
+        console.print("\n[green]All sources match Snowflake's schema.[/green]")
+
+
+@cli.command()
 def status() -> None:
     """Snapshot of ingested data, warehouses, recommenders, and recommendations."""
-    from datetime import datetime, timezone
     conn = get_connection()
 
     # ── Data freshness per source ──────────────────────────────────
@@ -482,18 +683,10 @@ def reject(rec_id: int, note: str | None) -> None:
     console.print(f"[yellow]#{rec_id} marked REJECTED.[/yellow]")
 
 
-@cli.command()
-def ui() -> None:
-    """Launch the Streamlit UI."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    app_path = Path(__file__).parent / "ui" / "app.py"
-    subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(app_path)],
-        check=False,
-    )
+# The Streamlit ``ui`` command was removed when the React SPA took over the
+# operator surface.  See ``web/`` for the current UI; serve it via
+# ``snowtuner api`` + ``cd web && npm run dev`` during development, or have
+# the production build served by the API directly.
 
 
 @cli.command()
@@ -531,9 +724,71 @@ def recommenders() -> None:
 def api(host: str, port: int, reload: bool, loop: str) -> None:
     """Launch the HTTP API service."""
     import uvicorn
+    from snowtuner.api.auth import assert_safe_host, get_auth_mode, get_or_create_token
+
+    # Refuse to start in 'none' mode if the bind isn't loopback — protects
+    # users from accidentally exposing an unauthenticated API.
+    assert_safe_host(host)
+
+    # Surface auth-mode at startup so operators know what they're shipping.
+    mode = get_auth_mode()
+    if mode == "token":
+        token = get_or_create_token()
+        console.print(
+            f"[bold]auth:[/bold] token mode active.  Bearer token: "
+            f"[cyan]{token[:8]}…{token[-4:]}[/cyan] (full token in "
+            f"~/.snowtuner/api_token)"
+        )
+    else:
+        console.print(
+            f"[bold]auth:[/bold] [yellow]{mode}[/yellow] — "
+            f"set SNOWTUNER_AUTH_MODE=token before exposing remotely"
+        )
+
     uvicorn.run(
         "snowtuner.api.app:create_app",
         host=host, port=port, reload=reload, factory=True, loop=loop,
+    )
+
+
+@cli.group()
+def auth() -> None:
+    """Inspect or rotate the API bearer token."""
+
+
+@auth.command("show")
+def auth_show() -> None:
+    """Print the active API token (or where it'd come from)."""
+    from snowtuner.api.auth import get_auth_mode, get_or_create_token
+    mode = get_auth_mode()
+    console.print(f"mode: [bold]{mode}[/bold]")
+    if mode == "token":
+        token = get_or_create_token()
+        console.print(f"token: [cyan]{token}[/cyan]")
+        console.print(
+            "Use as: [dim]Authorization: Bearer <token>[/dim]"
+        )
+    else:
+        console.print(
+            "[yellow]No token required in this mode.  "
+            "Set SNOWTUNER_AUTH_MODE=token to enable bearer auth.[/yellow]"
+        )
+
+
+@auth.command("rotate")
+def auth_rotate() -> None:
+    """Generate a fresh API token (invalidates the previous one)."""
+    import os
+    import secrets
+    from snowtuner.api.auth import _TOKEN_PATH
+    new = secrets.token_urlsafe(32)
+    _TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _TOKEN_PATH.write_text(new + "\n")
+    os.chmod(_TOKEN_PATH, 0o600)
+    console.print(f"new token: [cyan]{new}[/cyan]")
+    console.print(
+        "[dim]Restart any running snowtuner API and update any clients "
+        "(SPA, MCP, curl scripts) that cached the previous one.[/dim]"
     )
 
 

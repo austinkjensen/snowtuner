@@ -70,6 +70,23 @@ class ProposedExperiment(BaseModel):
     eligibility_issues: list[Issue] = Field(default_factory=list)
     proposed_by: str            # recommender name@version, or 'user' for UI-built
 
+    # ── Workload resolution (Phase 3) ────────────────────────────────
+    # The frozen list of query IDs that will actually be replayed.  Resolved
+    # at propose-time (from either the warehouse auto-sampler or a saved query
+    # group) so the user can preview and edit the workload before accepting.
+    # Engine reads from this list at run time instead of re-sampling.
+    #
+    # Empty list means "fall back to live sampling at run time" — back-compat
+    # path for experiments proposed before Phase 3.
+    sampled_query_ids: list[str] = Field(default_factory=list)
+    # Source provenance — purely informational, lets the UI render
+    # "Workload: 30 queries from saved group 'ETL slow queries'".
+    workload_source: str = "auto"   # 'auto' | 'group:<id>'
+    # Non-blocking issues surfaced during resolution: "only 18 eligible
+    # queries in the group; requested 30", "5 queries excluded for unsafe
+    # text", etc.  Carried forward into the report's sample_size_warnings.
+    sample_warnings: list[str] = Field(default_factory=list)
+
 
 class ArmObservation(BaseModel):
     """Aggregated metrics for a single arm.

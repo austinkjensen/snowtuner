@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 class ActionType(str, Enum):
     ALTER_WAREHOUSE = "ALTER_WAREHOUSE"
     CREATE_WAREHOUSE = "CREATE_WAREHOUSE"
-    CREATE_ROUTING_RULE = "CREATE_ROUTING_RULE"
     CREATE_LOCAL_DUCKDB_TABLE = "CREATE_LOCAL_DUCKDB_TABLE"
+    # CREATE_ROUTING_RULE removed in v0.2 — routing is a future-slice feature
 
 
 class Issue(BaseModel):
@@ -45,9 +45,10 @@ class Action(BaseModel):
     def target_warehouse_name(self) -> str | None:
         """Warehouse name this action affects, if any.  Used by autonomous-mode
         config matching.  Subclasses operating on warehouses should return the
-        warehouse name; everything else returns None.  (Named with the ``_name``
-        suffix to avoid colliding with Pydantic fields named ``target_warehouse``
-        on subclasses such as ``CreateRoutingRule``.)"""
+        warehouse name; everything else returns None.  Named with the ``_name``
+        suffix to avoid colliding with future action types whose Pydantic
+        schemas might want a separate ``target_warehouse: str`` field.
+        """
         return None
 
     def to_sql(self) -> str:

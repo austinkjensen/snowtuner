@@ -45,6 +45,7 @@ class AutonomousDecision:
 @dataclass
 class AutonomousRunReport:
     decisions: list[AutonomousDecision] = field(default_factory=list)
+    skipped_reason: str | None = None  # populated when the whole run no-ops
 
     def applied(self) -> list[AutonomousDecision]:
         return [d for d in self.decisions if d.decision == "applied"]
@@ -67,6 +68,21 @@ class AutonomousRunner:
 
     def run(self) -> AutonomousRunReport:
         report = AutonomousRunReport()
+
+        # Coordination guard: if any experiment is in RUNNING state, defer
+        # autonomous apply.  Applying ALTER WAREHOUSE on a warehouse that's
+        # being actively replayed against would corrupt the experiment's
+        # measurements (the engine sees the new config mid-replay).  Sync
+        # uses a separate connection so it doesn't have this concern; the
+        # autonomous runner does, because it issues DDL on Snowflake.
+        from snowtuner.experiments import ExperimentStore
+        if ExperimentStore(self.conn).has_running_experiment():
+            report.skipped_reason = (
+                "an experiment is currently RUNNING; deferring autonomous "
+                "apply to avoid corrupting in-flight measurements"
+            )
+            return report
+
         proposed = self.recs.list(status=RecommendationStatus.PROPOSED, limit=1000)
         for rec in proposed:
             decision = self._evaluate(rec)

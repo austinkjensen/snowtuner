@@ -107,7 +107,7 @@ function CliSection() {
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Terminal className="h-5 w-5" />
-          CLI ({tree.data?.subcommands.length ?? '…'} top-level commands)
+          CLI ({tree.data?.subcommands?.length ?? '…'} top-level commands)
         </CardTitle>
       </CardHeader>
       <CardContent>
@@ -119,7 +119,7 @@ function CliSection() {
         {tree.isLoading && <div className="text-sm text-muted-foreground">Loading…</div>}
         {tree.data && (
           <div className="space-y-2">
-            {tree.data.subcommands.map((c) => (
+            {(tree.data.subcommands ?? []).map((c) => (
               <CommandNode key={c.name} cmd={c} depth={0} />
             ))}
           </div>
@@ -132,7 +132,12 @@ function CliSection() {
 function CommandNode({ cmd, depth }: { cmd: CliCommand; depth: number }) {
   const [open, setOpen] = useState(depth === 0 ? false : true)
   const indent = depth * 12
-  const hasBody = cmd.params.length > 0 || cmd.subcommands.length > 0 || cmd.help
+  // ``params`` / ``subcommands`` are optional in the generated schema because
+  // the backend uses ``Field(default_factory=list)``; fall back to [] so the
+  // length checks are total.
+  const params = cmd.params ?? []
+  const subcommands = cmd.subcommands ?? []
+  const hasBody = params.length > 0 || subcommands.length > 0 || cmd.help
   const fullPath = cmd.path.join(' ')
 
   return (
@@ -171,12 +176,12 @@ function CommandNode({ cmd, depth }: { cmd: CliCommand; depth: number }) {
               {cmd.help}
             </pre>
           )}
-          {cmd.params.length > 0 && (
-            <ParamsTable params={cmd.params} />
+          {params.length > 0 && (
+            <ParamsTable params={params} />
           )}
-          {cmd.subcommands.length > 0 && (
+          {subcommands.length > 0 && (
             <div className="space-y-2">
-              {cmd.subcommands.map((sub) => (
+              {subcommands.map((sub) => (
                 <CommandNode key={sub.name} cmd={sub} depth={depth + 1} />
               ))}
             </div>

@@ -18,314 +18,54 @@ export type AutonomousApplication = Schemas['AutonomousApplicationOut']
 export type CredentialStatus = Schemas['CredentialStatusOut']
 export type CredentialVerify = Schemas['CredentialVerifyOut']
 
-export type RecommendationStatus =
-  | 'PROPOSED'
-  | 'ACCEPTED'
-  | 'REJECTED'
-  | 'APPLIED'
-  | 'ROLLED_BACK'
-  | 'SUPERSEDED'
+// ── Type aliases backed by the generated OpenAPI schema ────────────
+// Run `npm run gen-types` (against a running API) to refresh api-types.ts.
+// CI should fail if the generated file is out of sync.  Adding a new
+// endpoint or changing a Pydantic shape on the backend → regenerate → all
+// the TS consumers automatically pick up the new shape (or fail to compile).
 
-// ── Experiments (v0.2) ──────────────────────────────────────────
-// Defined inline (not pulled from generated api-types) so the UI can ship
-// without regenerating the OpenAPI client every time the experiments domain
-// model changes.  The shapes mirror the backend Pydantic models.
+export type RecommendationStatus = Schemas['RecommendationStatus']
+export type ExperimentStatus = Schemas['ExperimentStatus']
+export type ExperimentKind = Schemas['ExperimentKind']
 
-export type ExperimentStatus =
-  | 'PROPOSED'
-  | 'ACCEPTED'
-  | 'RUNNING'
-  | 'COMPLETED'
-  | 'ABORTED'
-  | 'FAILED'
-  | 'REJECTED'
+export type RecipeInfo = Schemas['RecipeInfo']
+export type BenchmarkArmSpec = Schemas['BenchmarkArmSpec']
+export type ProposeBenchmarkRequest = Schemas['ProposeBenchmarkRequest']
+export type CostEstimate = Schemas['CostEstimate']
+export type Issue = Schemas['Issue']
+export type ArmConfigDelta = Schemas['WarehouseConfigDelta']
+export type Arm = Schemas['Arm']
+export type ProposedExperiment = Schemas['ProposedExperiment']
+export type ArmObservation = Schemas['ArmObservation']
+export type ExperimentReport = Schemas['ExperimentReport']
+export type Experiment = Schemas['Experiment']
 
-export type ExperimentKind = 'tuning' | 'benchmark'
+// ── Queries explorer (generated) ───────────────────────────────
 
-export interface RecipeInfo {
-  name: string
-  summary: string
-}
+export type QueryRow = Schemas['QueryRow']
+export type QueryDetail = Schemas['QueryDetail']
+export type QueryFamily = Schemas['QueryFamily']
+export type QueryListResponse = Schemas['QueryListResponse']
+export type QueryFilterFacets = Schemas['QueryFilterFacets']
 
-export interface BenchmarkArmSpec {
-  name: string
-  size?: string | null              // e.g. 'XSMALL' through 'X6LARGE'
-  generation?: string | null        // '1' or '2'
-  qas_state?: string | null         // 'on' or 'off' (case-insensitive on the wire)
-  qas_max_scale_factor?: number | null
-}
+// ── Query groups (generated) ───────────────────────────────────
 
-export interface ProposeBenchmarkRequest {
-  hypothesis: string
-  workload_warehouse: string
-  arms: BenchmarkArmSpec[]
-  control_arm_name?: string | null
-  sample_size?: number
-  reps_per_arm?: number
-}
+export type QueryGroupKind = Schemas['QueryGroupKind']
+export type QueryFilterSpec = Schemas['QueryFilterSpec']
 
-export interface CostEstimate {
-  low_credits: number
-  high_credits: number
-  rationale: string
-  projected_annual_savings_low_credits?: number | null
-  projected_annual_savings_high_credits?: number | null
-}
-
-export interface Issue {
-  severity: 'warning' | 'error'
-  message: string
-  code?: string | null
-}
-
-export interface ArmConfigDelta {
-  generation?: string | null
-  size?: string | null
-  qas_state?: string | null
-  qas_max_scale_factor?: number | null
-}
-
-export interface Arm {
-  name: string
-  delta: ArmConfigDelta
-  eligibility_issues: Issue[]
-}
-
-export interface ProposedExperiment {
-  kind: ExperimentKind
-  recipe_name: string
-  target_warehouse: string | null
-  workload_warehouse: string | null
-  control_arm_name: string | null
-  hypothesis: string
-  arms: Arm[]
-  sample_size: number
-  reps_per_arm: number
-  cost_estimate: CostEstimate
-  eligibility_issues: Issue[]
-  proposed_by: string
-}
-
-export interface ArmObservation {
-  arm_name: string
-  n_queries_run: number
-  n_queries_failed: number
-  n_queries_excluded: number
-  // Absolute stats (always populated)
-  elapsed_ms_mean: number
-  elapsed_ms_p50: number
-  elapsed_ms_p95: number
-  credits_per_query_mean: number
-  // Paired-delta stats (zero when no control)
-  elapsed_ms_delta_mean: number
-  elapsed_ms_delta_p50: number
-  elapsed_ms_delta_p95: number
-  elapsed_ms_delta_ci_low: number
-  elapsed_ms_delta_ci_high: number
-  credits_per_query_delta_mean: number
-  credits_per_query_delta_ci_low: number
-  credits_per_query_delta_ci_high: number
-  elapsed_p_value_corrected?: number | null
-  credits_p_value_corrected?: number | null
-  // Pareto-frontier flag (benchmark only)
-  is_pareto_optimal: boolean
-}
-
-export interface ExperimentReport {
-  experiment_id: number
-  arms: ArmObservation[]
-  best_arm_name?: string | null
-  best_arm_rationale?: string | null
-  best_arm_objective?: string | null
-  projected_annual_savings_low_credits?: number | null
-  projected_annual_savings_high_credits?: number | null
-  projected_p95_latency_delta_pct_low?: number | null
-  projected_p95_latency_delta_pct_high?: number | null
-  sample_size_warnings: string[]
-  excluded_query_count: number
-  statistical_corrections_applied: string[]
-  assumptions: string[]
-}
-
-export interface Experiment {
-  id: number
-  proposed: ProposedExperiment
-  status: ExperimentStatus
-  proposed_at: string
-  accepted_at?: string | null
-  started_at?: string | null
-  completed_at?: string | null
-  aborted_reason?: string | null
-  actual_cost_credits?: number | null
-  cost_cap_hit: boolean
-  report?: ExperimentReport | null
-  derived_recommendation_id?: number | null
-  test_warehouse_names: string[]
-  test_warehouses_cleaned: boolean
-}
-
-// ── Queries explorer ──────────────────────────────────────────
-
-export interface QueryRow {
-  query_id: string
-  query_text_preview: string
-  query_type: string | null
-  execution_status: string | null
-  user_name: string | null
-  role_name: string | null
-  warehouse_name: string | null
-  warehouse_size: string | null
-  start_time: string | null
-  total_elapsed_ms: number | null
-  bytes_scanned: number | null
-  bytes_spilled_to_local: number | null
-  bytes_spilled_to_remote: number | null
-  queued_overload_ms: number | null
-  query_parameterized_hash: string | null
-}
-
-export interface QueryDetail {
-  query_id: string
-  query_text: string
-  query_type: string | null
-  execution_status: string | null
-  user_name: string | null
-  role_name: string | null
-  warehouse_name: string | null
-  warehouse_size: string | null
-  database_name: string | null
-  schema_name: string | null
-  start_time: string | null
-  end_time: string | null
-  total_elapsed_ms: number | null
-  compilation_ms: number | null
-  execution_ms: number | null
-  queued_overload_ms: number | null
-  queued_provisioning_ms: number | null
-  bytes_scanned: number | null
-  bytes_spilled_to_local: number | null
-  bytes_spilled_to_remote: number | null
-  query_parameterized_hash: string | null
-}
-
-export interface QueryFamily {
-  query_parameterized_hash: string
-  representative_query_id: string
-  representative_sql: string
-  occurrence_count: number
-  mean_elapsed_ms: number | null
-  p95_elapsed_ms: number | null
-  total_elapsed_ms: number | null
-  total_bytes_scanned: number | null
-  n_spill_remote: number
-  n_failed: number
-  first_seen: string | null
-  last_seen: string | null
-  distinct_warehouses: number
-  distinct_users: number
-}
-
-export interface QueryListResponse {
-  rows: QueryRow[]
-  total: number
-  limit: number
-  offset: number
-}
-
-export interface QueryFilterFacets {
-  warehouses: string[]
-  users: string[]
-  query_types: string[]
-  execution_statuses: string[]
-}
-
-// ── Query groups ──────────────────────────────────────────────
-
-export type QueryGroupKind = 'static' | 'dynamic'
-
-export interface QueryFilterSpec {
-  warehouse_name?: string[] | null
-  user_name?: string[] | null
-  role_name?: string[] | null
-  query_type?: string[] | null
-  execution_status?: string[] | null
-  query_parameterized_hash?: string[] | null
-  start_time_from?: string | null
-  start_time_to?: string | null
-  min_elapsed_ms?: number | null
-  max_elapsed_ms?: number | null
-  has_remote_spill?: boolean | null
-  has_local_spill?: boolean | null
-  has_queueing?: boolean | null
-  search?: string | null
-}
-
-export interface QueryGroup {
-  id: number
-  name: string
-  description: string | null
-  kind: QueryGroupKind
-  filter_spec: QueryFilterSpec
-  snapshot_query_ids: string[] | null
-  snapshot_at: string | null
-  created_at: string
-  created_by: string
-  member_count: number | null
-}
-
-export interface CreateQueryGroupBody {
-  name: string
-  description?: string | null
-  kind: QueryGroupKind
-  // Match the URL filter convention — strings or arrays both accepted by the server.
-  warehouse_name?: string | null
-  user_name?: string | null
-  query_type?: string | null
-  execution_status?: string | null
-  query_parameterized_hash?: string | null
-  start_time_from?: string | null
-  start_time_to?: string | null
-  min_elapsed_ms?: number | null
-  max_elapsed_ms?: number | null
-  has_remote_spill?: boolean | null
-  has_local_spill?: boolean | null
-  has_queueing?: boolean | null
-  search?: string | null
-}
+export type QueryGroup = Schemas['QueryGroup']
+export type CreateQueryGroupBody = Schemas['CreateQueryGroupRequest']
 
 // ── Self-documentation types ──────────────────────────────────
 
-export interface CliParam {
-  name: string
-  kind: 'option' | 'argument'
-  type: string
-  help: string
-  required: boolean
-  is_flag: boolean
-  default: string | null
-  choices: string[] | null
-  multiple: boolean
-}
-
-export interface CliCommand {
-  name: string
-  path: string[]
-  help: string
-  short_help: string
-  is_group: boolean
-  params: CliParam[]
-  subcommands: CliCommand[]
-}
-
-export interface McpToolInfo {
-  name: string
-  description: string
-  parameters: Record<string, unknown> | null
-}
+export type CliCommand = Schemas['CliCommand']
+export type CliParam = Schemas['CliParam']
+export type McpToolInfo = Schemas['McpToolInfo']
 
 export interface QueryListFilters {
   warehouse?: string         // comma-separated
   user?: string
+  role?: string
   query_type?: string
   status?: string
   parameterized_hash?: string
@@ -337,30 +77,57 @@ export interface QueryListFilters {
   has_local_spill?: boolean
   has_queueing?: boolean
   search?: string
+  // Structural filters
+  min_joins?: number
+  max_joins?: number
+  min_tables?: number
+  max_tables?: number
+  min_ctes?: number
+  max_ctes?: number
+  min_subqueries?: number
+  max_subqueries?: number
+  min_where_blocks?: number
+  max_where_blocks?: number
+  min_where_predicates?: number
+  max_where_predicates?: number
+  // Semantic predicates (Phase 2) — comma-separated table / column names.
+  referenced_tables_include?: string
+  referenced_tables_exclude?: string
+  where_columns_include?: string
+  where_columns_exclude?: string
   limit?: number
   offset?: number
 }
 
-export interface ExperimentRun {
-  experiment_id: number
-  arm_name: string
-  rep_index: number
-  sampled_query_id: string
-  parameterized_hash?: string | null
-  replay_query_id?: string | null
-  elapsed_ms?: number | null
-  queued_overload_ms?: number | null
-  bytes_scanned?: number | null
-  bytes_spilled_local?: number | null
-  bytes_spilled_remote?: number | null
-  credits_used_estimate?: number | null
-  status: 'success' | 'failed' | 'excluded'
-  error_message?: string | null
-  started_at?: string | null
-  completed_at?: string | null
-}
+export type ExperimentRun = Schemas['ExperimentRun']
 
 const BASE = '/api'
+
+// ── Auth ──────────────────────────────────────────────────────
+// When the API runs in SNOWTUNER_AUTH_MODE=token, every request needs an
+// Authorization: Bearer <token> header.  The token lives in localStorage
+// under this key; the user pastes it once via /settings or however they
+// got it from `snowtuner auth show`.  In SNOWTUNER_AUTH_MODE=none (local
+// dev), the token is unused — requests work without it.
+
+const TOKEN_STORAGE_KEY = 'snowtuner.api_token'
+
+export function getApiToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function setApiToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token)
+    else localStorage.removeItem(TOKEN_STORAGE_KEY)
+  } catch {
+    /* localStorage unavailable — degrade silently */
+  }
+}
 
 class ApiError extends Error {
   status: number
@@ -383,15 +150,26 @@ async function request<T>(
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v))
     }
   }
+  const headers: Record<string, string> = {}
+  if (opts?.body) headers['content-type'] = 'application/json'
+  const token = getApiToken()
+  if (token) headers['authorization'] = `Bearer ${token}`
+
   const res = await fetch(url, {
     method,
-    headers: opts?.body ? { 'content-type': 'application/json' } : undefined,
+    headers,
     body: opts?.body ? JSON.stringify(opts.body) : undefined,
   })
   const text = await res.text()
   const parsed = text ? safeParse(text) : null
   if (!res.ok) {
-    const msg = (parsed && (parsed as any).detail) || res.statusText
+    // FastAPI 4xx/5xx bodies are ``{detail: string | object}``; surface the
+    // string form to error messages, fall back to HTTP statusText otherwise.
+    const detail =
+      parsed && typeof parsed === 'object' && 'detail' in parsed
+        ? (parsed as { detail: unknown }).detail
+        : null
+    const msg = typeof detail === 'string' ? detail : res.statusText
     throw new ApiError(res.status, parsed, `${method} ${path}: ${msg}`)
   }
   return parsed as T
@@ -451,6 +229,20 @@ export const api = {
   credentials: () => request<CredentialStatus>('GET', '/credentials'),
   verifyCredentials: () => request<CredentialVerify>('POST', '/credentials/verify'),
 
+  // ── Sync + automation ──────────────────────────────────────────
+  runSync: () =>
+    request<{ sync_results: Array<{ source_name: string; rows_ingested: number; duration_seconds: number; high_water: string | null }>; errors?: Array<{ source_name: string; error: string }> }>(
+      'POST', '/sync/run',
+    ),
+  runBackfill: (days: number, source?: string) =>
+    request<{ sync_results: Array<{ source_name: string; rows_ingested: number }> ; errors: Array<{ source_name: string; error: string }> }>(
+      'POST', '/sync/backfill', { query: { days, source } },
+    ),
+  automationStatus: () =>
+    request<Schemas['AutomationStatusOut']>('GET', '/automation/status'),
+  runAutomationNow: () =>
+    request<Schemas['TickReportOut']>('POST', '/automation/run-now'),
+
   // ── Queries explorer ───────────────────────────────────────────
   listQueries: (filters?: QueryListFilters) =>
     request<QueryListResponse>('GET', '/queries', {
@@ -504,9 +296,17 @@ export const api = {
   getExperiment: (id: number) => request<Experiment>('GET', `/experiments/${id}`),
   listExperimentRuns: (id: number, armName?: string) =>
     request<ExperimentRun[]>('GET', `/experiments/${id}/runs`, { query: { arm_name: armName } }),
-  proposeExperiment: (recipeName: string, targetWarehouse: string) =>
+  proposeExperiment: (
+    recipeName: string,
+    targetWarehouse: string,
+    queryGroupId?: number | null,
+  ) =>
     request<Experiment>('POST', '/experiments/propose', {
-      body: { recipe_name: recipeName, target_warehouse: targetWarehouse },
+      body: {
+        recipe_name: recipeName,
+        target_warehouse: targetWarehouse,
+        query_group_id: queryGroupId ?? null,
+      },
     }),
   proposeBenchmarkExperiment: (body: ProposeBenchmarkRequest) =>
     request<Experiment>('POST', '/experiments/propose-benchmark', { body }),
@@ -515,6 +315,17 @@ export const api = {
   runExperiment: (id: number) => request<Experiment>('POST', `/experiments/${id}/run`),
   abortExperiment: (id: number, reason: string) =>
     request<Experiment>('POST', `/experiments/${id}/abort`, { body: { reason } }),
+  /**
+   * Remove one query from a PROPOSED experiment's frozen workload.  The
+   * server re-estimates cost from the remaining queries and returns the
+   * updated Experiment.  Refuses with 409 if the experiment isn't
+   * PROPOSED, and 422 if removing would empty the workload.
+   */
+  removeSampledQuery: (experimentId: number, queryId: string) =>
+    request<Experiment>(
+      'DELETE',
+      `/experiments/${experimentId}/sampled-queries/${encodeURIComponent(queryId)}`,
+    ),
 }
 
 export { ApiError }

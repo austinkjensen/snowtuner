@@ -289,12 +289,18 @@ function TuneForm({
     queryKey: ['warehouses'],
     queryFn: api.warehouses,
   })
+  const groups = useQuery({
+    queryKey: ['query-groups'],
+    queryFn: () => api.listQueryGroups(),
+  })
   const [recipeName, setRecipeName] = useState<string>('')
   const [target, setTarget] = useState<string>('')
+  // null = auto-sample from target warehouse; a number = the picked group id.
+  const [queryGroupId, setQueryGroupId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const propose = useMutation({
-    mutationFn: () => api.proposeExperiment(recipeName, target),
+    mutationFn: () => api.proposeExperiment(recipeName, target, queryGroupId),
     onSuccess: onCreated,
     onError: (e: Error) => setError(e.message),
   })
@@ -331,10 +337,16 @@ function TuneForm({
           ))}
         </select>
         <p className="mt-1 text-xs text-muted-foreground">
-          snowtuner samples real queries from this warehouse and replays them against side-by-side
-          clones — your production warehouse is never touched.
+          Side-by-side test clones inherit this warehouse's config; your
+          production warehouse itself is never touched.
         </p>
       </div>
+      <WorkloadSourcePicker
+        warehouseLabel={target ? `Auto-sample from ${target}` : 'Auto-sample from selected warehouse'}
+        groups={groups.data ?? []}
+        value={queryGroupId}
+        onChange={setQueryGroupId}
+      />
       {error && <div className="text-sm text-destructive">{error}</div>}
       <div className="flex justify-end gap-2 pt-2">
         <Button variant="ghost" onClick={onClose}>
@@ -346,6 +358,77 @@ function TuneForm({
         >
           {propose.isPending ? 'Proposing…' : 'Propose'}
         </Button>
+      </div>
+    </div>
+  )
+}
+
+// Picker shared between TuneForm and BenchmarkForm.  Two modes:
+//   * ``null`` (default) — auto-sample from the form's warehouse selection
+//     (the label changes between forms because Tune already has a target
+//     warehouse picker and Benchmark has a separate workload-warehouse one).
+//   * a numeric group id — load the group's members instead, freezing the
+//     resolved query IDs onto the proposal at the server.
+function WorkloadSourcePicker({
+  warehouseLabel,
+  groups,
+  value,
+  onChange,
+}: {
+  warehouseLabel: string
+  groups: import('@/lib/api').QueryGroup[]
+  value: number | null
+  onChange: (v: number | null) => void
+}) {
+  return (
+    <div>
+      <label className="text-sm font-medium">Workload source</label>
+      <div className="mt-1 space-y-2 text-sm">
+        <label className="flex items-start gap-2">
+          <input
+            type="radio"
+            className="mt-0.5"
+            checked={value === null}
+            onChange={() => onChange(null)}
+          />
+          <span>
+            <span className="font-medium">{warehouseLabel}</span>
+            <span className="ml-1 text-xs text-muted-foreground">
+              — top-by-impact queries from the last 7 days
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2">
+          <input
+            type="radio"
+            className="mt-0.5"
+            checked={value !== null}
+            onChange={() =>
+              onChange(value ?? groups[0]?.id ?? null)
+            }
+            disabled={groups.length === 0}
+          />
+          <span className="flex-1">
+            <span className="font-medium">Use saved query group</span>
+            <span className="ml-1 text-xs text-muted-foreground">
+              — replay the group's eligible members
+              {groups.length === 0 && ' (none saved yet)'}
+            </span>
+            {value !== null && (
+              <select
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1 text-sm"
+                value={String(value)}
+                onChange={(e) => onChange(Number(e.target.value))}
+              >
+                {groups.map((g) => (
+                  <option key={g.id} value={String(g.id)}>
+                    #{g.id} {g.name} ({g.kind}, {g.member_count ?? '?'} members)
+                  </option>
+                ))}
+              </select>
+            )}
+          </span>
+        </label>
       </div>
     </div>
   )
@@ -387,9 +470,14 @@ function BenchmarkForm({
     queryKey: ['warehouses'],
     queryFn: api.warehouses,
   })
+  const groups = useQuery({
+    queryKey: ['query-groups'],
+    queryFn: () => api.listQueryGroups(),
+  })
 
   const [hypothesis, setHypothesis] = useState('')
   const [workload, setWorkload] = useState('')
+  const [queryGroupId, setQueryGroupId] = useState<number | null>(null)
   const [arms, setArms] = useState<ArmDraft[]>([emptyArm(0), emptyArm(1)])
   const [controlArmName, setControlArmName] = useState<string>('')   // '' = no control
   const [sampleSize, setSampleSize] = useState<number>(30)
@@ -413,7 +501,11 @@ function BenchmarkForm({
     mutationFn: () => {
       const body = {
         hypothesis,
-        workload_warehouse: workload,
+        // When a group is picked, the server only needs query_group_id and
+        // ignores workload_warehouse.  When auto-sampling, workload is the
+        // source.
+        workload_warehouse: queryGroupId === null ? workload : null,
+        query_group_id: queryGroupId,
         control_arm_name: controlArmName || null,
         sample_size: sampleSize,
         reps_per_arm: repsPerArm,
@@ -433,7 +525,8 @@ function BenchmarkForm({
     onError: (e: Error) => setError(e.message),
   })
 
-  const valid = hypothesis.trim().length > 0 && workload && arms.length >= 2 &&
+  const workloadValid = queryGroupId !== null || !!workload
+  const valid = hypothesis.trim().length > 0 && workloadValid && arms.length >= 2 &&
     arms.every((a) => a.name.trim().length > 0)
   const armNames = arms.map((a) => a.name)
   const hasDuplicateName = new Set(armNames).size !== armNames.length
@@ -451,25 +544,40 @@ function BenchmarkForm({
         />
       </div>
 
-      <div>
-        <label className="text-sm font-medium">Workload source (warehouse to sample queries from)</label>
-        <select
-          className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
-          value={workload}
-          onChange={(e) => setWorkload(e.target.value)}
-        >
-          <option value="">— select a warehouse —</option>
-          {warehouses.data?.map((w) => (
-            <option key={w.name} value={w.name}>
-              {w.name} ({w.size ?? '?'})
-            </option>
-          ))}
-        </select>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Sampled queries are replayed against the test warehouses you configure below. The
-          workload warehouse itself isn't touched.
-        </p>
-      </div>
+      {/* Workload-source: warehouse auto-sample OR a saved query group.
+          The warehouse picker only renders when no group is selected. */}
+      {queryGroupId === null && (
+        <div>
+          <label className="text-sm font-medium">Sample from warehouse</label>
+          <select
+            className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+            value={workload}
+            onChange={(e) => setWorkload(e.target.value)}
+          >
+            <option value="">— select a warehouse —</option>
+            {warehouses.data?.map((w) => (
+              <option key={w.name} value={w.name}>
+                {w.name} ({w.size ?? '?'})
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Queries are sampled from this warehouse's history.  The warehouse
+            itself isn't touched; arms run on side-by-side clones.
+          </p>
+        </div>
+      )}
+
+      <WorkloadSourcePicker
+        warehouseLabel={
+          workload
+            ? `Auto-sample from ${workload}`
+            : 'Auto-sample from warehouse (selected above)'
+        }
+        groups={groups.data ?? []}
+        value={queryGroupId}
+        onChange={setQueryGroupId}
+      />
 
       <div>
         <div className="mb-2 flex items-center justify-between">

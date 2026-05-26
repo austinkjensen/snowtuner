@@ -273,25 +273,21 @@ training-gate evaluation. `model_state` is opaque per-recommender JSON
 Per ingestion source: highest watermark column value seen, last sync
 timestamp, row count from last sync. Drives incremental ingestion.
 
-### `app.routing_rules`
-
-Local routing rules. Not yet wired up; v0.2 introduces a query dispatcher
-that consults this table.
-
 ## Schema migrations
 
-Forward-only, defined in `_pre_create_migrations` in
-[`storage/schema.py`](../src/snowtuner/storage/schema.py). Each migration
-detects "pre-current shape" by looking at `information_schema.columns` and
-DROPs the offending table; the subsequent `CREATE TABLE IF NOT EXISTS`
-recreates it with the new shape.
+Pre-1.0: **no migrations.**  [`storage/schema.py`](../src/snowtuner/storage/schema.py)
+holds the canonical DDL; when a table shape changes during development we
+ship `snowtuner reset` + `snowtuner sync` instead of carrying schema-evolution
+shims.  Acceptable because `raw.*` is fully repopulatable from Snowflake and
+`reset` preserves user-authored config (`app.query_groups`,
+`app.autonomous_config`) by default while archiving
+`app.autonomous_applications` to `~/.snowtuner/audit-archive/` before
+deletion.  See [docs/architecture.md](architecture.md) and
+[docs/configuration.md](configuration.md) for the preservation defaults.
 
-This is acceptable pre-1.0 because `raw.*` is fully repopulatable from a
-sync. After 1.0 we'll switch to additive migrations only.
+For backfilling more history without a destructive reset, use
+`snowtuner backfill --days N` — it resets just `app.sync_watermarks` and
+re-pulls, leaving every other table untouched.
 
-Currently active migrations:
-
-1. `raw.warehouse_events_history` v1 (`event_id` from Snowflake, doesn't
-   exist) → v2 (composite PK, NULL `cluster_number` issues) → v3 (synthetic
-   `event_id` via sha256). Detected by absence of `event_id` or
-   `cluster_count`.
+A real migration framework (Alembic-style versioned files or DuckDB-native
+`ALTER TABLE` shims) will land before v1.0.

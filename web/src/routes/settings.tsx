@@ -1,7 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { AlertCircle, Check, KeyRound, RefreshCw, X } from 'lucide-react'
-import { api, type CredentialVerify } from '@/lib/api'
+import { useState } from 'react'
+import { api, getApiToken, setApiToken, type CredentialVerify } from '@/lib/api'
 import { humanizeAgo } from '@/lib/format'
 import { useTheme } from '@/components/theme-provider'
 import { Button } from '@/components/ui/button'
@@ -22,10 +23,67 @@ function SettingsPage() {
         </p>
       </div>
 
+      <ApiAuthCard />
       <ConnectionCard />
       <RecommendersCard />
       <AppearanceCard />
     </div>
+  )
+}
+
+// ── API auth ──────────────────────────────────────────────────────────────
+// The snowtuner API may run in SNOWTUNER_AUTH_MODE=token, in which case
+// the SPA needs to send a bearer token on every call.  This card stores
+// the token in localStorage.  In SNOWTUNER_AUTH_MODE=none (local dev),
+// the token field can stay empty.
+
+function ApiAuthCard() {
+  const [token, setToken] = useState(() => getApiToken() ?? '')
+  const [saved, setSaved] = useState(false)
+  function save() {
+    setApiToken(token.trim() || null)
+    setSaved(true)
+    setTimeout(() => setSaved(false), 1500)
+  }
+  function clear() {
+    setToken('')
+    setApiToken(null)
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <KeyRound className="h-4 w-4" />
+          API authentication
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          When the API runs in token mode (
+          <code className="text-xs">SNOWTUNER_AUTH_MODE=token</code>), every
+          UI request needs a bearer token.  Get yours with{' '}
+          <code className="text-xs">snowtuner auth show</code> and paste below.
+          Stored in <code className="text-xs">localStorage</code> on this
+          browser only.
+        </p>
+        <div className="flex gap-2">
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Paste bearer token…"
+            className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm font-mono"
+          />
+          <Button size="sm" onClick={save}>Save</Button>
+          <Button size="sm" variant="outline" onClick={clear}>Clear</Button>
+        </div>
+        {saved && (
+          <p className="text-xs text-green-600 flex items-center gap-1">
+            <Check className="h-3 w-3" /> Token saved.
+          </p>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

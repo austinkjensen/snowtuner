@@ -131,6 +131,10 @@ class WarehouseSummaryOut(BaseModel):
     size: str | None = None
     auto_suspend_seconds: int | None = None
     auto_resume: bool | None = None
+    # Snowflake compute generation ('1' or '2').  Mirrored per-warehouse
+    # via SHOW PARAMETERS at sync time.  None on older Snowflake versions
+    # where the parameter isn't available.
+    generation: str | None = None
     queries_in_window: int = 0
     suspend_resume_events: int = 0
 
@@ -148,6 +152,52 @@ class StatusOut(BaseModel):
     warehouses: list[WarehouseSummaryOut]
     recommender_states: list[dict[str, Any]]
     recommendation_counts: dict[str, int]
+
+
+# ── Schema drift (v0.2) ─────────────────────────────────────────
+
+class SourceDriftOut(BaseModel):
+    """Drift report for one ingestion source."""
+    source_name: str
+    source_view: str
+    expected_columns: list[str] = Field(default_factory=list)
+    actual_columns: list[str] = Field(default_factory=list)
+    missing_from_snowflake: list[str] = Field(default_factory=list)
+    extra_in_snowflake: list[str] = Field(default_factory=list)
+    error: str | None = None
+    is_actionable: bool = False    # missing columns will break sync
+
+
+class DriftReportOut(BaseModel):
+    sources: list[SourceDriftOut]
+    any_actionable: bool
+
+
+# ── AutomationLoop (v0.2) ───────────────────────────────────────
+
+class StageOutcomeOut(BaseModel):
+    name: str                    # 'sync' | 'features' | 'recommenders' | 'autonomous'
+    started_at: datetime
+    duration_seconds: float
+    outcome: str                  # 'success' | 'failed' | 'skipped'
+    error: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class TickReportOut(BaseModel):
+    started_at: datetime
+    completed_at: datetime | None = None
+    stages: list[StageOutcomeOut] = Field(default_factory=list)
+    overall: str                  # 'running' | 'success' | 'failed' | 'skipped'
+    skip_reason: str | None = None
+
+
+class AutomationStatusOut(BaseModel):
+    enabled: bool
+    interval_seconds: int
+    currently_running: bool
+    next_run_at: datetime | None = None
+    last_tick: TickReportOut | None = None
 
 
 # ── Credentials view ────────────────────────────────────────────
@@ -188,9 +238,15 @@ class ProposeExperimentRequest(BaseModel):
     The server samples historical query stats and looks up the warehouse
     config — the client only needs to say *which* recipe against *which*
     warehouse.
+
+    Optional ``query_group_id`` (Phase 3) overrides the warehouse-based
+    auto-sample with the group's members.  Static groups use their frozen
+    snapshot; dynamic groups are re-evaluated at propose-time and the
+    resolved IDs are then frozen onto the experiment proposal.
     """
     recipe_name: str
     target_warehouse: str
+    query_group_id: int | None = None
 
 
 class AbortExperimentRequest(BaseModel):
@@ -222,7 +278,8 @@ class ProposeBenchmarkRequest(BaseModel):
     a workload source instead of a target warehouse.
     """
     hypothesis: str                       # plain-English statement of what we're testing
-    workload_warehouse: str               # where to sample queries from (v1: a single warehouse)
+    workload_warehouse: str | None = None # where to sample queries from when no group is picked
+    query_group_id: int | None = None     # Phase 3: pick a saved group instead of auto-sample
     arms: list[BenchmarkArmSpec]
     control_arm_name: str | None = None   # optional reference arm; None = pure Pareto comparison
     sample_size: int = 30
@@ -249,6 +306,15 @@ class QueryRow(BaseModel):
     queued_overload_ms: int | None
     query_parameterized_hash: str | None
 
+    # sqlglot-extracted structural counts (from features.query_sql_features).
+    # NULL when query_text was redacted or unparseable.
+    joins_count: int | None = None
+    tables_referenced_count: int | None = None
+    ctes_count: int | None = None
+    subqueries_count: int | None = None
+    where_block_count: int | None = None
+    where_predicate_count: int | None = None
+
 
 class QueryDetail(BaseModel):
     """Full detail for GET /queries/{id} — everything we have in raw.query_history
@@ -274,6 +340,21 @@ class QueryDetail(BaseModel):
     bytes_spilled_to_local: int | None
     bytes_spilled_to_remote: int | None
     query_parameterized_hash: str | None
+
+    # sqlglot-extracted structural counts.
+    joins_count: int | None = None
+    tables_referenced_count: int | None = None
+    ctes_count: int | None = None
+    subqueries_count: int | None = None
+    where_block_count: int | None = None
+    where_predicate_count: int | None = None
+    sql_features_parse_error: str | None = None
+
+    # Semantic predicates (Phase 2).  Empty list means "parsed, none";
+    # populated only when the query was parseable.  Tables are emitted both
+    # fully-qualified (BUSINESS.SALES_OUTCOME) and short (SALES_OUTCOME).
+    referenced_tables: list[str] = Field(default_factory=list)
+    where_columns: list[str] = Field(default_factory=list)
 
 
 class QueryFamily(BaseModel):
@@ -310,8 +391,15 @@ class QueryFilterFacets(BaseModel):
     """GET /queries/facets — distinct values for the filter chips."""
     warehouses: list[str]
     users: list[str]
+    roles: list[str]
     query_types: list[str]
     execution_statuses: list[str]
+    # Semantic-predicate options (Phase 2).  Sorted by usage frequency
+    # descending and capped server-side so the payload stays bounded on
+    # large workloads.  ``referenced_tables`` includes both short and
+    # fully-qualified forms (BUSINESS.SALES_OUTCOME and SALES_OUTCOME).
+    referenced_tables: list[str] = Field(default_factory=list)
+    where_columns: list[str] = Field(default_factory=list)
 
 
 # ── Self-documentation (Docs tab) ───────────────────────────────
@@ -386,3 +474,25 @@ class CreateQueryGroupRequest(BaseModel):
     has_local_spill: bool | None = None
     has_queueing: bool | None = None
     search: str | None = None
+
+    # Structural attributes (sqlglot-extracted; NULL on redacted queries).
+    min_joins: int | None = None
+    max_joins: int | None = None
+    min_tables: int | None = None
+    max_tables: int | None = None
+    min_ctes: int | None = None
+    max_ctes: int | None = None
+    min_subqueries: int | None = None
+    max_subqueries: int | None = None
+    min_where_blocks: int | None = None
+    max_where_blocks: int | None = None
+    min_where_predicates: int | None = None
+    max_where_predicates: int | None = None
+
+    # Semantic predicates (Phase 2).  Comma-separated strings or arrays;
+    # the endpoint normalizes to ``list[str]``.  ``include`` = "query must
+    # touch ALL of these"; ``exclude`` = "query must touch NONE of these".
+    referenced_tables_include: list[str] | str | None = None
+    referenced_tables_exclude: list[str] | str | None = None
+    where_columns_include: list[str] | str | None = None
+    where_columns_exclude: list[str] | str | None = None

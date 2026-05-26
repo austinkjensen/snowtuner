@@ -34,7 +34,6 @@ dependencies = [
     "sqlglot>=25.0",
     "click>=8.1",
     "rich>=13.7",
-    "streamlit>=1.35",
     "pandas>=2.2",
     "numpy>=1.26",
     "scipy>=1.13",

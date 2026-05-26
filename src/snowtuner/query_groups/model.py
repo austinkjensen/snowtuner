@@ -48,6 +48,35 @@ class QueryFilterSpec(BaseModel):
     # Free-text substring search over query_text
     search: str | None = None
 
+    # Structural attributes — extracted by sqlglot into
+    # features.query_sql_features.  NULL when query_text was redacted /
+    # unparseable; a filter on min_* excludes nulls (since "min >= 1" can't
+    # be satisfied by NULL).
+    min_joins: int | None = None
+    max_joins: int | None = None
+    min_tables: int | None = None
+    max_tables: int | None = None
+    min_ctes: int | None = None
+    max_ctes: int | None = None
+    min_subqueries: int | None = None
+    max_subqueries: int | None = None
+    min_where_blocks: int | None = None
+    max_where_blocks: int | None = None
+    min_where_predicates: int | None = None
+    max_where_predicates: int | None = None
+
+    # ── Semantic predicates (Phase 2) ───────────────────────────────
+    # All values are uppercased on the storage side, so case-insensitive
+    # filtering happens automatically when the API also uppercases what
+    # the user typed.  ``include`` semantics = "query must touch ALL of
+    # these"; ``exclude`` = "query must touch NONE of these".  This
+    # matches how a user thinks about set-membership for multi-valued
+    # attributes (a query has many tables/columns, not one).
+    referenced_tables_include: list[str] | None = None
+    referenced_tables_exclude: list[str] | None = None
+    where_columns_include: list[str] | None = None
+    where_columns_exclude: list[str] | None = None
+
 
 class QueryGroup(BaseModel):
     """A persisted query group — the row shape returned by the API.

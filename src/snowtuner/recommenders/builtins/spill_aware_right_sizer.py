@@ -60,7 +60,6 @@ from snowtuner.recommenders.sizes import (
     credit_rate,
     memory_gb,
     normalize,
-    step,
 )
 
 WINDOW_DAYS = 14

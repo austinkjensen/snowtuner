@@ -34,6 +34,13 @@ class WarehouseEventsSource(Source):
     target_table = "raw.warehouse_events_history"
     watermark_column = "timestamp"
 
+    source_view = "SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY"
+    expected_source_columns = [
+        "timestamp", "warehouse_id", "warehouse_name", "cluster_number",
+        "event_name", "event_reason", "event_state", "user_name", "role_name",
+        "query_id", "size", "cluster_count",
+    ]
+
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "timestamp >= %s" if since else "TRUE"
         params: list = [since] if since else []

@@ -12,17 +12,28 @@ Design notes
   than a cold-cache production query would.
 - Metrics are fetched from QUERY_HISTORY via a short retry loop because
   QUERY_HISTORY can lag the query completion by a couple seconds.
+- The table function is qualified as ``SNOWFLAKE.INFORMATION_SCHEMA.*``
+  rather than bare ``INFORMATION_SCHEMA.*`` because ``INFORMATION_SCHEMA``
+  is database-scoped: an unqualified call fails with "Invalid identifier"
+  when the session has no current database set, which is exactly the case
+  for the SNOWTUNER_ROLE session the engine runs under.  Qualifying to
+  ``SNOWFLAKE.INFORMATION_SCHEMA`` makes the call work regardless of the
+  session's USE DATABASE state — and SNOWFLAKE is guaranteed to exist on
+  every Snowflake account.
 
 This module is intentionally side-effect-only on Snowflake; it doesn't touch
 DuckDB.  The engine writes the resulting ``ExperimentRun`` row.
 """
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Protocol
 
 from snowtuner.experiments.model import ExperimentRun, RunStatus
+
+logger = logging.getLogger(__name__)
 
 
 class SnowflakeExecutor(Protocol):
@@ -87,6 +98,13 @@ def replay_one(
         metrics = _fetch_query_metrics(
             metrics_executor or executor, replay_query_id,
         )
+        # If the fetch failed, attach a synthetic error_message so the run
+        # row carries the diagnostic forward — aggregate() will still mark
+        # the run as excluded (no elapsed_ms) but at least the UI / runs
+        # endpoint surfaces *why*.
+        fetch_err = metrics.pop("_fetch_error", None)
+        if fetch_err and error_message is None:
+            error_message = f"metric-fetch failed: {fetch_err}"
 
     return ExperimentRun(
         experiment_id=experiment_id,
@@ -113,24 +131,30 @@ def _fetch_query_metrics(
 ) -> dict:
     """Poll QUERY_HISTORY for the just-run query's metrics.
 
-    QUERY_HISTORY is part of the SNOWFLAKE.ACCOUNT_USAGE schema for historical
-    queries (45 min lag!) and ``INFORMATION_SCHEMA.QUERY_HISTORY`` for the
-    last 7 days with sub-minute latency.  We use the INFORMATION_SCHEMA
-    function form which exposes the just-completed query.
+    Uses ``SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(...)`` (the
+    fully-qualified call — see module docstring for why we don't use the
+    bare ``INFORMATION_SCHEMA`` form).  Sub-minute latency for the current
+    session; for cross-session backfill use ``SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY``
+    instead (~45-minute lag but persistent).
     """
     last_err: Exception | None = None
     for _attempt in range(_METRICS_POLL_MAX_TRIES):
         try:
+            # NOTE: ``INFORMATION_SCHEMA.QUERY_HISTORY*`` table functions
+            # do NOT expose ``BYTES_SPILLED_TO_LOCAL/REMOTE_STORAGE`` —
+            # those columns are only on ``SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY``
+            # (the persistent shared view with ~45-minute lag).  We leave
+            # spill stats as None in the live path; the backfill helper
+            # (``experiments/backfill.py``) recovers them from ACCOUNT_USAGE
+            # after the fact, which is sufficient for reporting.
             rows = executor.execute(
                 f"""
                 SELECT
                     total_elapsed_time,
                     queued_overload_time,
                     bytes_scanned,
-                    bytes_spilled_to_local_storage,
-                    bytes_spilled_to_remote_storage,
                     credits_used_cloud_services
-                FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(
+                FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(
                     RESULT_LIMIT => 1000
                 ))
                 WHERE query_id = '{query_id}'
@@ -143,8 +167,10 @@ def _fetch_query_metrics(
                     "elapsed_ms": int(r[0]) if r[0] is not None else None,
                     "queued_overload_ms": int(r[1]) if r[1] is not None else None,
                     "bytes_scanned": int(r[2]) if r[2] is not None else None,
-                    "bytes_spilled_local": int(r[3]) if r[3] is not None else None,
-                    "bytes_spilled_remote": int(r[4]) if r[4] is not None else None,
+                    # Spill stats unavailable in INFORMATION_SCHEMA — backfill
+                    # fills these in if the user runs it post-completion.
+                    "bytes_spilled_local": None,
+                    "bytes_spilled_remote": None,
                     # credits_used_cloud_services covers cloud-services overhead, not
                     # warehouse credits — the engine reconciles those from metering
                     # history at finalize time.  Leaving as None here.
@@ -152,14 +178,21 @@ def _fetch_query_metrics(
                 }
         except Exception as e:
             last_err = e
+            logger.warning(
+                "metric fetch failed for query_id=%s (attempt %d/%d): %s",
+                query_id, _attempt + 1, _METRICS_POLL_MAX_TRIES, e,
+            )
         time.sleep(_METRICS_POLL_INTERVAL_S)
     # Could not retrieve — return empty metrics (run still counts as success,
     # but the stats step will mark it under-instrumented).
     if last_err:
-        # Surface the last error in the run row via a synthetic note; the
-        # engine will treat empty metrics as "excluded from aggregation."
+        # Surface the last error to the caller; ``replay_one`` copies it
+        # onto the ExperimentRun.error_message field so the diagnostic is
+        # visible in /experiments/{id}/runs.
         return {"_fetch_error": f"{type(last_err).__name__}: {last_err}"}
-    return {}
+    # No exception but no rows either — usually means QUERY_HISTORY hasn't
+    # caught up.  Still surface that.
+    return {"_fetch_error": "no row in QUERY_HISTORY_BY_SESSION after poll window"}
 
 
 def _utc_naive_now() -> datetime:

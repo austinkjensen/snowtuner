@@ -19,6 +19,12 @@ class WarehouseMeteringSource(Source):
     target_table = "raw.warehouse_metering_history"
     watermark_column = "start_time"
 
+    source_view = "SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY"
+    expected_source_columns = [
+        "warehouse_id", "warehouse_name", "start_time", "end_time",
+        "credits_used", "credits_used_compute", "credits_used_cloud_services",
+    ]
+
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "start_time >= %s" if since else "TRUE"
         params: list = [since] if since else []

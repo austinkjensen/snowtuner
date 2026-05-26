@@ -1,7 +1,15 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
-import { Database, Search, AlertCircle, Save, Trash2 } from 'lucide-react'
+import {
+  Database,
+  Search,
+  AlertCircle,
+  Save,
+  Trash2,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react'
 import {
   api,
   type CreateQueryGroupBody,
@@ -9,24 +17,44 @@ import {
   type QueryGroupKind,
   type QueryListFilters,
   type QueryRow,
-  type QueryFamily,
 } from '@/lib/api'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 
-type View = 'queries' | 'families' | 'groups'
+type View = 'queries' | 'groups'
 
 type QueriesSearch = {
   view?: View
   warehouse?: string
   user?: string
+  role?: string
   status?: string
   type?: string
   has_remote_spill?: boolean
   has_queueing?: boolean
   search?: string
+  // Structural filters (sqlglot-extracted; null when query_text is redacted)
+  min_joins?: number
+  max_joins?: number
+  min_tables?: number
+  max_tables?: number
+  min_ctes?: number
+  max_ctes?: number
+  min_subqueries?: number
+  max_subqueries?: number
+  min_where_blocks?: number
+  max_where_blocks?: number
+  min_where_predicates?: number
+  max_where_predicates?: number
+  // Semantic predicates (Phase 2) — comma-separated table / column names.
+  // Names are uppercased server-side; the input is case-insensitive.
+  // ``_include`` = "query must touch ALL"; ``_exclude`` = "query must touch NONE".
+  referenced_tables_include?: string
+  referenced_tables_exclude?: string
+  where_columns_include?: string
+  where_columns_exclude?: string
   detail?: string                // open detail side-sheet for this query_id
   family?: string                // open queries filtered to this hash
   group?: number                 // open detail side-sheet for this group_id
@@ -34,8 +62,7 @@ type QueriesSearch = {
 
 export const Route = createFileRoute('/queries/')({
   validateSearch: (s: Record<string, unknown>): QueriesSearch => {
-    const view =
-      s.view === 'families' ? 'families' : s.view === 'groups' ? 'groups' : 'queries'
+    const view = s.view === 'groups' ? 'groups' : 'queries'
     const groupRaw = s.group
     const group =
       typeof groupRaw === 'number'
@@ -43,15 +70,41 @@ export const Route = createFileRoute('/queries/')({
         : typeof groupRaw === 'string' && /^\d+$/.test(groupRaw)
         ? Number(groupRaw)
         : undefined
+    const numParam = (v: unknown): number | undefined => {
+      if (typeof v === 'number' && !Number.isNaN(v)) return v
+      if (typeof v === 'string' && /^-?\d+$/.test(v)) return Number(v)
+      return undefined
+    }
     return {
       view,
       warehouse: typeof s.warehouse === 'string' ? s.warehouse : undefined,
       user: typeof s.user === 'string' ? s.user : undefined,
+      role: typeof s.role === 'string' ? s.role : undefined,
       status: typeof s.status === 'string' ? s.status : undefined,
       type: typeof s.type === 'string' ? s.type : undefined,
       has_remote_spill: s.has_remote_spill === 'true' ? true : undefined,
       has_queueing: s.has_queueing === 'true' ? true : undefined,
       search: typeof s.search === 'string' ? s.search : undefined,
+      min_joins: numParam(s.min_joins),
+      max_joins: numParam(s.max_joins),
+      min_tables: numParam(s.min_tables),
+      max_tables: numParam(s.max_tables),
+      min_ctes: numParam(s.min_ctes),
+      max_ctes: numParam(s.max_ctes),
+      min_subqueries: numParam(s.min_subqueries),
+      max_subqueries: numParam(s.max_subqueries),
+      min_where_blocks: numParam(s.min_where_blocks),
+      max_where_blocks: numParam(s.max_where_blocks),
+      min_where_predicates: numParam(s.min_where_predicates),
+      max_where_predicates: numParam(s.max_where_predicates),
+      referenced_tables_include:
+        typeof s.referenced_tables_include === 'string' ? s.referenced_tables_include : undefined,
+      referenced_tables_exclude:
+        typeof s.referenced_tables_exclude === 'string' ? s.referenced_tables_exclude : undefined,
+      where_columns_include:
+        typeof s.where_columns_include === 'string' ? s.where_columns_include : undefined,
+      where_columns_exclude:
+        typeof s.where_columns_exclude === 'string' ? s.where_columns_exclude : undefined,
       detail: typeof s.detail === 'string' ? s.detail : undefined,
       family: typeof s.family === 'string' ? s.family : undefined,
       group,
@@ -68,6 +121,8 @@ function QueriesExplorer() {
   const qc = useQueryClient()
   const [offset, setOffset] = useState(0)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
+  const [structuralOpen, setStructuralOpen] = useState(false)
+  const [semanticOpen, setSemanticOpen] = useState(false)
 
   const facets = useQuery({
     queryKey: ['query-facets'],
@@ -78,12 +133,29 @@ function QueriesExplorer() {
     () => ({
       warehouse: search.warehouse,
       user: search.user,
+      role: search.role,
       status: search.status,
       query_type: search.type,
       has_remote_spill: search.has_remote_spill,
       has_queueing: search.has_queueing,
       search: search.search,
       parameterized_hash: search.family,
+      min_joins: search.min_joins,
+      max_joins: search.max_joins,
+      min_tables: search.min_tables,
+      max_tables: search.max_tables,
+      min_ctes: search.min_ctes,
+      max_ctes: search.max_ctes,
+      min_subqueries: search.min_subqueries,
+      max_subqueries: search.max_subqueries,
+      min_where_blocks: search.min_where_blocks,
+      max_where_blocks: search.max_where_blocks,
+      min_where_predicates: search.min_where_predicates,
+      max_where_predicates: search.max_where_predicates,
+      referenced_tables_include: search.referenced_tables_include,
+      referenced_tables_exclude: search.referenced_tables_exclude,
+      where_columns_include: search.where_columns_include,
+      where_columns_exclude: search.where_columns_exclude,
       limit: PAGE_SIZE,
       offset,
     }),
@@ -96,26 +168,25 @@ function QueriesExplorer() {
     enabled: search.view === 'queries',
   })
 
-  const families = useQuery({
-    queryKey: ['query-families', filters],
-    queryFn: () =>
-      api.listQueryFamilies({
-        warehouse: filters.warehouse,
-        user: filters.user,
-        status: filters.status,
-        query_type: filters.query_type,
-        has_remote_spill: filters.has_remote_spill,
-        search: filters.search,
-        limit: 100,
-      }),
-    enabled: search.view === 'families',
-  })
-
   const groups = useQuery({
     queryKey: ['query-groups'],
     queryFn: () => api.listQueryGroups(),
     enabled: search.view === 'groups',
   })
+
+  const hasStructuralFilters =
+    search.min_joins != null || search.max_joins != null ||
+    search.min_tables != null || search.max_tables != null ||
+    search.min_ctes != null || search.max_ctes != null ||
+    search.min_subqueries != null || search.max_subqueries != null ||
+    search.min_where_blocks != null || search.max_where_blocks != null ||
+    search.min_where_predicates != null || search.max_where_predicates != null
+
+  const hasSemanticFilters =
+    !!search.referenced_tables_include ||
+    !!search.referenced_tables_exclude ||
+    !!search.where_columns_include ||
+    !!search.where_columns_exclude
 
   function setSearchParam<K extends keyof QueriesSearch>(key: K, value: QueriesSearch[K]) {
     setOffset(0)
@@ -152,9 +223,9 @@ function QueriesExplorer() {
   }
 
   const hasActiveFilters =
-    !!search.warehouse || !!search.user || !!search.status || !!search.type ||
-    !!search.has_remote_spill || !!search.has_queueing || !!search.search ||
-    !!search.family
+    !!search.warehouse || !!search.user || !!search.role || !!search.status ||
+    !!search.type || !!search.has_remote_spill || !!search.has_queueing ||
+    !!search.search || !!search.family || hasStructuralFilters || hasSemanticFilters
 
   return (
     <div className="mx-auto max-w-7xl px-6 py-6">
@@ -195,12 +266,6 @@ function QueriesExplorer() {
           Queries
         </button>
         <button
-          onClick={() => navigate({ search: { ...search, view: 'families' } })}
-          className={`rounded px-3 py-1.5 text-sm ${search.view === 'families' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}
-        >
-          Families
-        </button>
-        <button
           onClick={() => navigate({ search: { ...search, view: 'groups' } })}
           className={`rounded px-3 py-1.5 text-sm ${search.view === 'groups' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}
         >
@@ -235,6 +300,12 @@ function QueriesExplorer() {
                 value={search.user}
                 options={facets.data?.users ?? []}
                 onChange={(v) => setSearchParam('user', v)}
+              />
+              <FilterDropdown
+                label="role"
+                value={search.role}
+                options={facets.data?.roles ?? []}
+                onChange={(v) => setSearchParam('role', v)}
               />
               <FilterDropdown
                 label="type"
@@ -282,18 +353,137 @@ function QueriesExplorer() {
                 </Button>
               )}
             </div>
+
+            {/* Structural attributes (collapsible — sqlglot-derived counts) */}
+            <div className="border-t pt-3">
+              <button
+                onClick={() => setStructuralOpen((v) => !v)}
+                className="flex items-center gap-1 text-xs uppercase text-muted-foreground hover:text-foreground"
+              >
+                {structuralOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                Structural attributes
+                {hasStructuralFilters && (
+                  <Badge variant="secondary" className="ml-1 text-[10px]">
+                    active
+                  </Badge>
+                )}
+                <span className="ml-2 normal-case text-[11px] text-muted-foreground/80">
+                  (requires <code className="font-mono">GOVERNANCE_VIEWER</code> for
+                  query-text visibility)
+                </span>
+              </button>
+              {structuralOpen && (
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  <RangeFilter
+                    label="Joins"
+                    min={search.min_joins}
+                    max={search.max_joins}
+                    onMin={(v) => setSearchParam('min_joins', v)}
+                    onMax={(v) => setSearchParam('max_joins', v)}
+                  />
+                  <RangeFilter
+                    label="Tables referenced (distinct)"
+                    min={search.min_tables}
+                    max={search.max_tables}
+                    onMin={(v) => setSearchParam('min_tables', v)}
+                    onMax={(v) => setSearchParam('max_tables', v)}
+                  />
+                  <RangeFilter
+                    label="CTEs"
+                    min={search.min_ctes}
+                    max={search.max_ctes}
+                    onMin={(v) => setSearchParam('min_ctes', v)}
+                    onMax={(v) => setSearchParam('max_ctes', v)}
+                  />
+                  <RangeFilter
+                    label="Subqueries"
+                    min={search.min_subqueries}
+                    max={search.max_subqueries}
+                    onMin={(v) => setSearchParam('min_subqueries', v)}
+                    onMax={(v) => setSearchParam('max_subqueries', v)}
+                  />
+                  <RangeFilter
+                    label="WHERE blocks"
+                    min={search.min_where_blocks}
+                    max={search.max_where_blocks}
+                    onMin={(v) => setSearchParam('min_where_blocks', v)}
+                    onMax={(v) => setSearchParam('max_where_blocks', v)}
+                  />
+                  <RangeFilter
+                    label="WHERE predicates (leaves)"
+                    min={search.min_where_predicates}
+                    max={search.max_where_predicates}
+                    onMin={(v) => setSearchParam('min_where_predicates', v)}
+                    onMax={(v) => setSearchParam('max_where_predicates', v)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Semantic predicates (Phase 2) — tables read + columns filtered */}
+            <div className="border-t pt-3">
+              <button
+                onClick={() => setSemanticOpen((v) => !v)}
+                className="flex items-center gap-1 text-xs uppercase text-muted-foreground hover:text-foreground"
+              >
+                {semanticOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                Semantic filters
+                {hasSemanticFilters && (
+                  <Badge variant="secondary" className="ml-1 text-[10px]">
+                    active
+                  </Badge>
+                )}
+                <span className="ml-2 normal-case text-[11px] text-muted-foreground/80">
+                  comma-separated names; case-insensitive; tables match both short
+                  and <code className="font-mono">SCHEMA.NAME</code> forms
+                </span>
+              </button>
+              {semanticOpen && (
+                <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <TokenInput
+                    label="Tables referenced — include (AND)"
+                    value={search.referenced_tables_include}
+                    options={facets.data?.referenced_tables ?? []}
+                    placeholder="e.g. BUSINESS.SALES_OUTCOME, ORDERS"
+                    onChange={(v) => setSearchParam('referenced_tables_include', v)}
+                  />
+                  <TokenInput
+                    label="Tables referenced — exclude (none)"
+                    value={search.referenced_tables_exclude}
+                    options={facets.data?.referenced_tables ?? []}
+                    placeholder="e.g. STAGING.RAW_EVENTS"
+                    onChange={(v) => setSearchParam('referenced_tables_exclude', v)}
+                  />
+                  <TokenInput
+                    label="WHERE columns — include (AND)"
+                    value={search.where_columns_include}
+                    options={facets.data?.where_columns ?? []}
+                    placeholder="e.g. CLOSE_TIMESTAMP"
+                    onChange={(v) => setSearchParam('where_columns_include', v)}
+                  />
+                  <TokenInput
+                    label="WHERE columns — exclude (none)"
+                    value={search.where_columns_exclude}
+                    options={facets.data?.where_columns ?? []}
+                    placeholder="e.g. STATUS"
+                    onChange={(v) => setSearchParam('where_columns_exclude', v)}
+                  />
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
       )}
 
       {/* Body */}
-      {search.view === 'families' && (
-        <FamiliesTable
-          rows={families.data ?? []}
-          loading={families.isLoading}
-          onDrill={drillIntoFamily}
-        />
-      )}
       {search.view === 'groups' && (
         <GroupsTable
           rows={groups.data ?? []}
@@ -320,12 +510,29 @@ function QueriesExplorer() {
           currentFilters={{
             warehouse: search.warehouse,
             user: search.user,
+            role: search.role,
             query_type: search.type,
             execution_status: search.status,
             query_parameterized_hash: search.family,
             has_remote_spill: search.has_remote_spill,
             has_queueing: search.has_queueing,
             search: search.search,
+            min_joins: search.min_joins,
+            max_joins: search.max_joins,
+            min_tables: search.min_tables,
+            max_tables: search.max_tables,
+            min_ctes: search.min_ctes,
+            max_ctes: search.max_ctes,
+            min_subqueries: search.min_subqueries,
+            max_subqueries: search.max_subqueries,
+            min_where_blocks: search.min_where_blocks,
+            max_where_blocks: search.max_where_blocks,
+            min_where_predicates: search.min_where_predicates,
+            max_where_predicates: search.max_where_predicates,
+            referenced_tables_include: search.referenced_tables_include,
+            referenced_tables_exclude: search.referenced_tables_exclude,
+            where_columns_include: search.where_columns_include,
+            where_columns_exclude: search.where_columns_exclude,
           }}
           onClose={() => setShowSaveDialog(false)}
           onCreated={(g) => {
@@ -413,6 +620,99 @@ function FilterToggle({
   )
 }
 
+function RangeFilter({
+  label,
+  min,
+  max,
+  onMin,
+  onMax,
+}: {
+  label: string
+  min: number | undefined
+  max: number | undefined
+  onMin: (v: number | undefined) => void
+  onMax: (v: number | undefined) => void
+}) {
+  function parseInput(s: string): number | undefined {
+    const t = s.trim()
+    if (!t) return undefined
+    const n = Number(t)
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined
+  }
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="flex items-center gap-1.5">
+        <input
+          type="number"
+          min={0}
+          placeholder="min"
+          className="w-20 rounded-md border bg-background px-2 py-1 text-sm"
+          value={min ?? ''}
+          onChange={(e) => onMin(parseInput(e.target.value))}
+        />
+        <span className="text-xs text-muted-foreground">–</span>
+        <input
+          type="number"
+          min={0}
+          placeholder="max"
+          className="w-20 rounded-md border bg-background px-2 py-1 text-sm"
+          value={max ?? ''}
+          onChange={(e) => onMax(parseInput(e.target.value))}
+        />
+      </div>
+    </div>
+  )
+}
+
+// Comma-separated multi-value input with datalist autocomplete.  Used for
+// the Phase 2 semantic filters (tables / WHERE columns).  Lightweight on
+// purpose — typing comma-separated values mirrors how the URL filter looks,
+// and the datalist gives suggestion-driven autocomplete without pulling in
+// a full combobox component.  Token-pill UX is a future polish pass.
+function TokenInput({
+  label,
+  value,
+  options,
+  placeholder,
+  onChange,
+}: {
+  label: string
+  value: string | undefined
+  options: string[]
+  placeholder?: string
+  onChange: (v: string | undefined) => void
+}) {
+  // The datalist id has to be unique per input on the page; derive it
+  // from the label (collisions unlikely given there are only 4).
+  const listId = `tokeninput-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-[11px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </label>
+      <input
+        type="text"
+        list={listId}
+        placeholder={placeholder ?? 'comma-separated…'}
+        className="rounded-md border bg-background px-2 py-1 text-sm"
+        value={value ?? ''}
+        onChange={(e) => {
+          const v = e.target.value
+          // Trim outer whitespace but keep commas as-is while the user types.
+          // Empty string clears the filter entirely.
+          onChange(v.trim() ? v : undefined)
+        }}
+      />
+      <datalist id={listId}>
+        {options.slice(0, 200).map((o) => (
+          <option key={o} value={o} />
+        ))}
+      </datalist>
+    </div>
+  )
+}
+
 // ── Queries table ──────────────────────────────────────────────────
 
 function QueriesTable({
@@ -457,7 +757,7 @@ function QueriesTable({
                     <th className="px-4 py-2 text-right whitespace-nowrap">Scanned</th>
                     <th className="px-4 py-2 text-right whitespace-nowrap">Spill</th>
                     <th className="px-4 py-2 whitespace-nowrap">Started</th>
-                    <th className="px-4 py-2 whitespace-nowrap">Family</th>
+                    <th className="px-4 py-2 whitespace-nowrap">Parameterized hash</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -555,104 +855,6 @@ function QueriesTable({
   )
 }
 
-// ── Families table ──────────────────────────────────────────────────
-
-function FamiliesTable({
-  rows,
-  loading,
-  onDrill,
-}: {
-  rows: QueryFamily[]
-  loading: boolean
-  onDrill: (hash: string) => void
-}) {
-  return (
-    <Card>
-      <CardContent className="p-0">
-        {loading && <div className="p-4 text-sm text-muted-foreground">Loading…</div>}
-        {!loading && rows.length === 0 && (
-          <div className="p-8 text-center text-sm text-muted-foreground">
-            No families match these filters.
-          </div>
-        )}
-        {rows.length > 0 && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="border-b bg-muted/40 text-left text-xs uppercase text-muted-foreground">
-                <tr>
-                  <th className="px-4 py-2">Family / sample SQL</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">Count</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">Mean elapsed</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">p95 elapsed</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">Total elapsed</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">Spilled</th>
-                  <th className="px-4 py-2 text-right whitespace-nowrap">Failed</th>
-                  <th className="px-4 py-2 whitespace-nowrap">Last seen</th>
-                  <th className="px-4 py-2 whitespace-nowrap"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((f) => (
-                  <tr key={f.query_parameterized_hash} className="border-b hover:bg-muted/30">
-                    <td className="px-4 py-2">
-                      <div className="max-w-sm">
-                        <div className="font-mono text-xs text-muted-foreground truncate">
-                          {f.query_parameterized_hash.slice(0, 12)}…
-                        </div>
-                        <div
-                          className="truncate font-mono text-xs"
-                          title={f.representative_sql}
-                        >
-                          {f.representative_sql}
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-2 text-right whitespace-nowrap">{f.occurrence_count}</td>
-                    <td className="px-4 py-2 text-right font-mono whitespace-nowrap">
-                      {fmtMs(f.mean_elapsed_ms)}
-                    </td>
-                    <td className="px-4 py-2 text-right font-mono whitespace-nowrap">
-                      {fmtMs(f.p95_elapsed_ms)}
-                    </td>
-                    <td className="px-4 py-2 text-right font-mono whitespace-nowrap">
-                      {fmtMs(f.total_elapsed_ms)}
-                    </td>
-                    <td className="px-4 py-2 text-right whitespace-nowrap">
-                      {f.n_spill_remote > 0 ? (
-                        <span className="text-destructive">{f.n_spill_remote}</span>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-right whitespace-nowrap">
-                      {f.n_failed > 0 ? (
-                        <span className="text-destructive">{f.n_failed}</span>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted-foreground whitespace-nowrap">
-                      {fmtDt(f.last_seen)}
-                    </td>
-                    <td className="px-4 py-2 whitespace-nowrap">
-                      <button
-                        onClick={() => onDrill(f.query_parameterized_hash)}
-                        className="text-xs text-primary hover:underline"
-                      >
-                        Drill in →
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 // ── Detail side-sheet ───────────────────────────────────────────────
 
 function QueryDetailPanel({ queryId }: { queryId: string }) {
@@ -713,16 +915,104 @@ function QueryDetailPanel({ queryId }: { queryId: string }) {
         {d.query_parameterized_hash && (
           <Card>
             <CardContent className="p-4 text-sm">
-              <h3 className="mb-2 text-xs uppercase text-muted-foreground">Family</h3>
+              <h3 className="mb-2 text-xs uppercase text-muted-foreground">
+                Parameterized hash
+              </h3>
               <code className="block break-all font-mono text-xs">
                 {d.query_parameterized_hash}
               </code>
             </CardContent>
           </Card>
         )}
+
+        <Card>
+          <CardContent className="p-4 text-sm">
+            <h3 className="mb-3 text-xs uppercase text-muted-foreground">
+              Structural attributes
+              <span className="ml-2 normal-case text-[11px] text-muted-foreground/80">
+                (sqlglot-extracted)
+              </span>
+            </h3>
+            {d.sql_features_parse_error ? (
+              <div className="text-xs text-muted-foreground">
+                Not available: <code className="font-mono">{d.sql_features_parse_error}</code>
+                {d.sql_features_parse_error === 'redacted' && (
+                  <span className="ml-1">
+                    — grant <code className="font-mono">GOVERNANCE_VIEWER</code> for visibility.
+                  </span>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Joins" value={fmtCount(d.joins_count)} />
+                  <Field label="Tables referenced" value={fmtCount(d.tables_referenced_count)} />
+                  <Field label="CTEs" value={fmtCount(d.ctes_count)} />
+                  <Field label="Subqueries" value={fmtCount(d.subqueries_count)} />
+                  <Field label="WHERE blocks" value={fmtCount(d.where_block_count)} />
+                  <Field label="WHERE predicates" value={fmtCount(d.where_predicate_count)} />
+                </div>
+                {/* Semantic lists (Phase 2).  Empty arrays render as a
+                    placeholder so the user can tell "parsed but none" from
+                    "not yet extracted" (which would be the parse_error path). */}
+                <div className="mt-4 space-y-3 border-t pt-3 text-xs">
+                  <ChipList
+                    label="Tables referenced"
+                    items={d.referenced_tables ?? []}
+                    note="both fully-qualified and short forms shown"
+                  />
+                  <ChipList
+                    label="Columns in WHERE"
+                    items={d.where_columns ?? []}
+                    note="any column appearing anywhere in any WHERE clause"
+                  />
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </>
   )
+}
+
+function ChipList({
+  label,
+  items,
+  note,
+}: {
+  label: string
+  items: string[]
+  note?: string
+}) {
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-2">
+        <span className="uppercase tracking-wide text-muted-foreground">{label}</span>
+        {note && (
+          <span className="text-[10px] normal-case text-muted-foreground/70">{note}</span>
+        )}
+      </div>
+      {items.length === 0 ? (
+        <span className="text-muted-foreground">(none)</span>
+      ) : (
+        <div className="flex flex-wrap gap-1">
+          {items.map((it) => (
+            <code
+              key={it}
+              className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]"
+            >
+              {it}
+            </code>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function fmtCount(n: number | null | undefined): string {
+  return n == null ? '—' : String(n)
 }
 
 function Field({ label, value }: { label: string; value: string }) {
@@ -854,12 +1144,30 @@ function GroupsTable({
 type CurrentFilters = {
   warehouse?: string
   user?: string
+  role?: string
   query_type?: string
   execution_status?: string
   query_parameterized_hash?: string
   has_remote_spill?: boolean
   has_queueing?: boolean
   search?: string
+  min_joins?: number
+  max_joins?: number
+  min_tables?: number
+  max_tables?: number
+  min_ctes?: number
+  max_ctes?: number
+  min_subqueries?: number
+  max_subqueries?: number
+  min_where_blocks?: number
+  max_where_blocks?: number
+  min_where_predicates?: number
+  max_where_predicates?: number
+  // Semantic (Phase 2) — comma-separated table / column names
+  referenced_tables_include?: string
+  referenced_tables_exclude?: string
+  where_columns_include?: string
+  where_columns_exclude?: string
 }
 
 function SaveAsGroupDialog({
@@ -882,7 +1190,35 @@ function SaveAsGroupDialog({
         name: name.trim(),
         description: description.trim() || null,
         kind,
-        ...currentFilters,
+        // Map the dialog's filter shape to the API's CreateQueryGroupBody.
+        // The query-string filters use `query_type` / `status` / `family`;
+        // the API uses `query_type` / `execution_status` /
+        // `query_parameterized_hash`.  Already aligned in `currentFilters`.
+        warehouse_name: currentFilters.warehouse,
+        user_name: currentFilters.user,
+        role_name: currentFilters.role,
+        query_type: currentFilters.query_type,
+        execution_status: currentFilters.execution_status,
+        query_parameterized_hash: currentFilters.query_parameterized_hash,
+        has_remote_spill: currentFilters.has_remote_spill,
+        has_queueing: currentFilters.has_queueing,
+        search: currentFilters.search,
+        min_joins: currentFilters.min_joins,
+        max_joins: currentFilters.max_joins,
+        min_tables: currentFilters.min_tables,
+        max_tables: currentFilters.max_tables,
+        min_ctes: currentFilters.min_ctes,
+        max_ctes: currentFilters.max_ctes,
+        min_subqueries: currentFilters.min_subqueries,
+        max_subqueries: currentFilters.max_subqueries,
+        min_where_blocks: currentFilters.min_where_blocks,
+        max_where_blocks: currentFilters.max_where_blocks,
+        min_where_predicates: currentFilters.min_where_predicates,
+        max_where_predicates: currentFilters.max_where_predicates,
+        referenced_tables_include: currentFilters.referenced_tables_include,
+        referenced_tables_exclude: currentFilters.referenced_tables_exclude,
+        where_columns_include: currentFilters.where_columns_include,
+        where_columns_exclude: currentFilters.where_columns_exclude,
       }
       return api.createQueryGroup(body)
     },
@@ -894,13 +1230,34 @@ function SaveAsGroupDialog({
   const filterChips: string[] = []
   if (currentFilters.warehouse) filterChips.push(`warehouse=${currentFilters.warehouse}`)
   if (currentFilters.user) filterChips.push(`user=${currentFilters.user}`)
+  if (currentFilters.role) filterChips.push(`role=${currentFilters.role}`)
   if (currentFilters.query_type) filterChips.push(`type=${currentFilters.query_type}`)
   if (currentFilters.execution_status) filterChips.push(`status=${currentFilters.execution_status}`)
   if (currentFilters.query_parameterized_hash)
-    filterChips.push(`family=${currentFilters.query_parameterized_hash.slice(0, 12)}…`)
+    filterChips.push(`hash=${currentFilters.query_parameterized_hash.slice(0, 12)}…`)
   if (currentFilters.has_remote_spill) filterChips.push('has_remote_spill')
   if (currentFilters.has_queueing) filterChips.push('has_queueing')
   if (currentFilters.search) filterChips.push(`search="${currentFilters.search}"`)
+  // Structural
+  const range = (label: string, lo: number | undefined, hi: number | undefined) => {
+    if (lo == null && hi == null) return
+    filterChips.push(`${label}=${lo ?? '*'}..${hi ?? '*'}`)
+  }
+  range('joins', currentFilters.min_joins, currentFilters.max_joins)
+  range('tables', currentFilters.min_tables, currentFilters.max_tables)
+  range('ctes', currentFilters.min_ctes, currentFilters.max_ctes)
+  range('subqueries', currentFilters.min_subqueries, currentFilters.max_subqueries)
+  range('where_blocks', currentFilters.min_where_blocks, currentFilters.max_where_blocks)
+  range('where_predicates', currentFilters.min_where_predicates, currentFilters.max_where_predicates)
+  // Semantic chips (Phase 2)
+  if (currentFilters.referenced_tables_include)
+    filterChips.push(`tables⊇{${currentFilters.referenced_tables_include}}`)
+  if (currentFilters.referenced_tables_exclude)
+    filterChips.push(`tables∌{${currentFilters.referenced_tables_exclude}}`)
+  if (currentFilters.where_columns_include)
+    filterChips.push(`where⊇{${currentFilters.where_columns_include}}`)
+  if (currentFilters.where_columns_exclude)
+    filterChips.push(`where∌{${currentFilters.where_columns_exclude}}`)
 
   return (
     <div
@@ -1049,16 +1406,40 @@ function GroupDetailPanel({
   const chips: { label: string; value: string }[] = []
   if (spec.warehouse_name?.length) chips.push({ label: 'warehouse', value: spec.warehouse_name.join(', ') })
   if (spec.user_name?.length) chips.push({ label: 'user', value: spec.user_name.join(', ') })
+  if (spec.role_name?.length) chips.push({ label: 'role', value: spec.role_name.join(', ') })
   if (spec.query_type?.length) chips.push({ label: 'type', value: spec.query_type.join(', ') })
   if (spec.execution_status?.length) chips.push({ label: 'status', value: spec.execution_status.join(', ') })
   if (spec.query_parameterized_hash?.length)
-    chips.push({ label: 'family', value: spec.query_parameterized_hash.join(', ').slice(0, 30) + '…' })
+    chips.push({ label: 'hash', value: spec.query_parameterized_hash.join(', ').slice(0, 30) + '…' })
   if (spec.has_remote_spill === true) chips.push({ label: 'has_remote_spill', value: 'true' })
   if (spec.has_local_spill === true) chips.push({ label: 'has_local_spill', value: 'true' })
   if (spec.has_queueing === true) chips.push({ label: 'has_queueing', value: 'true' })
   if (spec.min_elapsed_ms != null) chips.push({ label: 'min_elapsed_ms', value: String(spec.min_elapsed_ms) })
   if (spec.max_elapsed_ms != null) chips.push({ label: 'max_elapsed_ms', value: String(spec.max_elapsed_ms) })
   if (spec.search) chips.push({ label: 'search', value: `"${spec.search}"` })
+
+  // Structural range chips
+  const range = (label: string, lo: number | null | undefined, hi: number | null | undefined) => {
+    if (lo == null && hi == null) return
+    chips.push({ label, value: `${lo ?? '*'}..${hi ?? '*'}` })
+  }
+  range('joins', spec.min_joins, spec.max_joins)
+  range('tables', spec.min_tables, spec.max_tables)
+  range('ctes', spec.min_ctes, spec.max_ctes)
+  range('subqueries', spec.min_subqueries, spec.max_subqueries)
+  range('where_blocks', spec.min_where_blocks, spec.max_where_blocks)
+  range('where_predicates', spec.min_where_predicates, spec.max_where_predicates)
+
+  // Semantic chips (Phase 2).  The spec stores these as ``list[str]``, so
+  // render the values joined by ``,`` for compactness.
+  if (spec.referenced_tables_include?.length)
+    chips.push({ label: 'tables⊇', value: spec.referenced_tables_include.join(',') })
+  if (spec.referenced_tables_exclude?.length)
+    chips.push({ label: 'tables∌', value: spec.referenced_tables_exclude.join(',') })
+  if (spec.where_columns_include?.length)
+    chips.push({ label: 'where⊇', value: spec.where_columns_include.join(',') })
+  if (spec.where_columns_exclude?.length)
+    chips.push({ label: 'where∌', value: spec.where_columns_exclude.join(',') })
 
   return (
     <>

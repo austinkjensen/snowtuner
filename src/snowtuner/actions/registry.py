@@ -6,14 +6,12 @@ from typing import Any
 from snowtuner.actions.base import Action, ActionType
 from snowtuner.actions.alter_warehouse import AlterWarehouse
 from snowtuner.actions.create_warehouse import CreateWarehouse
-from snowtuner.actions.routing_rule import CreateRoutingRule
 from snowtuner.actions.local_table import CreateLocalDuckDBTable
 
 
 ACTION_TYPES: dict[ActionType, type[Action]] = {
     ActionType.ALTER_WAREHOUSE: AlterWarehouse,
     ActionType.CREATE_WAREHOUSE: CreateWarehouse,
-    ActionType.CREATE_ROUTING_RULE: CreateRoutingRule,
     ActionType.CREATE_LOCAL_DUCKDB_TABLE: CreateLocalDuckDBTable,
 }
 

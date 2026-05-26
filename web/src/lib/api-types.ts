@@ -106,6 +106,64 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sync/backfill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Backfill
+         * @description Re-pull a wider historical window without destroying app.* state.
+         *
+         *     Mechanism: DELETE the sync watermarks for the targeted incremental
+         *     sources, then sync with ``initial_lookback_days=days``.  Idempotent
+         *     because raw.* tables upsert on a PK.  Preserves recommendations,
+         *     experiments, autonomous configs + audit, query groups, features.
+         *
+         *     Use this when you want more history than the default 14-day initial
+         *     lookback, OR when you want to refetch a window because something
+         *     was redacted / changed.  For schema-level rebuilds, use
+         *     ``snowtuner reset`` instead (more destructive — see its docs).
+         */
+        post: operations["run_backfill_sync_backfill_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Sync
+         * @description Run sync only (no features, no recommenders).
+         *
+         *     Pulls deltas from Snowflake's ACCOUNT_USAGE views into ``raw.*``,
+         *     respecting each source's watermark.  Use this when you want
+         *     fresh raw data without paying for the full orchestrator pipeline
+         *     (which also runs all feature transforms + every recommender).
+         *
+         *     Uses a dedicated SnowflakeClient so it doesn't contend with any
+         *     in-flight experiment using the engine's connection.
+         */
+        post: operations["run_sync_sync_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/recommendations": {
         parameters: {
             query?: never;
@@ -277,6 +335,85 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/automation/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Automation Status
+         * @description Snapshot the AutomationLoop's state.
+         *
+         *     Returns whether the loop is enabled, the configured interval, when
+         *     the next tick fires, and a fully-decomposed report of the last tick
+         *     (per-stage outcomes, durations, errors).  Use this to verify
+         *     ``SNOWTUNER_AUTOMATION_INTERVAL`` is set correctly and to debug
+         *     ticks that failed silently in the background.
+         */
+        get: operations["get_automation_status_automation_status_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/automation/run-now": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Automation Now
+         * @description Trigger one tick of the AutomationLoop synchronously.
+         *
+         *     Same code path as the background loop fires; runs the full
+         *     sync→features→recommenders→autonomous pipeline.  Returns the
+         *     tick report when complete.
+         *
+         *     Useful for: validating the loop's behavior without waiting for
+         *     an interval; triggering a fresh cycle on demand (UI's "Run now"
+         *     button); CI/CD verification before declaring a deploy healthy.
+         *     Refuses with a skipped report if another tick is already running.
+         */
+        post: operations["run_automation_now_automation_run_now_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/schema/drift": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Schema Drift
+         * @description Compare each source's expected Snowflake columns against the live
+         *     view's actual columns.
+         *
+         *     Returns a structured report; the CLI's ``snowtuner check-schema``
+         *     renders the same data.  Warn-only — never auto-evolves the schema.
+         */
+        get: operations["get_schema_drift_schema_drift_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/status": {
         parameters: {
             query?: never;
@@ -328,6 +465,437 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/experiments/recipes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Recipes */
+        get: operations["list_recipes_experiments_recipes_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Experiments */
+        get: operations["list_experiments_experiments_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Experiment */
+        get: operations["get_experiment_experiments__experiment_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Experiment Runs */
+        get: operations["list_experiment_runs_experiments__experiment_id__runs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/propose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Propose Experiment */
+        post: operations["propose_experiment_experiments_propose_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/propose-benchmark": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Propose Benchmark Experiment
+         * @description Propose a benchmark-kind experiment: compare N absolute configurations
+         *     against a workload.
+         *
+         *     Distinct from `/experiments/propose` because:
+         *       - No recipe — arms are user-built
+         *       - No target warehouse to clone control from — arms are absolute
+         *       - Workload source is explicit (workload_warehouse), not derived
+         */
+        post: operations["propose_benchmark_experiment_experiments_propose_benchmark_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept Experiment */
+        post: operations["accept_experiment_experiments__experiment_id__accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reject Experiment */
+        post: operations["reject_experiment_experiments__experiment_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/sampled-queries/{query_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Sampled Query
+         * @description Remove a single query from a PROPOSED experiment's frozen workload.
+         *
+         *     Re-estimates cost from the remaining queries.  Refuses if:
+         *       * the experiment isn't PROPOSED (already accepted/running)
+         *       * the resulting list would be empty (would leave the experiment
+         *         with no workload — better to reject the proposal entirely)
+         */
+        delete: operations["remove_sampled_query_experiments__experiment_id__sampled_queries__query_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/backfill-metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Backfill Experiment Metrics
+         * @description Recover metrics on a COMPLETED experiment whose live fetch failed.
+         *
+         *     Pulls elapsed_ms / bytes_scanned / spill stats from
+         *     ``SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`` for every SUCCESS run that
+         *     has a ``replay_query_id`` but no ``elapsed_ms``.  UPDATEs the run
+         *     rows in place, then re-aggregates and writes the new report.
+         *
+         *     ACCOUNT_USAGE has a ~45-minute lag; if a recent experiment came back
+         *     empty, wait an hour before backfilling or the rows won't be there.
+         *
+         *     Returns a small summary: rows_inspected / rows_updated /
+         *     rows_unreachable / report_regenerated.
+         */
+        post: operations["backfill_experiment_metrics_experiments__experiment_id__backfill_metrics_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Experiment
+         * @description Spawn the engine in a background thread; return immediately.
+         *
+         *     The client polls GET /experiments/{id} to watch status transitions
+         *     through RUNNING → COMPLETED/FAILED/ABORTED.
+         */
+        post: operations["run_experiment_experiments__experiment_id__run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/experiments/{experiment_id}/abort": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Abort Experiment
+         * @description Mark an experiment as ABORTED.
+         *
+         *     v0.2 doesn't yet have a cooperative-cancel signal to the running
+         *     engine thread — the engine notices status changes between phases.
+         *     For a hard abort during a long-running query, restart the API
+         *     process; the next startup will clean up orphaned warehouses.
+         */
+        post: operations["abort_experiment_experiments__experiment_id__abort_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/queries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Queries */
+        get: operations["list_queries_queries_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/queries/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Query Facets
+         * @description Distinct filter values from the last N days of query history.
+         *
+         *     Scoped to a window so we don't surface long-departed users / decommissioned
+         *     warehouses in the filter chips.
+         *
+         *     Semantic facets (tables, where columns) are ranked by usage frequency
+         *     within the window and capped at ``semantic_limit`` so the payload stays
+         *     bounded on big workloads.
+         */
+        get: operations["query_facets_queries_facets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/queries/{query_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Query */
+        get: operations["get_query_queries__query_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/query-families": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Query Families
+         * @description Aggregated rollup by query_parameterized_hash.
+         *
+         *     Default sort: total_elapsed_ms DESC (the "biggest cost contributors first"
+         *     view — same impact ranking the experiments sampler uses internally).
+         */
+        get: operations["list_query_families_query_families_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/query-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Query Groups */
+        get: operations["list_query_groups_query_groups_get"];
+        put?: never;
+        /** Create Query Group */
+        post: operations["create_query_group_query_groups_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/query-groups/{group_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Query Group */
+        get: operations["get_query_group_query_groups__group_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Query Group */
+        delete: operations["delete_query_group_query_groups__group_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/query-groups/{group_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Query Group Members */
+        get: operations["query_group_members_query_groups__group_id__members_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cli-help": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Cli Help
+         * @description Introspect the snowtuner CLI and return a structured tree of commands.
+         *
+         *     Used by the web UI's Docs tab to render an auto-generated CLI reference.
+         *     The tree mirrors what `snowtuner --help` shows in the terminal, but
+         *     recursive — each group's subcommands are included inline.
+         */
+        get: operations["cli_help_cli_help_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/mcp-tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Mcp Tools List
+         * @description List MCP tools registered on the admin server with descriptions and
+         *     JSON-schema parameter specs.  Used by the web UI's Docs tab.
+         */
+        get: operations["mcp_tools_list_mcp_tools_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/seed": {
         parameters: {
             query?: never;
@@ -349,6 +917,137 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AbortExperimentRequest
+         * @description POST /experiments/{id}/abort body.  Reason is required so the audit
+         *     trail is useful.
+         */
+        AbortExperimentRequest: {
+            /** Reason */
+            reason: string;
+        };
+        /**
+         * Arm
+         * @description One configuration point in an experiment.
+         *
+         *     The control arm has an empty delta — its warehouse is the user's existing
+         *     one, untouched.  Non-control arms describe a new warehouse that will be
+         *     spun up for the experiment with the delta applied.
+         */
+        Arm: {
+            /** Name */
+            name: string;
+            delta: components["schemas"]["WarehouseConfigDelta"];
+            /** Estimated Cost Credits */
+            estimated_cost_credits?: number | null;
+            /** Eligibility Issues */
+            eligibility_issues?: components["schemas"]["Issue"][];
+        };
+        /**
+         * ArmObservation
+         * @description Aggregated metrics for a single arm.
+         *
+         *     Carries two complementary views:
+         *
+         *     1. **Absolute stats** (always populated): the arm's own mean/p50/p95
+         *        elapsed and per-query credits.  Used by the benchmark Pareto-frontier
+         *        ranking and shown on every report regardless of kind.
+         *     2. **Delta stats** (populated only when there's a control to pair
+         *        against): mean/p50/p95 of (arm_elapsed - control_elapsed) and per-query
+         *        credit deltas, plus Bonferroni-corrected p-values.  Used by the
+         *        tuning best-arm rule.
+         */
+        ArmObservation: {
+            /** Arm Name */
+            arm_name: string;
+            /** N Queries Run */
+            n_queries_run: number;
+            /** N Queries Failed */
+            n_queries_failed: number;
+            /** N Queries Excluded */
+            n_queries_excluded: number;
+            /**
+             * Elapsed Ms Mean
+             * @default 0
+             */
+            elapsed_ms_mean: number;
+            /**
+             * Elapsed Ms P50
+             * @default 0
+             */
+            elapsed_ms_p50: number;
+            /**
+             * Elapsed Ms P95
+             * @default 0
+             */
+            elapsed_ms_p95: number;
+            /**
+             * Credits Per Query Mean
+             * @default 0
+             */
+            credits_per_query_mean: number;
+            /**
+             * Elapsed Ms Delta Mean
+             * @default 0
+             */
+            elapsed_ms_delta_mean: number;
+            /**
+             * Elapsed Ms Delta P50
+             * @default 0
+             */
+            elapsed_ms_delta_p50: number;
+            /**
+             * Elapsed Ms Delta P95
+             * @default 0
+             */
+            elapsed_ms_delta_p95: number;
+            /**
+             * Elapsed Ms Delta Ci Low
+             * @default 0
+             */
+            elapsed_ms_delta_ci_low: number;
+            /**
+             * Elapsed Ms Delta Ci High
+             * @default 0
+             */
+            elapsed_ms_delta_ci_high: number;
+            /**
+             * Credits Per Query Delta Mean
+             * @default 0
+             */
+            credits_per_query_delta_mean: number;
+            /**
+             * Credits Per Query Delta Ci Low
+             * @default 0
+             */
+            credits_per_query_delta_ci_low: number;
+            /**
+             * Credits Per Query Delta Ci High
+             * @default 0
+             */
+            credits_per_query_delta_ci_high: number;
+            /** Elapsed P Value Corrected */
+            elapsed_p_value_corrected?: number | null;
+            /** Credits P Value Corrected */
+            credits_p_value_corrected?: number | null;
+            /**
+             * Is Pareto Optimal
+             * @default false
+             */
+            is_pareto_optimal: boolean;
+        };
+        /** AutomationStatusOut */
+        AutomationStatusOut: {
+            /** Enabled */
+            enabled: boolean;
+            /** Interval Seconds */
+            interval_seconds: number;
+            /** Currently Running */
+            currently_running: boolean;
+            /** Next Run At */
+            next_run_at?: string | null;
+            last_tick?: components["schemas"]["TickReportOut"] | null;
+        };
         /** AutonomousApplicationOut */
         AutonomousApplicationOut: {
             /** Id */
@@ -415,6 +1114,193 @@ export interface components {
             max_rollbacks_per_week?: number | null;
         };
         /**
+         * BenchmarkArmSpec
+         * @description One arm in a user-built benchmark experiment.
+         *
+         *     Each arm fully specifies its config; the engine creates a test warehouse
+         *     that *is* this config (no merge with a control's current state).  Fields
+         *     left unset will be defaulted at engine time to sensible values
+         *     (XSMALL, Gen1, QAS off) so the user doesn't have to specify everything.
+         */
+        BenchmarkArmSpec: {
+            /** Name */
+            name: string;
+            /** Size */
+            size?: string | null;
+            /** Generation */
+            generation?: string | null;
+            /** Qas State */
+            qas_state?: string | null;
+            /** Qas Max Scale Factor */
+            qas_max_scale_factor?: number | null;
+        };
+        /**
+         * CliCommand
+         * @description One node in the CLI tree.  Groups have ``subcommands`` populated.
+         */
+        CliCommand: {
+            /** Name */
+            name: string;
+            /** Path */
+            path: string[];
+            /**
+             * Help
+             * @default
+             */
+            help: string;
+            /**
+             * Short Help
+             * @default
+             */
+            short_help: string;
+            /**
+             * Is Group
+             * @default false
+             */
+            is_group: boolean;
+            /** Params */
+            params?: components["schemas"]["CliParam"][];
+            /** Subcommands */
+            subcommands?: components["schemas"]["CliCommand"][];
+        };
+        /**
+         * CliParam
+         * @description One option or argument on a CLI command.
+         */
+        CliParam: {
+            /** Name */
+            name: string;
+            /** Kind */
+            kind: string;
+            /** Type */
+            type: string;
+            /**
+             * Help
+             * @default
+             */
+            help: string;
+            /**
+             * Required
+             * @default false
+             */
+            required: boolean;
+            /**
+             * Is Flag
+             * @default false
+             */
+            is_flag: boolean;
+            /** Default */
+            default?: string | null;
+            /** Choices */
+            choices?: string[] | null;
+            /**
+             * Multiple
+             * @default false
+             */
+            multiple: boolean;
+        };
+        /**
+         * CostEstimate
+         * @description Estimated cost of running a proposed experiment, and the savings
+         *     projection if it succeeds.  Frozen at proposal time.
+         */
+        CostEstimate: {
+            /** Low Credits */
+            low_credits: number;
+            /** High Credits */
+            high_credits: number;
+            /** Rationale */
+            rationale: string;
+            /** Projected Annual Savings Low Credits */
+            projected_annual_savings_low_credits?: number | null;
+            /** Projected Annual Savings High Credits */
+            projected_annual_savings_high_credits?: number | null;
+            /** Projected Annual Savings Assumptions */
+            projected_annual_savings_assumptions?: string[];
+            /** Projected P50 Elapsed Delta Pct Low */
+            projected_p50_elapsed_delta_pct_low?: number | null;
+            /** Projected P50 Elapsed Delta Pct High */
+            projected_p50_elapsed_delta_pct_high?: number | null;
+        };
+        /**
+         * CreateQueryGroupRequest
+         * @description POST /query-groups body.
+         *
+         *     ``filter_spec`` carries the criteria; for static groups, we materialize
+         *     the current member list at creation time and store it on the row.  The
+         *     client can pass the same fields it'd otherwise use as URL filters on
+         *     ``/queries`` — the explorer's "Save current filter as group" action just
+         *     forwards what's in its current search-params shape, lightly normalized.
+         */
+        CreateQueryGroupRequest: {
+            /** Name */
+            name: string;
+            /** Description */
+            description?: string | null;
+            /** Kind */
+            kind: string;
+            /** Warehouse Name */
+            warehouse_name?: string[] | string | null;
+            /** User Name */
+            user_name?: string[] | string | null;
+            /** Role Name */
+            role_name?: string[] | string | null;
+            /** Query Type */
+            query_type?: string[] | string | null;
+            /** Execution Status */
+            execution_status?: string[] | string | null;
+            /** Query Parameterized Hash */
+            query_parameterized_hash?: string[] | string | null;
+            /** Start Time From */
+            start_time_from?: string | null;
+            /** Start Time To */
+            start_time_to?: string | null;
+            /** Min Elapsed Ms */
+            min_elapsed_ms?: number | null;
+            /** Max Elapsed Ms */
+            max_elapsed_ms?: number | null;
+            /** Has Remote Spill */
+            has_remote_spill?: boolean | null;
+            /** Has Local Spill */
+            has_local_spill?: boolean | null;
+            /** Has Queueing */
+            has_queueing?: boolean | null;
+            /** Search */
+            search?: string | null;
+            /** Min Joins */
+            min_joins?: number | null;
+            /** Max Joins */
+            max_joins?: number | null;
+            /** Min Tables */
+            min_tables?: number | null;
+            /** Max Tables */
+            max_tables?: number | null;
+            /** Min Ctes */
+            min_ctes?: number | null;
+            /** Max Ctes */
+            max_ctes?: number | null;
+            /** Min Subqueries */
+            min_subqueries?: number | null;
+            /** Max Subqueries */
+            max_subqueries?: number | null;
+            /** Min Where Blocks */
+            min_where_blocks?: number | null;
+            /** Max Where Blocks */
+            max_where_blocks?: number | null;
+            /** Min Where Predicates */
+            min_where_predicates?: number | null;
+            /** Max Where Predicates */
+            max_where_predicates?: number | null;
+            /** Referenced Tables Include */
+            referenced_tables_include?: string[] | string | null;
+            /** Referenced Tables Exclude */
+            referenced_tables_exclude?: string[] | string | null;
+            /** Where Columns Include */
+            where_columns_include?: string[] | string | null;
+            /** Where Columns Exclude */
+            where_columns_exclude?: string[] | string | null;
+        };
+        /**
          * CredentialStatusOut
          * @description Public-safe view of resolved credentials.  Never includes secrets.
          */
@@ -453,6 +1339,13 @@ export interface components {
             /** Error */
             error?: string | null;
         };
+        /** DriftReportOut */
+        DriftReportOut: {
+            /** Sources */
+            sources: components["schemas"]["SourceDriftOut"][];
+            /** Any Actionable */
+            any_actionable: boolean;
+        };
         /**
          * EvidenceRef
          * @description A pointer to data that supports this recommendation.
@@ -471,6 +1364,159 @@ export interface components {
             /** Value */
             value?: number | null;
         };
+        /**
+         * Experiment
+         * @description A persisted experiment row.  Everything we know about one experiment
+         *     from proposal to completion (or abortion / failure).
+         */
+        Experiment: {
+            /** Id */
+            id: number;
+            proposed: components["schemas"]["ProposedExperiment"];
+            status: components["schemas"]["ExperimentStatus"];
+            /**
+             * Proposed At
+             * Format: date-time
+             */
+            proposed_at: string;
+            /** Accepted At */
+            accepted_at?: string | null;
+            /** Started At */
+            started_at?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Aborted Reason */
+            aborted_reason?: string | null;
+            /** Actual Cost Credits */
+            actual_cost_credits?: number | null;
+            /**
+             * Cost Cap Hit
+             * @default false
+             */
+            cost_cap_hit: boolean;
+            report?: components["schemas"]["ExperimentReport"] | null;
+            /** Derived Recommendation Id */
+            derived_recommendation_id?: number | null;
+            /** Test Warehouse Names */
+            test_warehouse_names?: string[];
+            /**
+             * Test Warehouses Cleaned
+             * @default false
+             */
+            test_warehouses_cleaned: boolean;
+        };
+        /**
+         * ExperimentKind
+         * @description What problem the experiment is trying to solve.
+         *
+         *     Two kinds, distinguished by what's anchored:
+         *
+         *     ``TUNING`` — anchored to a specific warehouse.  We're asking
+         *     "how should *this* warehouse change?"  The control arm is implicit
+         *     (the warehouse's current config); non-control arms are *deltas* on
+         *     top of that config.  Produces a recommendation if a winning arm is
+         *     found.
+         *
+         *     ``BENCHMARK`` — anchored to a workload.  We're asking "across these
+         *     N candidate configurations, which performs best on this set of
+         *     queries?"  Arms are *absolute* configs; control is optional (one of
+         *     the arms may be designated as reference, or none).  Produces a
+         *     benchmark report; doesn't directly emit a recommendation since
+         *     there's no specific warehouse being optimized.
+         * @enum {string}
+         */
+        ExperimentKind: "tuning" | "benchmark";
+        /**
+         * ExperimentReport
+         * @description Final report.  Generated once; the engine writes it onto the
+         *     ``Experiment`` and computes a derived recommendation if a clear winner
+         *     emerges.
+         */
+        ExperimentReport: {
+            /** Experiment Id */
+            experiment_id: number;
+            /** Arms */
+            arms: components["schemas"]["ArmObservation"][];
+            /** Best Arm Name */
+            best_arm_name?: string | null;
+            /** Best Arm Rationale */
+            best_arm_rationale?: string | null;
+            /** Best Arm Objective */
+            best_arm_objective?: string | null;
+            /** Projected Annual Savings Low Credits */
+            projected_annual_savings_low_credits?: number | null;
+            /** Projected Annual Savings High Credits */
+            projected_annual_savings_high_credits?: number | null;
+            /** Projected P95 Latency Delta Pct Low */
+            projected_p95_latency_delta_pct_low?: number | null;
+            /** Projected P95 Latency Delta Pct High */
+            projected_p95_latency_delta_pct_high?: number | null;
+            /** Sample Size Warnings */
+            sample_size_warnings?: string[];
+            /**
+             * Excluded Query Count
+             * @default 0
+             */
+            excluded_query_count: number;
+            /** Statistical Corrections Applied */
+            statistical_corrections_applied?: string[];
+            /** Assumptions */
+            assumptions?: string[];
+        };
+        /**
+         * ExperimentRun
+         * @description One row of ``app.experiment_runs`` — a single replay of one sampled
+         *     query against one arm at one rep index.
+         *
+         *     The engine writes these as they complete; the stats step aggregates them
+         *     into the per-arm ``ArmObservation``s on the final report.  Stored
+         *     individually (rather than only as aggregates) so we can re-aggregate with
+         *     different exclusion rules without re-running the experiment.
+         */
+        ExperimentRun: {
+            /** Experiment Id */
+            experiment_id: number;
+            /** Arm Name */
+            arm_name: string;
+            /** Rep Index */
+            rep_index: number;
+            /** Sampled Query Id */
+            sampled_query_id: string;
+            /** Parameterized Hash */
+            parameterized_hash?: string | null;
+            /** Replay Query Id */
+            replay_query_id?: string | null;
+            /** Elapsed Ms */
+            elapsed_ms?: number | null;
+            /** Queued Overload Ms */
+            queued_overload_ms?: number | null;
+            /** Bytes Scanned */
+            bytes_scanned?: number | null;
+            /** Bytes Spilled Local */
+            bytes_spilled_local?: number | null;
+            /** Bytes Spilled Remote */
+            bytes_spilled_remote?: number | null;
+            /** Credits Used Estimate */
+            credits_used_estimate?: number | null;
+            status: components["schemas"]["RunStatus"];
+            /** Error Message */
+            error_message?: string | null;
+            /** Started At */
+            started_at?: string | null;
+            /** Completed At */
+            completed_at?: string | null;
+        };
+        /**
+         * ExperimentStatus
+         * @enum {string}
+         */
+        ExperimentStatus: "PROPOSED" | "ACCEPTED" | "RUNNING" | "COMPLETED" | "ABORTED" | "FAILED" | "REJECTED";
+        /**
+         * Generation
+         * @description Snowflake warehouse generation.  Set via ``GENERATION = '1' | '2'``.
+         * @enum {string}
+         */
+        Generation: "1" | "2";
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -492,6 +1538,449 @@ export interface components {
             confidence: number;
             /** Notes */
             notes?: string | null;
+        };
+        /**
+         * Issue
+         * @description A validation issue raised by Action.validate().
+         */
+        Issue: {
+            /** Severity */
+            severity: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * McpToolInfo
+         * @description One MCP tool registered on the admin server.
+         *
+         *     ``parameters`` is the JSON Schema FastMCP generates from the tool
+         *     function's signature; rendered as a collapsible JSON block in the UI.
+         */
+        McpToolInfo: {
+            /** Name */
+            name: string;
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /** Parameters */
+            parameters?: {
+                [key: string]: unknown;
+            } | null;
+        };
+        /**
+         * ProposeBenchmarkRequest
+         * @description POST /experiments/propose-benchmark body.
+         *
+         *     Distinct endpoint from the recipe-based `propose` because the payload
+         *     shape is fundamentally different: arms are absolute, not deltas; there's
+         *     a workload source instead of a target warehouse.
+         */
+        ProposeBenchmarkRequest: {
+            /** Hypothesis */
+            hypothesis: string;
+            /** Workload Warehouse */
+            workload_warehouse?: string | null;
+            /** Query Group Id */
+            query_group_id?: number | null;
+            /** Arms */
+            arms: components["schemas"]["BenchmarkArmSpec"][];
+            /** Control Arm Name */
+            control_arm_name?: string | null;
+            /**
+             * Sample Size
+             * @default 30
+             */
+            sample_size: number;
+            /**
+             * Reps Per Arm
+             * @default 3
+             */
+            reps_per_arm: number;
+        };
+        /**
+         * ProposeExperimentRequest
+         * @description POST /experiments/propose body.
+         *
+         *     The server samples historical query stats and looks up the warehouse
+         *     config — the client only needs to say *which* recipe against *which*
+         *     warehouse.
+         *
+         *     Optional ``query_group_id`` (Phase 3) overrides the warehouse-based
+         *     auto-sample with the group's members.  Static groups use their frozen
+         *     snapshot; dynamic groups are re-evaluated at propose-time and the
+         *     resolved IDs are then frozen onto the experiment proposal.
+         */
+        ProposeExperimentRequest: {
+            /** Recipe Name */
+            recipe_name: string;
+            /** Target Warehouse */
+            target_warehouse: string;
+            /** Query Group Id */
+            query_group_id?: number | null;
+        };
+        /**
+         * ProposedExperiment
+         * @description What a recommender (or a user via the UI) proposes when more data is
+         *     needed before recommending.
+         *
+         *     Mirrors the role ``Recommendation`` plays for advisory output.  Frozen
+         *     once accepted — the engine reads from this same spec to drive the run.
+         */
+        ProposedExperiment: {
+            /** @default tuning */
+            kind: components["schemas"]["ExperimentKind"];
+            /** Recipe Name */
+            recipe_name: string;
+            /** Target Warehouse */
+            target_warehouse?: string | null;
+            /** Workload Warehouse */
+            workload_warehouse?: string | null;
+            /**
+             * Control Arm Name
+             * @default control
+             */
+            control_arm_name: string | null;
+            /** Hypothesis */
+            hypothesis: string;
+            /** Arms */
+            arms: components["schemas"]["Arm"][];
+            /** Sample Size */
+            sample_size: number;
+            /** Reps Per Arm */
+            reps_per_arm: number;
+            cost_estimate: components["schemas"]["CostEstimate"];
+            /** Eligibility Issues */
+            eligibility_issues?: components["schemas"]["Issue"][];
+            /** Proposed By */
+            proposed_by: string;
+            /** Sampled Query Ids */
+            sampled_query_ids?: string[];
+            /**
+             * Workload Source
+             * @default auto
+             */
+            workload_source: string;
+            /** Sample Warnings */
+            sample_warnings?: string[];
+        };
+        /**
+         * QASState
+         * @description Whether Query Acceleration Service is enabled on the warehouse.
+         * @enum {string}
+         */
+        QASState: "off" | "on";
+        /**
+         * QueryDetail
+         * @description Full detail for GET /queries/{id} — everything we have in raw.query_history
+         *     for one query, used by the side-sheet detail view.
+         */
+        QueryDetail: {
+            /** Query Id */
+            query_id: string;
+            /** Query Text */
+            query_text: string;
+            /** Query Type */
+            query_type: string | null;
+            /** Execution Status */
+            execution_status: string | null;
+            /** User Name */
+            user_name: string | null;
+            /** Role Name */
+            role_name: string | null;
+            /** Warehouse Name */
+            warehouse_name: string | null;
+            /** Warehouse Size */
+            warehouse_size: string | null;
+            /** Database Name */
+            database_name: string | null;
+            /** Schema Name */
+            schema_name: string | null;
+            /** Start Time */
+            start_time: string | null;
+            /** End Time */
+            end_time: string | null;
+            /** Total Elapsed Ms */
+            total_elapsed_ms: number | null;
+            /** Compilation Ms */
+            compilation_ms: number | null;
+            /** Execution Ms */
+            execution_ms: number | null;
+            /** Queued Overload Ms */
+            queued_overload_ms: number | null;
+            /** Queued Provisioning Ms */
+            queued_provisioning_ms: number | null;
+            /** Bytes Scanned */
+            bytes_scanned: number | null;
+            /** Bytes Spilled To Local */
+            bytes_spilled_to_local: number | null;
+            /** Bytes Spilled To Remote */
+            bytes_spilled_to_remote: number | null;
+            /** Query Parameterized Hash */
+            query_parameterized_hash: string | null;
+            /** Joins Count */
+            joins_count?: number | null;
+            /** Tables Referenced Count */
+            tables_referenced_count?: number | null;
+            /** Ctes Count */
+            ctes_count?: number | null;
+            /** Subqueries Count */
+            subqueries_count?: number | null;
+            /** Where Block Count */
+            where_block_count?: number | null;
+            /** Where Predicate Count */
+            where_predicate_count?: number | null;
+            /** Sql Features Parse Error */
+            sql_features_parse_error?: string | null;
+            /** Referenced Tables */
+            referenced_tables?: string[];
+            /** Where Columns */
+            where_columns?: string[];
+        };
+        /**
+         * QueryFamily
+         * @description One row in GET /query-families — the parameterized-hash rollup view.
+         *
+         *     A family is a set of queries with the same query_parameterized_hash —
+         *     same SQL skeleton, different literal values.
+         */
+        QueryFamily: {
+            /** Query Parameterized Hash */
+            query_parameterized_hash: string;
+            /** Representative Query Id */
+            representative_query_id: string;
+            /** Representative Sql */
+            representative_sql: string;
+            /** Occurrence Count */
+            occurrence_count: number;
+            /** Mean Elapsed Ms */
+            mean_elapsed_ms: number | null;
+            /** P95 Elapsed Ms */
+            p95_elapsed_ms: number | null;
+            /** Total Elapsed Ms */
+            total_elapsed_ms: number | null;
+            /** Total Bytes Scanned */
+            total_bytes_scanned: number | null;
+            /** N Spill Remote */
+            n_spill_remote: number;
+            /** N Failed */
+            n_failed: number;
+            /** First Seen */
+            first_seen: string | null;
+            /** Last Seen */
+            last_seen: string | null;
+            /** Distinct Warehouses */
+            distinct_warehouses: number;
+            /** Distinct Users */
+            distinct_users: number;
+        };
+        /**
+         * QueryFilterFacets
+         * @description GET /queries/facets — distinct values for the filter chips.
+         */
+        QueryFilterFacets: {
+            /** Warehouses */
+            warehouses: string[];
+            /** Users */
+            users: string[];
+            /** Roles */
+            roles: string[];
+            /** Query Types */
+            query_types: string[];
+            /** Execution Statuses */
+            execution_statuses: string[];
+            /** Referenced Tables */
+            referenced_tables?: string[];
+            /** Where Columns */
+            where_columns?: string[];
+        };
+        /**
+         * QueryFilterSpec
+         * @description The criteria that define a saved group of queries.
+         *
+         *     The fields mirror what the queries explorer exposes as URL filters,
+         *     so the round-trip ``URL params → QueryFilterSpec → URL params`` is
+         *     lossless and "save current filter as group" is mechanical.
+         *
+         *     Multi-value categorical filters use list semantics (``IN`` clause); each
+         *     single-value or numeric field is a scalar predicate.  ``None`` everywhere
+         *     means "no filter on this dimension."
+         */
+        QueryFilterSpec: {
+            /** Warehouse Name */
+            warehouse_name?: string[] | null;
+            /** User Name */
+            user_name?: string[] | null;
+            /** Role Name */
+            role_name?: string[] | null;
+            /** Query Type */
+            query_type?: string[] | null;
+            /** Execution Status */
+            execution_status?: string[] | null;
+            /** Query Parameterized Hash */
+            query_parameterized_hash?: string[] | null;
+            /** Start Time From */
+            start_time_from?: string | null;
+            /** Start Time To */
+            start_time_to?: string | null;
+            /** Min Elapsed Ms */
+            min_elapsed_ms?: number | null;
+            /** Max Elapsed Ms */
+            max_elapsed_ms?: number | null;
+            /** Has Remote Spill */
+            has_remote_spill?: boolean | null;
+            /** Has Local Spill */
+            has_local_spill?: boolean | null;
+            /** Has Queueing */
+            has_queueing?: boolean | null;
+            /** Search */
+            search?: string | null;
+            /** Min Joins */
+            min_joins?: number | null;
+            /** Max Joins */
+            max_joins?: number | null;
+            /** Min Tables */
+            min_tables?: number | null;
+            /** Max Tables */
+            max_tables?: number | null;
+            /** Min Ctes */
+            min_ctes?: number | null;
+            /** Max Ctes */
+            max_ctes?: number | null;
+            /** Min Subqueries */
+            min_subqueries?: number | null;
+            /** Max Subqueries */
+            max_subqueries?: number | null;
+            /** Min Where Blocks */
+            min_where_blocks?: number | null;
+            /** Max Where Blocks */
+            max_where_blocks?: number | null;
+            /** Min Where Predicates */
+            min_where_predicates?: number | null;
+            /** Max Where Predicates */
+            max_where_predicates?: number | null;
+            /** Referenced Tables Include */
+            referenced_tables_include?: string[] | null;
+            /** Referenced Tables Exclude */
+            referenced_tables_exclude?: string[] | null;
+            /** Where Columns Include */
+            where_columns_include?: string[] | null;
+            /** Where Columns Exclude */
+            where_columns_exclude?: string[] | null;
+        };
+        /**
+         * QueryGroup
+         * @description A persisted query group — the row shape returned by the API.
+         *
+         *     For static groups, ``snapshot_query_ids`` is the frozen membership;
+         *     ``snapshot_at`` records when that snapshot was taken.  For dynamic
+         *     groups, both are None and members are computed on demand from
+         *     ``filter_spec``.
+         */
+        QueryGroup: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /** Description */
+            description?: string | null;
+            kind: components["schemas"]["QueryGroupKind"];
+            filter_spec: components["schemas"]["QueryFilterSpec"];
+            /** Snapshot Query Ids */
+            snapshot_query_ids?: string[] | null;
+            /** Snapshot At */
+            snapshot_at?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Created By
+             * @default user
+             */
+            created_by: string;
+            /** Member Count */
+            member_count?: number | null;
+        };
+        /**
+         * QueryGroupKind
+         * @description Whether the group's members are frozen or re-evaluated on every read.
+         * @enum {string}
+         */
+        QueryGroupKind: "static" | "dynamic";
+        /**
+         * QueryListResponse
+         * @description Wrapped response for GET /queries — includes pagination metadata.
+         */
+        QueryListResponse: {
+            /** Rows */
+            rows: components["schemas"]["QueryRow"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+        };
+        /**
+         * QueryRow
+         * @description One row in the GET /queries list response — compact, list-view shape.
+         */
+        QueryRow: {
+            /** Query Id */
+            query_id: string;
+            /** Query Text Preview */
+            query_text_preview: string;
+            /** Query Type */
+            query_type: string | null;
+            /** Execution Status */
+            execution_status: string | null;
+            /** User Name */
+            user_name: string | null;
+            /** Role Name */
+            role_name: string | null;
+            /** Warehouse Name */
+            warehouse_name: string | null;
+            /** Warehouse Size */
+            warehouse_size: string | null;
+            /** Start Time */
+            start_time: string | null;
+            /** Total Elapsed Ms */
+            total_elapsed_ms: number | null;
+            /** Bytes Scanned */
+            bytes_scanned: number | null;
+            /** Bytes Spilled To Local */
+            bytes_spilled_to_local: number | null;
+            /** Bytes Spilled To Remote */
+            bytes_spilled_to_remote: number | null;
+            /** Queued Overload Ms */
+            queued_overload_ms: number | null;
+            /** Query Parameterized Hash */
+            query_parameterized_hash: string | null;
+            /** Joins Count */
+            joins_count?: number | null;
+            /** Tables Referenced Count */
+            tables_referenced_count?: number | null;
+            /** Ctes Count */
+            ctes_count?: number | null;
+            /** Subqueries Count */
+            subqueries_count?: number | null;
+            /** Where Block Count */
+            where_block_count?: number | null;
+            /** Where Predicate Count */
+            where_predicate_count?: number | null;
+        };
+        /**
+         * RecipeInfo
+         * @description One row of GET /experiments/recipes.
+         */
+        RecipeInfo: {
+            /** Name */
+            name: string;
+            /** Summary */
+            summary: string;
         };
         /** RecommendationOut */
         RecommendationOut: {
@@ -575,6 +2064,12 @@ export interface components {
             /** Recommender Results */
             recommender_results: components["schemas"]["RunRecommenderReport"][];
         };
+        /**
+         * RunStatus
+         * @description Outcome of a single (arm, query, rep) replay.
+         * @enum {string}
+         */
+        RunStatus: "success" | "failed" | "excluded";
         /** SeedRequest */
         SeedRequest: {
             /**
@@ -588,6 +2083,31 @@ export interface components {
              */
             seed: number;
         };
+        /**
+         * SourceDriftOut
+         * @description Drift report for one ingestion source.
+         */
+        SourceDriftOut: {
+            /** Source Name */
+            source_name: string;
+            /** Source View */
+            source_view: string;
+            /** Expected Columns */
+            expected_columns?: string[];
+            /** Actual Columns */
+            actual_columns?: string[];
+            /** Missing From Snowflake */
+            missing_from_snowflake?: string[];
+            /** Extra In Snowflake */
+            extra_in_snowflake?: string[];
+            /** Error */
+            error?: string | null;
+            /**
+             * Is Actionable
+             * @default false
+             */
+            is_actionable: boolean;
+        };
         /** SourceFreshnessOut */
         SourceFreshnessOut: {
             /** Name */
@@ -600,6 +2120,26 @@ export interface components {
             latest?: string | null;
             /** Last Synced At */
             last_synced_at?: string | null;
+        };
+        /** StageOutcomeOut */
+        StageOutcomeOut: {
+            /** Name */
+            name: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Duration Seconds */
+            duration_seconds: number;
+            /** Outcome */
+            outcome: string;
+            /** Error */
+            error?: string | null;
+            /** Details */
+            details?: {
+                [key: string]: unknown;
+            };
         };
         /** StatusOut */
         StatusOut: {
@@ -621,6 +2161,22 @@ export interface components {
             /** Note */
             note?: string | null;
         };
+        /** TickReportOut */
+        TickReportOut: {
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Completed At */
+            completed_at?: string | null;
+            /** Stages */
+            stages?: components["schemas"]["StageOutcomeOut"][];
+            /** Overall */
+            overall: string;
+            /** Skip Reason */
+            skip_reason?: string | null;
+        };
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -633,6 +2189,21 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /**
+         * WarehouseConfigDelta
+         * @description Subset of ``CREATE WAREHOUSE`` knobs an experiment arm can vary.
+         *
+         *     Only fields explicitly set are interpreted as overrides; everything else
+         *     inherits from the control warehouse's config.
+         */
+        WarehouseConfigDelta: {
+            generation?: components["schemas"]["Generation"] | null;
+            /** Size */
+            size?: string | null;
+            qas_state?: components["schemas"]["QASState"] | null;
+            /** Qas Max Scale Factor */
+            qas_max_scale_factor?: number | null;
         };
         /** WarehouseSummaryOut */
         WarehouseSummaryOut: {
@@ -815,6 +2386,62 @@ export interface operations {
                         [key: string]: {
                             [key: string]: number | string;
                         }[];
+                    };
+                };
+            };
+        };
+    };
+    run_backfill_sync_backfill_post: {
+        parameters: {
+            query: {
+                days: number;
+                source?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_sync_sync_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
                     };
                 };
             };
@@ -1167,6 +2794,66 @@ export interface operations {
             };
         };
     };
+    get_automation_status_automation_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationStatusOut"];
+                };
+            };
+        };
+    };
+    run_automation_now_automation_run_now_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TickReportOut"];
+                };
+            };
+        };
+    };
+    get_schema_drift_schema_drift_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DriftReportOut"];
+                };
+            };
+        };
+    };
     get_status_status_get: {
         parameters: {
             query?: never;
@@ -1223,6 +2910,771 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CredentialVerifyOut"];
+                };
+            };
+        };
+    };
+    list_recipes_experiments_recipes_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecipeInfo"][];
+                };
+            };
+        };
+    };
+    list_experiments_experiments_get: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["ExperimentStatus"] | null;
+                target_warehouse?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_experiment_experiments__experiment_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_experiment_runs_experiments__experiment_id__runs_get: {
+        parameters: {
+            query?: {
+                arm_name?: string | null;
+            };
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExperimentRun"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    propose_experiment_experiments_propose_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProposeExperimentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    propose_benchmark_experiment_experiments_propose_benchmark_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProposeBenchmarkRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    accept_experiment_experiments__experiment_id__accept_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reject_experiment_experiments__experiment_id__reject_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_sampled_query_experiments__experiment_id__sampled_queries__query_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+                query_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    backfill_experiment_metrics_experiments__experiment_id__backfill_metrics_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_experiment_experiments__experiment_id__run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    abort_experiment_experiments__experiment_id__abort_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                experiment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbortExperimentRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Experiment"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_queries_queries_get: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated warehouse names */
+                warehouse?: string | null;
+                /** @description Comma-separated user names */
+                user?: string | null;
+                /** @description Comma-separated role names */
+                role?: string | null;
+                /** @description Comma-separated query types */
+                query_type?: string | null;
+                /** @description Comma-separated execution statuses */
+                status?: string | null;
+                /** @description Filter to one parameterized_hash */
+                parameterized_hash?: string | null;
+                /** @description start_time >= this */
+                start_from?: string | null;
+                /** @description start_time <= this */
+                start_to?: string | null;
+                min_elapsed_ms?: number | null;
+                max_elapsed_ms?: number | null;
+                has_remote_spill?: boolean | null;
+                has_local_spill?: boolean | null;
+                has_queueing?: boolean | null;
+                /** @description Substring search over query text (case-insensitive) */
+                search?: string | null;
+                min_joins?: number | null;
+                max_joins?: number | null;
+                min_tables?: number | null;
+                max_tables?: number | null;
+                min_ctes?: number | null;
+                max_ctes?: number | null;
+                min_subqueries?: number | null;
+                max_subqueries?: number | null;
+                min_where_blocks?: number | null;
+                max_where_blocks?: number | null;
+                min_where_predicates?: number | null;
+                max_where_predicates?: number | null;
+                /** @description Comma-sep table names; query must touch ALL */
+                referenced_tables_include?: string | null;
+                /** @description Comma-sep table names; query must touch NONE */
+                referenced_tables_exclude?: string | null;
+                /** @description Comma-sep column names; query must filter on ALL */
+                where_columns_include?: string | null;
+                /** @description Comma-sep column names; query must NOT filter on any */
+                where_columns_exclude?: string | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_facets_queries_facets_get: {
+        parameters: {
+            query?: {
+                lookback_days?: number;
+                /** @description Cap on the number of semantic facet entries (tables, where columns). */
+                semantic_limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryFilterFacets"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_query_queries__query_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                query_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_query_families_query_families_get: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated warehouse names */
+                warehouse?: string | null;
+                /** @description Comma-separated user names */
+                user?: string | null;
+                /** @description Comma-separated query types */
+                query_type?: string | null;
+                /** @description Comma-separated execution statuses */
+                status?: string | null;
+                start_from?: string | null;
+                start_to?: string | null;
+                min_elapsed_ms?: number | null;
+                max_elapsed_ms?: number | null;
+                has_remote_spill?: boolean | null;
+                has_local_spill?: boolean | null;
+                search?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryFamily"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_query_groups_query_groups_get: {
+        parameters: {
+            query?: {
+                /** @description Filter to 'static' or 'dynamic' */
+                kind?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryGroup"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_query_group_query_groups_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateQueryGroupRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryGroup"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_query_group_query_groups__group_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryGroup"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_query_group_query_groups__group_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_group_members_query_groups__group_id__members_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                group_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cli_help_cli_help_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CliCommand"];
+                };
+            };
+        };
+    };
+    mcp_tools_list_mcp_tools_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpToolInfo"][];
                 };
             };
         };

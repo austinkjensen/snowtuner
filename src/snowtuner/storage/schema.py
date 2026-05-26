@@ -92,6 +92,12 @@ _DDL = [
         scaling_policy       VARCHAR,
         state                VARCHAR,
         comment              VARCHAR,
+        -- Snowflake compute generation ('1' or '2').  Mirrored per-warehouse
+        -- via `SHOW PARAMETERS LIKE 'GENERATION' IN WAREHOUSE <name>` (the
+        -- top-level SHOW WAREHOUSES doesn't expose it as of the versions
+        -- we've tested).  NULL when the parameter query fails or the
+        -- warehouse doesn't expose it.
+        generation           VARCHAR,
         snapshot_at          TIMESTAMP DEFAULT current_timestamp
     )
     """,
@@ -174,22 +180,10 @@ _DDL = [
         rows_last_sync BIGINT
     )
     """,
-    # Local routing rules — used by the query dispatcher in future phases.
-    """
-    CREATE SEQUENCE IF NOT EXISTS app.routing_rules_seq
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS app.routing_rules (
-        id              BIGINT PRIMARY KEY DEFAULT nextval('app.routing_rules_seq'),
-        match_type      VARCHAR NOT NULL,  -- 'family' | 'user' | 'role' | 'regex'
-        match_value     VARCHAR NOT NULL,
-        target_warehouse VARCHAR NOT NULL,
-        priority        INTEGER NOT NULL DEFAULT 100,
-        enabled         BOOLEAN NOT NULL DEFAULT TRUE,
-        source_recommendation_id BIGINT,
-        created_at      TIMESTAMP DEFAULT current_timestamp
-    )
-    """,
+    # NOTE: ``app.routing_rules`` was removed in v0.2.  Routing requires
+    # snowtuner to sit in-band as a query proxy between users and Snowflake;
+    # until that dispatcher exists, persisting routing rules is dead weight.
+    # Will return when we build the proxy layer.
     # ── Autonomous mode ───────────────────────────────────────────
     # Per (action_type, warehouse_name) opt-in for autonomous apply.
     # Per-(action_type, warehouse_name, knob) autonomous-mode config.
@@ -290,6 +284,50 @@ _DDL = [
         started_at              TIMESTAMP,
         completed_at            TIMESTAMP,
         PRIMARY KEY (experiment_id, arm_name, rep_index, sampled_query_id)
+    )
+    """,
+    # ── v0.2 SQL feature extraction ───────────────────────────────
+    # Per-query AST-derived counts, computed by QuerySqlFeaturesTransform.
+    # Joined into /queries responses and used to filter queries / define
+    # groups by structural attributes.  All counts NULL when the source
+    # query_text was redacted or unparseable; parse_error records the reason.
+    """
+    CREATE TABLE IF NOT EXISTS features.query_sql_features (
+        query_id                VARCHAR PRIMARY KEY,
+        joins_count             INTEGER,
+        tables_referenced_count INTEGER,
+        ctes_count              INTEGER,
+        subqueries_count        INTEGER,
+        where_block_count       INTEGER,
+        where_predicate_count   INTEGER,
+        parse_error             VARCHAR,
+        computed_at             TIMESTAMP NOT NULL DEFAULT current_timestamp
+    )
+    """,
+    # ── v0.2 semantic predicates (Phase 2) ────────────────────────
+    # Two side tables that record which tables a query reads from and
+    # which columns it filters on (any Column node anywhere in any WHERE
+    # subtree).  Populated by the same QuerySqlFeaturesTransform parse pass
+    # that fills query_sql_features.  Both are list-valued (one row per
+    # (query_id, ref)) so we can index them and answer "queries that touch
+    # table X but don't filter on column Y" via EXISTS / NOT EXISTS.
+    #
+    # For schema-qualified references (FROM business.sales_outcome), we
+    # emit BOTH 'BUSINESS.SALES_OUTCOME' and 'SALES_OUTCOME' rows so a
+    # filter on either short or fully-qualified name matches.  All names
+    # are stored UPPERCASE (Snowflake's default identifier folding).
+    """
+    CREATE TABLE IF NOT EXISTS features.query_referenced_tables (
+        query_id   VARCHAR NOT NULL,
+        table_ref  VARCHAR NOT NULL,
+        PRIMARY KEY (query_id, table_ref)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS features.query_where_columns (
+        query_id   VARCHAR NOT NULL,
+        column_ref VARCHAR NOT NULL,
+        PRIMARY KEY (query_id, column_ref)
     )
     """,
     # ── v0.2 query groups ─────────────────────────────────────────

@@ -222,6 +222,29 @@ class ExperimentStore:
             [report.model_dump_json(), experiment_id],
         )
 
+    def set_proposed(
+        self, experiment_id: int, proposed: ProposedExperiment,
+    ) -> None:
+        """Replace the persisted ``ProposedExperiment`` spec and its
+        denormalized columns.
+
+        Used when the user edits the proposal before accepting — e.g. removing
+        a sampled query from the workload (Phase 3).  Only safe while
+        ``status = PROPOSED``; callers must check before invoking.
+        """
+        self.conn.execute(
+            """
+            UPDATE app.experiments
+            SET spec = ?, cost_estimate = ?
+            WHERE id = ?
+            """,
+            [
+                proposed.model_dump_json(),
+                proposed.cost_estimate.model_dump_json(),
+                experiment_id,
+            ],
+        )
+
     def set_derived_recommendation_id(
         self, experiment_id: int, recommendation_id: int,
     ) -> None:
@@ -302,6 +325,47 @@ class ExperimentStore:
                 run.bytes_spilled_remote, run.credits_used_estimate,
                 run.status.value, run.error_message,
                 run.started_at, run.completed_at,
+            ],
+        )
+
+    def update_run_metrics(
+        self,
+        *,
+        experiment_id: int,
+        arm_name: str,
+        rep_index: int,
+        sampled_query_id: str,
+        elapsed_ms: int | None,
+        queued_overload_ms: int | None,
+        bytes_scanned: int | None,
+        bytes_spilled_local: int | None,
+        bytes_spilled_remote: int | None,
+    ) -> None:
+        """Backfill metrics on an existing run row.
+
+        Used when the live metric-fetch in ``replay.py`` came up empty (e.g.
+        the historical replay.py bug that called the unqualified
+        ``INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION``).  Recover by querying
+        ``SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY`` for the replay_query_id
+        post-hoc and writing the metrics here, then re-aggregating.
+        """
+        self.conn.execute(
+            """
+            UPDATE app.experiment_runs
+            SET elapsed_ms = ?,
+                queued_overload_ms = ?,
+                bytes_scanned = ?,
+                bytes_spilled_local = ?,
+                bytes_spilled_remote = ?
+            WHERE experiment_id = ?
+              AND arm_name = ?
+              AND rep_index = ?
+              AND sampled_query_id = ?
+            """,
+            [
+                elapsed_ms, queued_overload_ms, bytes_scanned,
+                bytes_spilled_local, bytes_spilled_remote,
+                experiment_id, arm_name, rep_index, sampled_query_id,
             ],
         )
 
