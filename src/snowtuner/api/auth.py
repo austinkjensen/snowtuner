@@ -32,10 +32,28 @@ from pathlib import Path
 
 from fastapi import HTTPException, Request
 
+from snowtuner.storage.db import data_dir
+
 logger = logging.getLogger(__name__)
 
 
-_TOKEN_PATH = Path.home() / ".snowtuner" / "api_token"
+def _token_path() -> Path:
+    """Path to the persisted auto-generated API token.
+
+    Lives under ``data_dir()`` (overridable via ``SNOWTUNER_DATA_DIR``) so
+    deployments that put state on a non-home volume (e.g. EBS at
+    ``/var/lib/snowtuner``) keep the token alongside the DuckDB file.
+    """
+    return data_dir() / "api_token"
+
+
+# Backwards-compat alias for callers that still import ``_TOKEN_PATH``.
+# Resolved lazily via ``__getattr__`` so test fixtures can override
+# ``SNOWTUNER_DATA_DIR`` between module-import and first read.
+def __getattr__(name: str) -> Path:
+    if name == "_TOKEN_PATH":
+        return _token_path()
+    raise AttributeError(name)
 
 # Routes that bypass auth even when auth_mode='token'.  Health check is for
 # load balancers / supervisors; OpenAPI viewer is convenience.
@@ -69,18 +87,19 @@ def get_or_create_token() -> str:
     if env_token:
         return env_token.strip()
 
-    if _TOKEN_PATH.exists():
-        return _TOKEN_PATH.read_text().strip()
+    token_path = _token_path()
+    if token_path.exists():
+        return token_path.read_text().strip()
 
     # First run on this machine — generate, persist with restrictive perms.
-    _TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
-    _TOKEN_PATH.write_text(token + "\n")
-    os.chmod(_TOKEN_PATH, 0o600)
+    token_path.write_text(token + "\n")
+    os.chmod(token_path, 0o600)
     logger.warning(
         "Generated new API token at %s.  Copy it into the snowtuner UI "
         "or use it as a Bearer header in API/MCP calls.",
-        _TOKEN_PATH,
+        token_path,
     )
     return token
 
@@ -100,7 +119,10 @@ def require_auth(request: Request) -> None:
         # auth is disabled.  Belt-and-suspenders alongside the host-binding
         # check at app startup.
         host = request.client.host if request.client else ""
-        if host not in ("127.0.0.1", "::1", "localhost"):
+        # 'testclient' is the synthetic host the Starlette/FastAPI in-process
+        # ASGI TestClient sets in request.client.  It's never reachable from
+        # a network, so it's safe to include in the loopback set.
+        if host not in ("127.0.0.1", "::1", "localhost", "testclient"):
             raise HTTPException(
                 403,
                 "SNOWTUNER_AUTH_MODE=none but the request originated from a "

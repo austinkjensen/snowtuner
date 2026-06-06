@@ -97,8 +97,15 @@ _DDL = [
         -- top-level SHOW WAREHOUSES doesn't expose it as of the versions
         -- we've tested).  NULL when the parameter query fails or the
         -- warehouse doesn't expose it.
-        generation           VARCHAR,
-        snapshot_at          TIMESTAMP DEFAULT current_timestamp
+        generation                 VARCHAR,
+        -- Query Acceleration Service state ('on'/'off') and max scale
+        -- factor (0 = serverless cap not set).  Mirrored via SHOW
+        -- PARAMETERS LIKE 'ENABLE_QUERY_ACCELERATION' / 'QUERY_ACCELERATION_MAX_SCALE_FACTOR'.
+        -- NULL when unavailable (older Snowflake versions, edition
+        -- restrictions, or transient lookup failure).
+        qas_state                  VARCHAR,
+        qas_max_scale_factor       INTEGER,
+        snapshot_at                TIMESTAMP DEFAULT current_timestamp
     )
     """,
 
@@ -180,10 +187,61 @@ _DDL = [
         rows_last_sync BIGINT
     )
     """,
-    # NOTE: ``app.routing_rules`` was removed in v0.2.  Routing requires
-    # snowtuner to sit in-band as a query proxy between users and Snowflake;
-    # until that dispatcher exists, persisting routing rules is dead weight.
-    # Will return when we build the proxy layer.
+    # ── Audit event stream ────────────────────────────────────────
+    # The single chronological feed of "what happened across the system at
+    # time T?".  Append-only.  Not the canonical state-of-record for any
+    # domain entity — those live in their own tables (recommendations,
+    # experiments, autonomous_applications, sync_watermarks).  This table
+    # is the cross-cutting timeline you query to answer "what changed
+    # between 9am and 10am?" without joining 5 tables.
+    #
+    # Scope: state-changing operator actions, AutomationLoop tick
+    # transitions, sync completion (per source), experiment lifecycle,
+    # autonomous applies, errors.  Read-only API calls are NOT logged.
+    #
+    # Reset behavior: archived to ~/.snowtuner/audit-archive/events-*.json
+    # before deletion, then wiped (events reference IDs that get
+    # renumbered on reset, so preserving in-place would create dangling
+    # references).
+    """
+    CREATE SEQUENCE IF NOT EXISTS app.events_seq
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS app.events (
+        id          BIGINT PRIMARY KEY DEFAULT nextval('app.events_seq'),
+        timestamp   TIMESTAMP NOT NULL DEFAULT current_timestamp,
+        actor       VARCHAR NOT NULL,    -- 'user' | 'automation' | 'engine' |
+                                         -- 'sync' | 'recommender:<name>' | 'autonomous'
+        action      VARCHAR NOT NULL,    -- dotted-namespace verb, e.g.
+                                         -- 'recommendation.accept',
+                                         -- 'experiment.run',
+                                         -- 'sync.source.success',
+                                         -- 'automation.tick.complete'
+        subject     VARCHAR,             -- target_resource: warehouse name,
+                                         -- experiment id, recommendation id,
+                                         -- source name, etc.
+        outcome     VARCHAR NOT NULL,    -- 'success' | 'failed' | 'skipped' | 'started'
+        payload     JSON,                -- structured details (stage outcomes,
+                                         -- knob changes, error context, etc.)
+        error       VARCHAR              -- short error message when outcome='failed'
+    )
+    """,
+    # Time-ordered scans are the dominant query pattern (the UI's activity
+    # feed, the API's GET /events).  An index on timestamp keeps "last 100
+    # events" fast even when the table grows large.
+    """
+    CREATE INDEX IF NOT EXISTS events_timestamp_idx
+      ON app.events(timestamp DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_action_idx
+      ON app.events(action, timestamp DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_actor_idx
+      ON app.events(actor, timestamp DESC)
+    """,
+
     # ── Autonomous mode ───────────────────────────────────────────
     # Per (action_type, warehouse_name) opt-in for autonomous apply.
     # Per-(action_type, warehouse_name, knob) autonomous-mode config.
@@ -229,7 +287,7 @@ _DDL = [
         rollback_error    VARCHAR
     )
     """,
-    # ── v0.2 experiments ──────────────────────────────────────────
+    # ── Experiments ───────────────────────────────────────────────
     # The full ProposedExperiment is stored as a single JSON blob (`spec`)
     # so the engine can reproduce the run from the row alone, and so we don't
     # have to evolve the schema each time the spec gains a field.  Reports
@@ -286,7 +344,7 @@ _DDL = [
         PRIMARY KEY (experiment_id, arm_name, rep_index, sampled_query_id)
     )
     """,
-    # ── v0.2 SQL feature extraction ───────────────────────────────
+    # ── SQL feature extraction ────────────────────────────────────
     # Per-query AST-derived counts, computed by QuerySqlFeaturesTransform.
     # Joined into /queries responses and used to filter queries / define
     # groups by structural attributes.  All counts NULL when the source
@@ -304,7 +362,7 @@ _DDL = [
         computed_at             TIMESTAMP NOT NULL DEFAULT current_timestamp
     )
     """,
-    # ── v0.2 semantic predicates (Phase 2) ────────────────────────
+    # ── Semantic predicates ───────────────────────────────────────
     # Two side tables that record which tables a query reads from and
     # which columns it filters on (any Column node anywhere in any WHERE
     # subtree).  Populated by the same QuerySqlFeaturesTransform parse pass
@@ -330,7 +388,7 @@ _DDL = [
         PRIMARY KEY (query_id, column_ref)
     )
     """,
-    # ── v0.2 query groups ─────────────────────────────────────────
+    # ── Query groups ──────────────────────────────────────────────
     # Saved sets of queries the user can apply as a workload filter or feed
     # into an experiment.  Two kinds:
     #   - static  : snapshot at creation; immutable membership.  filter_spec

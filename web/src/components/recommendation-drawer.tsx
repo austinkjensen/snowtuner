@@ -13,7 +13,7 @@ import {
   AlertCircle, Check, ChevronDown, ChevronUp, Copy, ExternalLink, Info, X,
 } from 'lucide-react'
 import { api, type Recommendation } from '@/lib/api'
-import { creditsDelta, humanizeAgo } from '@/lib/format'
+import { creditsDelta, humanizeAgo, warehouseFromTarget } from '@/lib/format'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -335,12 +335,6 @@ function ErrorBlock() {
       </div>
     </SheetBody>
   )
-}
-
-function warehouseFromTarget(target: string | null | undefined): string | null {
-  if (!target) return null
-  const m = target.match(/^warehouse:([^:]+)/)
-  return m ? m[1] : null
 }
 
 function invalidate(qc: ReturnType<typeof useQueryClient>) {

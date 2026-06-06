@@ -51,6 +51,7 @@ snowflake = [
 ]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
     "ruff>=0.5",
 ]
 
@@ -74,3 +75,33 @@ packages = ["src/snowtuner"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+# Test discovery: anything under tests/ with the standard name pattern.
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Fail fast on warnings during development — promotes warnings to errors
+# so deprecation drift in deps surfaces in CI before it's a bug.
+filterwarnings = [
+    # Snowflake-connector & DuckDB sometimes warn on macOS-specific things
+    # we can't suppress at the source.  Add specific ignores here as they
+    # appear rather than blanket-suppressing.
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    # scipy.stats fires RuntimeWarning when t-test inputs have near-zero
+    # variance ("Precision loss…").  Our tests deliberately exercise that
+    # edge case (degenerate-data Bonferroni cap, low-N warnings) so the
+    # warning is expected, not a regression signal.
+    "ignore:Precision loss occurred:RuntimeWarning",
+]
+# Keep test runs short: short tracebacks unless --tb=long is requested.
+addopts = "-ra --tb=short"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+]

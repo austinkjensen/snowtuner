@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 _COLUMNS = [
     "name", "size", "min_cluster_count", "max_cluster_count",
     "auto_suspend_seconds", "auto_resume", "scaling_policy", "state", "comment",
-    "generation",
+    "generation", "qas_state", "qas_max_scale_factor",
 ]
 
 
@@ -58,6 +58,24 @@ class WarehousesSource(Source):
                 auto_resume = str(auto_resume_raw).lower() == "true"
 
             name = pick(r, "name")
+            # Per-warehouse parameter lookups in one batch: 3 round-trips
+            # per warehouse but acceptable for tens of warehouses.  Each is
+            # independently defensive — one failure doesn't poison the row.
+            gen = _fetch_parameter(client, name, "GENERATION") if name else None
+            qas_raw = (
+                _fetch_parameter(client, name, "ENABLE_QUERY_ACCELERATION")
+                if name else None
+            )
+            qas_state = _normalize_qas_state(qas_raw)
+            qas_max_raw = (
+                _fetch_parameter(client, name, "QUERY_ACCELERATION_MAX_SCALE_FACTOR")
+                if name else None
+            )
+            try:
+                qas_max = int(qas_max_raw) if qas_max_raw is not None else None
+            except (TypeError, ValueError):
+                qas_max = None
+
             out.append({
                 "name": name,
                 "size": pick(r, "size"),
@@ -68,7 +86,9 @@ class WarehousesSource(Source):
                 "scaling_policy": pick(r, "scaling_policy"),
                 "state": pick(r, "state"),
                 "comment": pick(r, "comment"),
-                "generation": _fetch_generation(client, name) if name else None,
+                "generation": gen,
+                "qas_state": qas_state,
+                "qas_max_scale_factor": qas_max,
             })
         return out
 
@@ -85,18 +105,19 @@ class WarehousesSource(Source):
             )
 
 
-def _fetch_generation(client: SnowflakeClient, warehouse_name: str) -> str | None:
-    """Return the GENERATION parameter for a warehouse, or None on failure.
+def _fetch_parameter(
+    client: SnowflakeClient, warehouse_name: str, param_name: str,
+) -> str | None:
+    """Return one warehouse-level parameter's value, or None on failure.
 
-    ``SHOW PARAMETERS LIKE 'GENERATION' IN WAREHOUSE <name>`` returns rows
+    ``SHOW PARAMETERS LIKE '<param>' IN WAREHOUSE <name>`` returns rows
     shaped ``(key, value, default, level, description, type)``.  We pull
-    ``value``.  Snowflake's value is either ``'1'`` or ``'2'``; we preserve
-    whatever Snowflake returns rather than normalizing.
+    ``value`` and return as a string.
 
     Failures (older Snowflake versions where the parameter doesn't exist,
-    missing MONITOR privilege, transient connection issues) downgrade to
-    None — the experiments recommender treats unknown generation as
-    "skip, can't safely classify".
+    edition restrictions on QAS-related params, missing MONITOR privilege,
+    transient connection issues) downgrade to None — downstream consumers
+    treat unknown values as "can't safely classify, skip".
     """
     try:
         # Identifier must be embedded; Snowflake doesn't accept bound parameters
@@ -104,7 +125,7 @@ def _fetch_generation(client: SnowflakeClient, warehouse_name: str) -> str | Non
         # output, so injection isn't a concern, but quote-escape defensively.
         safe_name = warehouse_name.replace('"', '""')
         cols, rows = client.execute_with_columns(
-            f'SHOW PARAMETERS LIKE \'GENERATION\' IN WAREHOUSE "{safe_name}"'
+            f'SHOW PARAMETERS LIKE \'{param_name}\' IN WAREHOUSE "{safe_name}"'
         )
         if not rows:
             return None
@@ -116,7 +137,25 @@ def _fetch_generation(client: SnowflakeClient, warehouse_name: str) -> str | Non
         return str(v) if v is not None else None
     except Exception as e:
         logger.warning(
-            "could not fetch generation for warehouse %r: %s",
-            warehouse_name, e,
+            "could not fetch parameter %s for warehouse %r: %s",
+            param_name, warehouse_name, e,
         )
         return None
+
+
+def _normalize_qas_state(raw: str | None) -> str | None:
+    """Normalize Snowflake's QAS boolean to our 'on'/'off' enum convention.
+
+    ``ENABLE_QUERY_ACCELERATION`` returns 'true'/'false' as strings (or
+    sometimes a Python bool depending on driver version).  We map to the
+    lowercase 'on'/'off' that the QASState enum and the experiments
+    framework use.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("true", "on", "1", "yes", "enabled"):
+        return "on"
+    if s in ("false", "off", "0", "no", "disabled"):
+        return "off"
+    return None

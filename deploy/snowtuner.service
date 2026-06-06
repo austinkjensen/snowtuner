@@ -1,0 +1,63 @@
+[Unit]
+Description=snowtuner API + automation loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=snowtuner
+Group=snowtuner
+WorkingDirectory=/opt/snowtuner
+
+# Environment file written by deploy/fetch-secrets.sh on every boot.
+# Contains:
+#   SNOWTUNER_API_TOKEN              — bearer for /api auth
+#   SNOWTUNER_SNOWFLAKE_ACCOUNT      — Snowflake account locator
+#   SNOWTUNER_SNOWFLAKE_USER         — service user
+#   SNOWTUNER_SNOWFLAKE_AUTHENTICATOR=keypair
+#   SNOWTUNER_SNOWFLAKE_PRIVATE_KEY_PATH=/var/lib/snowtuner/snowflake_rsa_key.p8
+#   SNOWTUNER_SNOWFLAKE_WAREHOUSE    — default warehouse for service queries
+#   SNOWTUNER_SNOWFLAKE_ROLE         — SNOWTUNER_ROLE (or whatever you bootstrapped)
+EnvironmentFile=/var/lib/snowtuner/env
+
+# Persistent state on the EBS volume.
+Environment=SNOWTUNER_DATA_DIR=/var/lib/snowtuner
+# Bearer-token auth (refuse to start on a non-loopback host without it).
+Environment=SNOWTUNER_AUTH_MODE=token
+# Built SPA — served at / on the same port as the API.
+Environment=SNOWTUNER_STATIC_DIR=/opt/snowtuner/web/dist
+# Full pipeline runs every hour (sync → features → recommenders → autonomous apply).
+Environment=SNOWTUNER_AUTOMATION_INTERVAL=3600
+# Don't trigger the loop synchronously on api startup; let the first scheduled
+# tick happen ~1 interval after boot so journalctl shows the boot succeeded
+# before the heavy work begins.
+Environment=SNOWTUNER_AUTOMATION_ON_START=false
+
+# Bind to loopback only — Cloudflare Tunnel handles the public surface.
+ExecStart=/opt/snowtuner/.venv/bin/snowtuner api --host 127.0.0.1 --port 8770
+
+# Restart on crash, with backoff to avoid tight loops on persistent failure.
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging goes to journald (journalctl -u snowtuner -f).
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — sandboxes the process so a snowtuner exploit can't pivot.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/snowtuner
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -63,7 +63,7 @@ def reset(yes: bool, include_user_config: bool) -> None:
     upgrade by running this command then [cyan]snowtuner sync[/cyan] to
     repopulate raw.* from Snowflake.
 
-    [bold]Preservation defaults (v0.2):[/bold]
+    [bold]Preservation defaults:[/bold]
 
     \b
       app.query_groups       — PRESERVED (override with --include-user-config)
@@ -318,6 +318,51 @@ def backfill(days: int, source_filter: str | None) -> None:
         "Run [cyan]snowtuner features[/cyan] or [cyan]snowtuner run[/cyan] "
         "if you want derived features rebuilt from the new raw data."
     )
+
+
+@cli.group()
+def events() -> None:
+    """Inspect and prune the app.events audit feed."""
+
+
+@events.command("prune")
+@click.option("--older-than-days", type=int, required=True,
+              help="Delete events older than this many days.  Use 90 for a "
+                   "quarterly retention policy.")
+@click.option("--yes", is_flag=True, default=False,
+              help="Skip the confirmation prompt.")
+def events_prune(older_than_days: int, yes: bool) -> None:
+    """Delete events older than the given window.
+
+    No auto-trim in v1 — operators run this manually (or via cron) when
+    the table grows large.  Archived JSON dumps from past ``snowtuner
+    reset`` operations are NOT affected; those preserve history regardless
+    of in-DB retention.
+    """
+    from snowtuner.events import prune_events
+
+    conn = get_connection()
+    # Pre-flight: how many rows would we delete?  See note in
+    # snowtuner.events.prune_events on why we string-format the int.
+    days = int(older_than_days)
+    n_total = conn.execute("SELECT COUNT(*) FROM app.events").fetchone()[0]
+    n_old = conn.execute(
+        f"SELECT COUNT(*) FROM app.events "
+        f"WHERE timestamp < (now() - INTERVAL {days} DAYS)"
+    ).fetchone()[0]
+    console.print(
+        f"[bold]Events table:[/bold] {n_total:,} total, "
+        f"{n_old:,} older than {older_than_days}d"
+    )
+    if n_old == 0:
+        console.print("[dim]Nothing to prune.[/dim]")
+        return
+    if not yes:
+        if not click.confirm(f"Delete {n_old:,} events?", default=False):
+            console.print("[dim]Cancelled.[/dim]")
+            raise SystemExit(0)
+    deleted = prune_events(conn, older_than_days=older_than_days)
+    console.print(f"[green]Deleted {deleted:,} events.[/green]")
 
 
 @cli.command("check-schema")
@@ -683,12 +728,6 @@ def reject(rec_id: int, note: str | None) -> None:
     console.print(f"[yellow]#{rec_id} marked REJECTED.[/yellow]")
 
 
-# The Streamlit ``ui`` command was removed when the React SPA took over the
-# operator surface.  See ``web/`` for the current UI; serve it via
-# ``snowtuner api`` + ``cd web && npm run dev`` during development, or have
-# the production build served by the API directly.
-
-
 @cli.command()
 def recommenders() -> None:
     """List the built-in recommenders."""
@@ -780,11 +819,12 @@ def auth_rotate() -> None:
     """Generate a fresh API token (invalidates the previous one)."""
     import os
     import secrets
-    from snowtuner.api.auth import _TOKEN_PATH
+    from snowtuner.api.auth import _token_path
+    token_path = _token_path()
     new = secrets.token_urlsafe(32)
-    _TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _TOKEN_PATH.write_text(new + "\n")
-    os.chmod(_TOKEN_PATH, 0o600)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(new + "\n")
+    os.chmod(token_path, 0o600)
     console.print(f"new token: [cyan]{new}[/cyan]")
     console.print(
         "[dim]Restart any running snowtuner API and update any clients "
@@ -1440,7 +1480,7 @@ def autonomous_rollback(application_id: int) -> None:
         raise SystemExit(2)
 
 
-# ── Experiments (v0.2) ─────────────────────────────────────────────
+# ── Experiments ────────────────────────────────────────────────────
 
 @cli.group()
 def experiments() -> None:

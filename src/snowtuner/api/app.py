@@ -1,7 +1,7 @@
 """FastAPI HTTP service for snowtuner.
 
-This is the **integration surface**: CI jobs, the Streamlit UI, and the admin
-MCP server all call these endpoints.  Recommenders themselves still run
+This is the **integration surface**: CI jobs, the React SPA in ``web/``, and
+the MCP server all call these endpoints.  Recommenders themselves still run
 in-process against the live DuckDB connection — the API is for *driving* the
 optimizer, not for how recommenders access data.
 
@@ -35,11 +35,15 @@ Endpoints
 from __future__ import annotations
 
 import contextlib
+import logging
+import os
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 
 from snowtuner.api.schemas import (
     AbortExperimentRequest,
@@ -53,6 +57,8 @@ from snowtuner.api.schemas import (
     CredentialVerifyOut,
     AutomationStatusOut,
     DriftReportOut,
+    EventOut,
+    EventsResponse,
     McpToolInfo,
     StageOutcomeOut,
     TickReportOut,
@@ -88,6 +94,7 @@ from snowtuner.experiments import (
     ExperimentStatus,
     ExperimentStore,
 )
+from snowtuner.events import log_event
 from snowtuner.experiments.config_delta import WarehouseConfig
 from snowtuner.experiments.eligibility import AccountInfo
 from snowtuner.experiments.recipes import PRESET_RECIPES
@@ -96,6 +103,9 @@ from snowtuner.query_groups import (
     QueryGroup,
     QueryGroupKind,
     QueryGroupStore,
+)
+from snowtuner.query_groups.sql import (
+    build_filter_from_spec as _build_filter_from_spec,
 )
 from snowtuner.ingestion.snowflake_client import SnowflakeClient
 from snowtuner.features import DEFAULT_TRANSFORMS
@@ -391,9 +401,21 @@ def create_app() -> FastAPI:
         body: StatusUpdateRequest = StatusUpdateRequest(),
         store: RecommendationStore = Depends(_get_store),
     ) -> RecommendationOut:
-        if store.get(rec_id) is None:
+        rec = store.get(rec_id)
+        if rec is None:
             raise HTTPException(404, f"recommendation {rec_id} not found")
         store.set_status(rec_id, RecommendationStatus.ACCEPTED, notes=body.note)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="recommendation.accept",
+            subject=str(rec_id),
+            payload={
+                "action_type": rec.action.type.value,
+                "target_resource": rec.action.target_resource(),
+                "note": body.note,
+            },
+        )
         return RecommendationOut.from_model(store.get(rec_id))  # type: ignore[arg-type]
 
     @app.post("/recommendations/{rec_id}/reject", response_model=RecommendationOut)
@@ -402,9 +424,21 @@ def create_app() -> FastAPI:
         body: StatusUpdateRequest = StatusUpdateRequest(),
         store: RecommendationStore = Depends(_get_store),
     ) -> RecommendationOut:
-        if store.get(rec_id) is None:
+        rec = store.get(rec_id)
+        if rec is None:
             raise HTTPException(404, f"recommendation {rec_id} not found")
         store.set_status(rec_id, RecommendationStatus.REJECTED, notes=body.note)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="recommendation.reject",
+            subject=str(rec_id),
+            payload={
+                "action_type": rec.action.type.value,
+                "target_resource": rec.action.target_resource(),
+                "note": body.note,
+            },
+        )
         return RecommendationOut.from_model(store.get(rec_id))  # type: ignore[arg-type]
 
     # ── Autonomous mode ───────────────────────────────────────────
@@ -490,7 +524,7 @@ def create_app() -> FastAPI:
         rows = conn.execute(
             """
             SELECT w.name, w.size, w.auto_suspend_seconds, w.auto_resume,
-                   w.generation,
+                   w.generation, w.qas_state, w.qas_max_scale_factor,
                    (SELECT COUNT(*) FROM raw.query_history q
                     WHERE q.warehouse_name = w.name) AS q_cnt,
                    (SELECT COUNT(*) FROM raw.warehouse_events_history e
@@ -507,11 +541,104 @@ def create_app() -> FastAPI:
                 auto_suspend_seconds=r[2],
                 auto_resume=bool(r[3]) if r[3] is not None else None,
                 generation=r[4],
-                queries_in_window=int(r[5] or 0),
-                suspend_resume_events=int(r[6] or 0),
+                qas_state=r[5],
+                qas_max_scale_factor=r[6],
+                queries_in_window=int(r[7] or 0),
+                suspend_resume_events=int(r[8] or 0),
             )
             for r in rows
         ]
+
+    @app.get("/events", response_model=EventsResponse)
+    def list_events(
+        actor: str | None = Query(None, description="Filter by exact actor"),
+        action: str | None = Query(None, description="Filter by exact action verb"),
+        action_prefix: str | None = Query(
+            None,
+            description=(
+                "Filter by action prefix (e.g. 'experiment.' matches all "
+                "experiment events).  Use INSTEAD of action, not alongside."
+            ),
+        ),
+        subject: str | None = Query(None),
+        outcome: str | None = Query(None),
+        since: datetime | None = Query(None, description="Events with timestamp >= since"),
+        until: datetime | None = Query(None, description="Events with timestamp < until"),
+        limit: int = Query(100, gt=0, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> EventsResponse:
+        """Paginated, filterable feed from ``app.events``.
+
+        The events table is the cross-cutting timeline of state-changing
+        actions across snowtuner — operator clicks, AutomationLoop ticks,
+        sync per-source outcomes, autonomous applies, etc.  Use this to
+        answer "what happened between time X and Y?" without joining the
+        domain tables.
+
+        For the activity-feed UI, fetch with no filters (latest 100); for
+        debugging a specific recommendation, filter by
+        ``subject=<rec_id>`` and the relevant action prefix.
+        """
+        import json
+        conn = get_connection()
+        where: list[str] = []
+        params: list[Any] = []
+        if actor:
+            where.append("actor = ?")
+            params.append(actor)
+        if action:
+            where.append("action = ?")
+            params.append(action)
+        if action_prefix:
+            where.append("action LIKE ?")
+            params.append(action_prefix + "%")
+        if subject:
+            where.append("subject = ?")
+            params.append(subject)
+        if outcome:
+            where.append("outcome = ?")
+            params.append(outcome)
+        if since:
+            where.append("timestamp >= ?")
+            params.append(since)
+        if until:
+            where.append("timestamp < ?")
+            params.append(until)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM app.events {where_sql}", params,
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"""
+            SELECT id, timestamp, actor, action, subject, outcome, payload, error
+            FROM app.events
+            {where_sql}
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        ).fetchall()
+        out = []
+        for r in rows:
+            payload = None
+            if r[6]:
+                try:
+                    payload = json.loads(r[6])
+                except (TypeError, ValueError):
+                    payload = None
+            out.append(EventOut(
+                id=int(r[0]),
+                timestamp=r[1],
+                actor=r[2],
+                action=r[3],
+                subject=r[4],
+                outcome=r[5],
+                payload=payload,
+                error=r[7],
+            ))
+        return EventsResponse(rows=out, total=int(total), limit=limit, offset=offset)
 
     @app.get("/automation/status", response_model=AutomationStatusOut)
     def get_automation_status() -> AutomationStatusOut:
@@ -739,7 +866,7 @@ def create_app() -> FastAPI:
             region=str(region) if region is not None else None,
         )
 
-    # ── Experiments (v0.2) ────────────────────────────────────────
+    # ── Experiments ───────────────────────────────────────────────
     def _experiment_store() -> ExperimentStore:
         return ExperimentStore(get_connection())
 
@@ -847,6 +974,20 @@ def create_app() -> FastAPI:
         # warnings agree.
         proposed.sample_size = len(resolved.sampled)
         new_id = store.insert(proposed)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.propose",
+            subject=str(new_id),
+            payload={
+                "kind": "tuning",
+                "recipe_name": req.recipe_name,
+                "target_warehouse": req.target_warehouse,
+                "query_group_id": req.query_group_id,
+                "sample_size": proposed.sample_size,
+                "workload_source": proposed.workload_source,
+            },
+        )
         return store.get(new_id)  # type: ignore[return-value]
 
     @app.post("/experiments/propose-benchmark", response_model=Experiment)
@@ -1004,6 +1145,21 @@ def create_app() -> FastAPI:
             sample_warnings=resolved.warnings,
         )
         new_id = store.insert(proposed)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.propose",
+            subject=str(new_id),
+            payload={
+                "kind": "benchmark",
+                "workload_warehouse": req.workload_warehouse,
+                "query_group_id": req.query_group_id,
+                "arms": [a.name for a in runnable_arms],
+                "control_arm_name": req.control_arm_name,
+                "sample_size": proposed.sample_size,
+                "workload_source": proposed.workload_source,
+            },
+        )
         return store.get(new_id)  # type: ignore[return-value]
 
     @app.post("/experiments/{experiment_id}/accept", response_model=Experiment)
@@ -1027,6 +1183,18 @@ def create_app() -> FastAPI:
                 "abort it first",
             )
         store.set_status(experiment_id, ExperimentStatus.ACCEPTED)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.accept",
+            subject=str(experiment_id),
+            payload={
+                "kind": exp.proposed.kind.value,
+                "target_warehouse": exp.proposed.target_warehouse,
+                "recipe_name": exp.proposed.recipe_name,
+                "sample_size": exp.proposed.sample_size,
+            },
+        )
         return store.get(experiment_id)  # type: ignore[return-value]
 
     @app.post("/experiments/{experiment_id}/reject", response_model=Experiment)
@@ -1043,6 +1211,17 @@ def create_app() -> FastAPI:
                 f"this one is {exp.status.value}",
             )
         store.set_status(experiment_id, ExperimentStatus.REJECTED)
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.reject",
+            subject=str(experiment_id),
+            payload={
+                "kind": exp.proposed.kind.value,
+                "target_warehouse": exp.proposed.target_warehouse,
+                "recipe_name": exp.proposed.recipe_name,
+            },
+        )
         return store.get(experiment_id)  # type: ignore[return-value]
 
     @app.delete(
@@ -1201,6 +1380,18 @@ def create_app() -> FastAPI:
                 client.close()
 
         threading.Thread(target=_run, daemon=True, name=f"exp-{experiment_id}").start()
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.run.start",
+            subject=str(experiment_id),
+            payload={
+                "kind": exp.proposed.kind.value,
+                "arms": [a.name for a in exp.proposed.arms],
+                "sample_size": exp.proposed.sample_size,
+                "reps_per_arm": exp.proposed.reps_per_arm,
+            },
+        )
         # Return the experiment in its (probably-still-ACCEPTED) state; the
         # caller polls for transitions.
         return store.get(experiment_id)  # type: ignore[return-value]
@@ -1230,6 +1421,17 @@ def create_app() -> FastAPI:
         store.set_status(
             experiment_id, ExperimentStatus.ABORTED,
             aborted_reason=body.reason,
+        )
+        log_event(
+            get_connection(),
+            actor="user",
+            action="experiment.abort",
+            subject=str(experiment_id),
+            outcome="success",
+            payload={
+                "previous_status": exp.status.value,
+                "reason": body.reason,
+            },
         )
         return store.get(experiment_id)  # type: ignore[return-value]
 
@@ -1755,6 +1957,35 @@ def create_app() -> FastAPI:
     def seed(req: SeedRequest = SeedRequest()) -> dict[str, int]:
         return seed_demo_data(get_connection(), days=req.days, seed=req.seed)
 
+    # ── Built SPA (production only) ───────────────────────────────
+    # When ``SNOWTUNER_STATIC_DIR`` is set, mount the built React SPA at ``/``
+    # so the API and UI live on the same origin (single port, no CORS, no
+    # Vite dev server needed).  ``html=True`` makes StaticFiles fall back to
+    # ``index.html`` for any path that isn't a real file — that's how the
+    # client-side router (TanStack Router) handles deep links like
+    # ``/experiments/42`` after a hard refresh.
+    #
+    # This mount goes LAST so all the ``@app.get(...)`` routes above match
+    # first; the static handler only sees requests that didn't hit an API
+    # endpoint.  In dev (``npm run dev``) Vite serves the SPA on a different
+    # port and proxies ``/api/*`` over here — env var stays unset.
+    static_dir_env = os.environ.get("SNOWTUNER_STATIC_DIR")
+    if static_dir_env:
+        static_dir = Path(static_dir_env).expanduser().resolve()
+        if static_dir.is_dir():
+            app.mount(
+                "/", StaticFiles(directory=str(static_dir), html=True), name="spa"
+            )
+            logging.getLogger("snowtuner.api").info(
+                "serving built SPA from %s", static_dir
+            )
+        else:
+            logging.getLogger("snowtuner.api").warning(
+                "SNOWTUNER_STATIC_DIR=%s does not exist or is not a directory; "
+                "SPA not mounted",
+                static_dir_env,
+            )
+
     return app
 
 
@@ -1782,12 +2013,6 @@ def _load_warehouse_config(warehouse_name: str) -> WarehouseConfig | None:
         auto_resume=bool(row[3]) if row[3] is not None else None,
         generation=None, qas_state=None,
     )
-
-
-# ``_sample_query_stats`` was removed in Phase 3 — the workload resolver
-# now produces both the replay list and the cost-estimate stats from a single
-# canonical pass.  Recipe code paths take ``sample_query_stats`` directly
-# from ``[s.historical for s in resolved.sampled]``.
 
 
 def _resolve_query_group(group_id: int) -> "QueryGroup":
@@ -1944,13 +2169,6 @@ def _filter_spec_from_create_req(req: CreateQueryGroupRequest) -> QueryFilterSpe
         where_columns_include=_to_list(req.where_columns_include),
         where_columns_exclude=_to_list(req.where_columns_exclude),
     )
-
-
-# ``_build_filter_from_spec`` moved to ``snowtuner.query_groups.sql`` so
-# non-API callers (notably the experiments workload resolver) can share it
-# without importing FastAPI.  Re-exported here for backwards compatibility
-# within this module.
-from snowtuner.query_groups.sql import build_filter_from_spec as _build_filter_from_spec  # noqa: E402
 
 
 def _group_member_count(group: QueryGroup) -> int:

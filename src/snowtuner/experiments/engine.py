@@ -20,9 +20,9 @@ exposes ``recover_orphaned_warehouses()`` to be called at startup.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
 
 import duckdb
 
@@ -168,9 +168,11 @@ class ExperimentEngine:
             else:
                 control_config = WarehouseConfig(name="__BENCHMARK_NO_CONTROL__")
 
-            # Phase 3: read the frozen sample picked at propose-time.  This
-            # is the canonical path; legacy experiments without a frozen
-            # list fall through to live sampling for back-compat.
+            # Workload resolution: prefer the frozen sample picked at
+            # propose-time (the API workload resolver writes ``sampled_query_ids``
+            # before persisting).  If the proposal didn't pre-resolve — e.g.
+            # a recommender's ``propose_experiments()`` returned a recipe-built
+            # ProposedExperiment directly — fall back to live sampling at run-time.
             if exp.proposed.sampled_query_ids:
                 sampled = self._load_sampled_queries(exp.proposed.sampled_query_ids)
                 if not sampled:
@@ -183,8 +185,6 @@ class ExperimentEngine:
                     )
                     return
             else:
-                # Legacy path: experiment was proposed before Phase 3 froze
-                # the sample.  Run the warehouse-based sampler now.
                 sampled = self._sample_queries(workload_wh, exp.proposed.sample_size)
                 if not sampled:
                     self.store.set_status(
@@ -312,8 +312,11 @@ class ExperimentEngine:
     ) -> list[SampledQuery]:
         """Pick representative queries to replay.  Trims to ``sample_size``.
 
-        Legacy path — only invoked for experiments proposed before Phase 3,
-        where ``ProposedExperiment.sampled_query_ids`` is empty.
+        Live-sampling fallback for proposals that didn't pre-resolve their
+        workload (``sampled_query_ids`` empty).  The API propose endpoints
+        populate ``sampled_query_ids`` via the workload resolver, so the
+        common path is ``_load_sampled_queries`` below; this branch fires
+        for recommender-built proposals that bypass the resolver.
         """
         samples = self.sampler.select(self.duck, target_warehouse)
         return samples[:sample_size]
@@ -324,8 +327,8 @@ class ExperimentEngine:
         """Materialize ``SampledQuery`` objects from the frozen ID list.
 
         Used at engine run-time for experiments that resolved their workload
-        at propose-time (Phase 3 path).  Preserves the order of ``query_ids``
-        so the replay ordering matches what the user saw in the preview.
+        at propose-time.  Preserves the order of ``query_ids`` so the replay
+        ordering matches what the user saw in the preview.
 
         Queries that have since vanished from ``raw.query_history`` (e.g.
         the user re-synced and the row aged out) are silently dropped — the

@@ -6,6 +6,7 @@ import { creditsDelta, humanizeAgo } from '@/lib/format'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { SkeletonRows } from '@/components/skeleton-rows'
 
 export const Route = createFileRoute('/')({
   component: Dashboard,
@@ -178,18 +179,6 @@ function ApplicationStateBadge({ state }: { state: string }) {
 
 function EmptyHint({ children }: { children: React.ReactNode }) {
   return <p className="px-3 py-6 text-center text-sm text-muted-foreground">{children}</p>
-}
-
-function SkeletonRows() {
-  return (
-    <ul className="divide-y divide-border">
-      {[0, 1, 2].map((i) => (
-        <li key={i} className="px-3 py-2.5">
-          <div className="h-4 w-1/2 animate-pulse rounded bg-muted" />
-        </li>
-      ))}
-    </ul>
-  )
 }
 
 function ErrorState() {

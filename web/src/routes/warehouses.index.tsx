@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Search } from 'lucide-react'
 import { api, type Warehouse } from '@/lib/api'
-import { formatNumber } from '@/lib/format'
+import { formatNumber, warehouseFromTarget } from '@/lib/format'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
@@ -282,12 +282,6 @@ function ErrorState() {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-
-function warehouseFromTarget(target: string | null | undefined): string | null {
-  if (!target) return null
-  const m = target.match(/^warehouse:([^:]+)/)
-  return m ? m[1] : null
-}
 
 function compareRows(
   a: Warehouse & { open_proposals: number },

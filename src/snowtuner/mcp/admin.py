@@ -275,7 +275,7 @@ def rollback_autonomous_application(application_id: int) -> dict:
     return _post(f"/autonomous/applications/{application_id}/rollback")
 
 
-# ── Experiments (v0.2) ────────────────────────────────────────────
+# ── Experiments ───────────────────────────────────────────────────
 
 @mcp.tool()
 def list_experiment_recipes() -> list[dict]:
@@ -635,6 +635,41 @@ def run_features() -> dict:
     structural / semantic data without triggering recommender output.
     """
     return _post("/features/run")
+
+
+@mcp.tool()
+def list_events(
+    actor: str | None = None,
+    action: str | None = None,
+    action_prefix: str | None = None,
+    subject: str | None = None,
+    outcome: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    """Paginated, filterable feed from app.events.
+
+    The events table is the cross-cutting timeline of state-changing
+    actions across snowtuner: operator clicks, AutomationLoop ticks per
+    stage, sync outcomes per source, autonomous applies.  Use this to
+    answer "what happened between X and Y?" without joining the domain
+    tables.
+
+    Common patterns:
+      * list_events(action_prefix='experiment.', limit=20) — recent
+        experiment lifecycle activity
+      * list_events(actor='autonomous') — every autonomous apply
+      * list_events(action='sync.source.failure') — sync failures only
+      * list_events(subject='ETL_WH') — everything touching ETL_WH
+    """
+    return _get(
+        "/events",
+        actor=actor, action=action, action_prefix=action_prefix,
+        subject=subject, outcome=outcome,
+        since=since, until=until, limit=limit, offset=offset,
+    )
 
 
 @mcp.tool()

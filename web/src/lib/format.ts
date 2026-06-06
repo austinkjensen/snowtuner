@@ -27,3 +27,19 @@ export function formatNumber(n: number | null | undefined): string {
   if (n == null) return '—'
   return n.toLocaleString()
 }
+
+/**
+ * Extract the warehouse name from a recommendation's ``target_resource``.
+ *
+ * ``target_resource`` is a colon-delimited resource identifier; warehouse
+ * recommendations use the form ``warehouse:<NAME>`` (optionally followed by
+ * more knob-specific segments).  Returns ``null`` for non-warehouse targets
+ * or missing values so callers can decide how to render.
+ */
+export function warehouseFromTarget(
+  target: string | null | undefined,
+): string | null {
+  if (!target) return null
+  const m = target.match(/^warehouse:([^:]+)/)
+  return m ? m[1] : null
+}

@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, Search } from 'lucide-react'
 import { api, type Recommendation, type RecommendationStatus } from '@/lib/api'
-import { creditsDelta } from '@/lib/format'
+import { creditsDelta, warehouseFromTarget } from '@/lib/format'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
@@ -309,12 +309,6 @@ function ErrorState() {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-
-function warehouseFromTarget(target: string | null | undefined): string | null {
-  if (!target) return null
-  const m = target.match(/^warehouse:([^:]+)/)
-  return m ? m[1] : null
-}
 
 function firstLine(text: string | null | undefined): string {
   if (!text) return ''

@@ -177,10 +177,27 @@ class AutomationLoop:
                 break
 
     def _tick(self) -> TickReport:
+        from snowtuner.events import log_event
+        from snowtuner.storage.db import get_connection
+
         report = TickReport(started_at=_utc_now())
+        # tick.start is logged with outcome='started' so the matching
+        # tick.complete event closes the pair.  Useful for "how long did
+        # tick X take?" queries against app.events alone.
+        try:
+            log_event(
+                get_connection(),
+                actor="automation",
+                action="automation.tick.start",
+                outcome="started",
+            )
+        except Exception:
+            # Logging must never block the pipeline.  Defensive — the
+            # log_event helper itself is best-effort, but if get_connection()
+            # fails (e.g. DB locked) we just press on.
+            pass
         try:
             self._run_pipeline(report)
-            # Aggregate outcome: failed if any stage failed, else success.
             if any(s.outcome == "failed" for s in report.stages):
                 report.overall = "failed"
             else:
@@ -191,6 +208,32 @@ class AutomationLoop:
             report.skip_reason = f"top-level exception: {type(e).__name__}: {e}"
         finally:
             report.completed_at = _utc_now()
+            try:
+                log_event(
+                    get_connection(),
+                    actor="automation",
+                    action="automation.tick.complete",
+                    outcome=report.overall,
+                    payload={
+                        "duration_seconds": (
+                            (report.completed_at - report.started_at).total_seconds()
+                            if report.completed_at else None
+                        ),
+                        "stages": [
+                            {
+                                "name": s.name,
+                                "outcome": s.outcome,
+                                "duration_seconds": s.duration_seconds,
+                                "error": s.error,
+                            }
+                            for s in report.stages
+                        ],
+                        "skip_reason": report.skip_reason,
+                    },
+                    error=report.skip_reason if report.overall == "failed" else None,
+                )
+            except Exception:
+                pass
         return report
 
     def _run_pipeline(self, report: TickReport) -> None:

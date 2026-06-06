@@ -16,7 +16,7 @@ Adding a new recipe is a single function added to this module + an entry in
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from snowtuner.experiments.arm import Arm
 from snowtuner.experiments.axes import Generation, QASState

@@ -48,6 +48,12 @@ def default_registry() -> RecommenderRegistry:
     from snowtuner.recommenders.builtins.gen2_candidate_finder import (
         Gen2CandidateFinder,
     )
+    from snowtuner.recommenders.builtins.multi_cluster_reducer import (
+        MultiClusterReducer,
+    )
+    from snowtuner.recommenders.builtins.qas_candidate_finder import (
+        QASCandidateFinder,
+    )
     from snowtuner.recommenders.builtins.rule_based_right_sizer import (
         RuleBasedRightSizer,
     )
@@ -55,9 +61,13 @@ def default_registry() -> RecommenderRegistry:
     reg = RecommenderRegistry()
     reg.register(AutoSuspendSurvivalTuner())
     reg.register(RuleBasedRightSizer())
-    # Candidate finder for Gen1→Gen2 experiments.  Doesn't emit direct
-    # recommendations — only proposes experiments via propose_experiments().
+    # Direct-recommendation recommender for multi-cluster waste — pure
+    # observational, no experiment needed (peak observed cluster fully
+    # determines safe bounds).
+    reg.register(MultiClusterReducer())
+    # Candidate finders — emit experiment proposals only, no direct recs.
     # The eventual AlterWarehouse rec comes from experiments/derive.py once
-    # the experiment completes.
+    # the proposed experiment completes.
     reg.register(Gen2CandidateFinder())
+    reg.register(QASCandidateFinder())
     return reg

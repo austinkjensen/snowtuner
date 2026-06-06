@@ -10,7 +10,8 @@ import {
   type AutonomousConfig,
   type AutonomousApplication,
 } from '@/lib/api'
-import { creditsDelta, formatNumber, humanizeAgo } from '@/lib/format'
+import { creditsDelta, formatNumber, humanizeAgo, warehouseFromTarget } from '@/lib/format'
+import { SkeletonRows } from '@/components/skeleton-rows'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -133,7 +134,7 @@ function OpenProposalsCard({
       </CardHeader>
       <CardContent className="p-3 pt-3">
         {loading ? (
-          <SkeletonRows />
+          <SkeletonRows count={2} rowPadding="py-3" />
         ) : recs.length === 0 ? (
           <Empty>No open proposals for this warehouse.</Empty>
         ) : (
@@ -252,7 +253,7 @@ function AutonomousCard({
       </CardHeader>
       <CardContent className="p-3 pt-3">
         {loading ? (
-          <SkeletonRows />
+          <SkeletonRows count={2} rowPadding="py-3" />
         ) : (
           <>
             <div className="px-3 pb-3 text-xs text-muted-foreground">
@@ -436,7 +437,7 @@ function ApplicationsCard({
       </CardHeader>
       <CardContent className="p-3 pt-3">
         {loading ? (
-          <SkeletonRows />
+          <SkeletonRows count={2} rowPadding="py-3" />
         ) : apps.length === 0 ? (
           <Empty>No autonomous applications recorded for this warehouse.</Empty>
         ) : (
@@ -546,25 +547,7 @@ function Empty({ children }: { children: React.ReactNode }) {
   return <p className="px-3 py-6 text-center text-sm text-muted-foreground">{children}</p>
 }
 
-function SkeletonRows() {
-  return (
-    <ul className="divide-y divide-border">
-      {[0, 1].map((i) => (
-        <li key={i} className="px-3 py-3">
-          <div className="h-4 w-1/2 animate-pulse rounded bg-muted" />
-        </li>
-      ))}
-    </ul>
-  )
-}
-
 // ── helpers ────────────────────────────────────────────────────────────────
-
-function warehouseFromTarget(target: string | null | undefined): string | null {
-  if (!target) return null
-  const m = target.match(/^warehouse:([^:]+)/)
-  return m ? m[1] : null
-}
 
 function firstLine(text: string | null | undefined): string {
   if (!text) return ''

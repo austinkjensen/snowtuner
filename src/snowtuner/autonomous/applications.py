@@ -1,10 +1,10 @@
 """Audit log of autonomous applications, plus rollback execution."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Iterable
 
 import duckdb
 

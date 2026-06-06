@@ -69,16 +69,48 @@ def sync_all(
     *,
     initial_lookback_days: int | None = None,
 ) -> tuple[list[SyncResult], list[SyncError]]:
-    """Run each source.  One failing source does not abort the rest."""
+    """Run each source.  One failing source does not abort the rest.
+
+    Emits one event per source via ``snowtuner.events.log_event``:
+    ``sync.source.success`` (with rows_ingested + duration in payload) or
+    ``sync.source.failure`` (with the error message).  The events stream
+    is how the UI / API / MCP query "what's been syncing lately?" without
+    grepping logs.
+    """
+    # Lazy import to avoid a circular-ish dependency (events → db →
+    # nothing-here, but keeping the boundary tidy regardless).
+    from snowtuner.events import log_event
+
     results: list[SyncResult] = []
     errors: list[SyncError] = []
     for s in sources:
         try:
-            results.append(
-                sync_source(s, client, conn, initial_lookback_days=initial_lookback_days)
+            res = sync_source(s, client, conn, initial_lookback_days=initial_lookback_days)
+            results.append(res)
+            log_event(
+                conn,
+                actor="sync",
+                action="sync.source.success",
+                subject=s.name,
+                payload={
+                    "rows_ingested": res.rows_ingested,
+                    "duration_seconds": res.duration_seconds,
+                    "high_water": (
+                        res.high_water.isoformat() if res.high_water else None
+                    ),
+                },
             )
         except Exception as e:
-            errors.append(SyncError(source_name=s.name, error=f"{type(e).__name__}: {e}"))
+            err = f"{type(e).__name__}: {e}"
+            errors.append(SyncError(source_name=s.name, error=err))
+            log_event(
+                conn,
+                actor="sync",
+                action="sync.source.failure",
+                subject=s.name,
+                outcome="failed",
+                error=err,
+            )
     return results, errors
 
 

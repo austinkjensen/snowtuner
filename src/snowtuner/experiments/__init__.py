@@ -1,4 +1,4 @@
-"""snowtuner experiments — v0.2.
+"""snowtuner experiments.
 
 The third loop on top of observe → recommend → apply: actively run sample
 queries against side-by-side warehouse configurations to gather the data

@@ -8,6 +8,7 @@ import { useTheme } from '@/components/theme-provider'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { SkeletonRows } from '@/components/skeleton-rows'
 
 export const Route = createFileRoute('/settings')({
   component: SettingsPage,
@@ -136,7 +137,7 @@ function ConnectionCard() {
       </CardHeader>
       <CardContent className="p-6 pt-2">
         {creds.isLoading ? (
-          <SkeletonRows />
+          <SkeletonRows as="div" rowPadding="py-3" />
         ) : !creds.data?.configured ? (
           <div className="rounded-md border border-warning/40 bg-warning/5 p-4 text-sm">
             <p className="font-medium text-foreground">No credentials configured.</p>
@@ -235,7 +236,7 @@ function RecommendersCard() {
       </CardHeader>
       <CardContent className="p-3 pt-3">
         {recs.isLoading ? (
-          <SkeletonRows />
+          <SkeletonRows as="div" rowPadding="py-3" />
         ) : recs.data?.length === 0 ? (
           <p className="px-3 py-6 text-center text-sm text-muted-foreground">
             No recommenders registered.
@@ -342,14 +343,3 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
-function SkeletonRows() {
-  return (
-    <div className="divide-y divide-border">
-      {[0, 1, 2].map((i) => (
-        <div key={i} className="px-3 py-3">
-          <div className="h-4 w-1/2 animate-pulse rounded bg-muted" />
-        </div>
-      ))}
-    </div>
-  )
-}

@@ -28,10 +28,10 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
 from typing import Protocol
 
 from snowtuner.experiments.model import ExperimentRun, RunStatus
+from snowtuner.storage.db import naive_utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def replay_one(
     executor (works for SNOWTUNER_EXP_SVC granted IMPORTED PRIVILEGES on
     SNOWFLAKE).
     """
-    started_at = _utc_naive_now()
+    started_at = naive_utcnow()
     replay_query_id: str | None = None
     error_message: str | None = None
     status = RunStatus.SUCCESS
@@ -91,7 +91,7 @@ def replay_one(
         status = RunStatus.FAILED
         error_message = f"{type(e).__name__}: {e}"
 
-    completed_at = _utc_naive_now()
+    completed_at = naive_utcnow()
 
     metrics: dict = {}
     if status == RunStatus.SUCCESS and replay_query_id is not None:
@@ -193,7 +193,3 @@ def _fetch_query_metrics(
     # No exception but no rows either — usually means QUERY_HISTORY hasn't
     # caught up.  Still surface that.
     return {"_fetch_error": "no row in QUERY_HISTORY_BY_SESSION after poll window"}
-
-
-def _utc_naive_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)

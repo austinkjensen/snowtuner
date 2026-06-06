@@ -135,6 +135,11 @@ class WarehouseSummaryOut(BaseModel):
     # via SHOW PARAMETERS at sync time.  None on older Snowflake versions
     # where the parameter isn't available.
     generation: str | None = None
+    # Query Acceleration Service state ('on'/'off') and max scale factor.
+    # Mirrored via SHOW PARAMETERS at sync time.  None on accounts without
+    # QAS support (Standard edition) or when lookup fails.
+    qas_state: str | None = None
+    qas_max_scale_factor: int | None = None
     queries_in_window: int = 0
     suspend_resume_events: int = 0
 
@@ -154,7 +159,7 @@ class StatusOut(BaseModel):
     recommendation_counts: dict[str, int]
 
 
-# ── Schema drift (v0.2) ─────────────────────────────────────────
+# ── Schema drift ────────────────────────────────────────────────
 
 class SourceDriftOut(BaseModel):
     """Drift report for one ingestion source."""
@@ -198,6 +203,27 @@ class AutomationStatusOut(BaseModel):
     currently_running: bool
     next_run_at: datetime | None = None
     last_tick: TickReportOut | None = None
+
+
+# ── Events (v0.2) ───────────────────────────────────────────────
+
+class EventOut(BaseModel):
+    """One row in the app.events audit feed."""
+    id: int
+    timestamp: datetime
+    actor: str
+    action: str
+    subject: str | None = None
+    outcome: str
+    payload: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class EventsResponse(BaseModel):
+    rows: list[EventOut]
+    total: int
+    limit: int
+    offset: int
 
 
 # ── Credentials view ────────────────────────────────────────────

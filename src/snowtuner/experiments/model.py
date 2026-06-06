@@ -70,14 +70,15 @@ class ProposedExperiment(BaseModel):
     eligibility_issues: list[Issue] = Field(default_factory=list)
     proposed_by: str            # recommender name@version, or 'user' for UI-built
 
-    # ── Workload resolution (Phase 3) ────────────────────────────────
+    # ── Workload resolution ──────────────────────────────────────────
     # The frozen list of query IDs that will actually be replayed.  Resolved
     # at propose-time (from either the warehouse auto-sampler or a saved query
     # group) so the user can preview and edit the workload before accepting.
     # Engine reads from this list at run time instead of re-sampling.
     #
-    # Empty list means "fall back to live sampling at run time" — back-compat
-    # path for experiments proposed before Phase 3.
+    # Empty list means "fall back to live sampling at run time" — taken when
+    # a recommender's ``propose_experiments()`` returns a recipe-built
+    # ProposedExperiment that bypasses the API workload resolver.
     sampled_query_ids: list[str] = Field(default_factory=list)
     # Source provenance — purely informational, lets the UI render
     # "Workload: 30 queries from saved group 'ETL slow queries'".

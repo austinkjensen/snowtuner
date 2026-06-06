@@ -202,6 +202,10 @@ class AutonomousRunner:
             rollback_sql = action.rollback_sql()  # type: ignore[attr-defined]
 
         sql = action.to_sql()
+        # log_event for the autonomous apply timeline.  The full SQL + rollback
+        # live in app.autonomous_applications (the canonical store); the event
+        # is the queryable timeline marker.
+        from snowtuner.events import log_event
         try:
             executed_sql = action.apply(self.client)
         except Exception as e:
@@ -210,6 +214,19 @@ class AutonomousRunner:
                 action_type=action.type.value,
                 warehouse_name=warehouse,
                 applied_sql=sql,
+                error=f"{type(e).__name__}: {e}",
+            )
+            log_event(
+                self.conn,
+                actor="autonomous",
+                action="autonomous.apply",
+                subject=warehouse,
+                outcome="failed",
+                payload={
+                    "recommendation_id": rec.id,
+                    "action_type": action.type.value,
+                    "application_id": app_id,
+                },
                 error=f"{type(e).__name__}: {e}",
             )
             return AutonomousDecision(
@@ -227,6 +244,19 @@ class AutonomousRunner:
             warehouse_name=warehouse,
             applied_sql=executed_sql,
             rollback_sql=rollback_sql,
+        )
+        log_event(
+            self.conn,
+            actor="autonomous",
+            action="autonomous.apply",
+            subject=warehouse,
+            payload={
+                "recommendation_id": rec.id,
+                "action_type": action.type.value,
+                "application_id": app_id,
+                "confidence": confidence,
+                "has_rollback": rollback_sql is not None,
+            },
         )
         # Promote the recommendation to APPLIED + remember the SQL/rollback.
         self.conn.execute(

@@ -163,9 +163,13 @@ def reset_database(
             if not include_user_config:
                 preserved_groups, preserved_configs = _snapshot_user_config(conn)
             # Audit export is unconditional — always preserve the audit trail.
-            audit_path = _export_audit_trail(
-                conn, audit_archive_dir or Path.home() / ".snowtuner" / "audit-archive",
+            # Two artifacts go in the same archive directory: the
+            # autonomous-applications dump and the events stream dump.
+            archive_root = (
+                audit_archive_dir or Path.home() / ".snowtuner" / "audit-archive"
             )
+            audit_path = _export_audit_trail(conn, archive_root)
+            _export_event_log(conn, archive_root)
         except Exception:
             # Pre-existing schema may be too out-of-date to read.  Skip
             # preservation rather than blocking the reset.  The audit
@@ -281,6 +285,48 @@ def _export_audit_trail(conn, archive_dir: Path) -> Path | None:
 
     def _ser(v):
         # datetimes → ISO strings; everything else passes through.
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return v
+
+    records = [
+        {c: _ser(v) for c, v in zip(cols, r)}
+        for r in rows
+    ]
+    out_path.write_text(json.dumps(records, indent=2))
+    return out_path
+
+
+def _export_event_log(conn, archive_dir: Path) -> Path | None:
+    """Dump app.events to a timestamped JSON file.
+
+    Mirrors ``_export_audit_trail`` for the cross-cutting event stream.
+    Same archive directory, same approach: written before reset wipes
+    the DB.  Events are append-only and the archived JSON is functionally
+    complete (events reference entity IDs that get renumbered on reset,
+    so preserving in-place would create dangling references).
+    """
+    import json
+    from datetime import datetime, timezone
+    # Check table exists first — early-development DBs may not have it.
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, actor, action, subject, outcome, payload, error
+            FROM app.events
+            ORDER BY timestamp
+            """
+        ).fetchall()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    cols = ["id", "timestamp", "actor", "action", "subject", "outcome", "payload", "error"]
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = archive_dir / f"events-{stamp}.json"
+
+    def _ser(v):
         if hasattr(v, "isoformat"):
             return v.isoformat()
         return v
