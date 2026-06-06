@@ -100,8 +100,11 @@ class TestHealthAndStatus:
         r = api_client.get("/health")
         assert r.status_code == 200
 
-    def test_root(self, api_client):
-        r = api_client.get("/")
+    def test_version_info(self, api_client):
+        # GET / is reserved for the SPA's index.html (StaticFiles mount in
+        # production); the JSON discovery payload moved to /version when we
+        # added the SPA-on-same-origin deploy.
+        r = api_client.get("/version")
         assert r.status_code == 200
         body = r.json()
         assert body["name"] == "snowtuner"

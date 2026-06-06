@@ -172,8 +172,28 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    @app.get("/")
-    def root() -> dict[str, str]:
+    @app.middleware("http")
+    async def strip_api_prefix(request, call_next):
+        """Rewrite ``/api/<path>`` to ``/<path>`` before route matching.
+
+        The React SPA in ``web/`` calls ``/api/*`` everywhere — that's the
+        path Vite's dev proxy serves.  In production we mount the built SPA
+        at ``/`` and run the API on the same origin (no proxy), so the
+        ``/api`` prefix would otherwise miss every route.  Stripping it here
+        keeps dev and prod aligned without needing to re-prefix every
+        ``@app.get(...)`` and every test.  TODO: real fix is to refactor
+        all routes under an APIRouter with ``prefix='/api'``.
+        """
+        if request.url.path.startswith("/api/"):
+            request.scope["path"] = request.url.path[4:]
+            request.scope["raw_path"] = request.scope["path"].encode("ascii")
+        return await call_next(request)
+
+    @app.get("/version")
+    def version_info() -> dict[str, str]:
+        """Discovery endpoint.  ``GET /`` is reserved for the SPA's
+        ``index.html`` via the StaticFiles mount registered at the end of
+        ``create_app()``."""
         return {
             "name": "snowtuner",
             "version": "0.1.0",
