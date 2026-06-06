@@ -1,31 +1,22 @@
 # Deploying snowtuner on AWS
 
-This walks through deploying snowtuner to a single EC2 instance in your AWS
-account. You'll reach the UI through an SSM port-forward — no public URL,
-no extra vendors, no certificate management. **~$17/month** total.
+One CloudFormation stack + one Secrets Manager secret = snowtuner running
+in your AWS account, reachable from your laptop via SSM port-forward.
+Total cost: **~$17/month**. End-to-end deploy: **~10 minutes**.
 
-This is the default deploy story. If later you want a real custom domain or
-multi-user access, see the [Upgrade paths](#upgrade-paths) section at the bottom.
+If you've never deployed anything to AWS before and are evaluating
+snowtuner, **run it on your laptop first**. The local dev path (`snowtuner
+api` + `cd web && npm run dev`) needs zero infrastructure. See the
+[main README](../README.md). Come back here when you want it to keep
+running while your laptop is asleep, or when you want a team to share it.
 
-## When to actually do this
-
-snowtuner runs fine on your laptop and that's the right way to evaluate it.
-Reach for an EC2 deploy when you want:
-
-- snowtuner to keep syncing/recommending while your laptop is asleep
-- the automation loop to apply autonomous changes on a schedule
-- to leave it running for a team
-
-If you're just kicking the tires, **skip this guide** and run snowtuner
-locally first.
-
-## What this gets you
+## What gets provisioned
 
 ```
 ┌─────────────────────┐
 │  your laptop        │
 │                     │
-│  $ aws ssm start... │ ──── SSM port-forward over outbound HTTPS ────┐
+│  aws ssm start-...  │ ──── SSM port-forward over outbound HTTPS ────┐
 │  http://localhost:  │                                                │
 │         8770        │                                                │
 └─────────────────────┘                                                ▼
@@ -35,32 +26,39 @@ locally first.
                                                        │                        │
                                                        │  snowtuner :8770       │
                                                        │  (loopback only)       │
-                                                       │                        │
-                                                       │  EBS @ 20GB            │
-                                                       │  /var/lib/snowtuner    │
+                                                       │  + cloned source       │
+                                                       │  + DuckDB              │
+                                                       │  + 30GB gp3 root vol   │
                                                        └────────────┬───────────┘
                                                                     │
-                                                          (outbound only)
-                                                                    ▼
+                                  (EC2 initiates; stateful SG       │
+                                   permits the response packets     │
+                                   on the established connection)   ▼
                                                        ┌──────────────────────┐
                                                        │  your Snowflake      │
                                                        │  account             │
                                                        └──────────────────────┘
 ```
 
-**No inbound ports.** The security group has zero rules. snowtuner binds to
-`127.0.0.1:8770` — only reachable from the EC2 instance itself. SSM Session
-Manager forwards `localhost:8770` on your laptop to `localhost:8770` on the
-instance, over an outbound HTTPS connection from the SSM agent.
+**No inbound ports.** The security group has zero ingress rules. Everything
+the box does — talking to Snowflake, fetching the secret, accepting the
+SSM port-forward — happens over connections **the EC2 instance opens**.
+AWS security groups are stateful, so response packets on those established
+connections flow back automatically. Nobody from the public internet can
+initiate a connection to the box.
+
+**Why SSM port-forward instead of a public URL?** Simplest possible deploy
+that avoids real-world problems (cert renewals, leaked URLs, abuse) for
+the case where one person or a small team is using snowtuner. When you
+outgrow it, see [Upgrade paths](#upgrade-paths).
 
 ## Prerequisites
 
-- AWS account, with permissions to create IAM roles, EC2, EBS, Secrets Manager
+- AWS account with permission to create IAM roles, EC2, EBS, Secrets Manager, and CloudFormation stacks
 - AWS CLI installed: `brew install awscli`
-- AWS CLI configured: `aws configure` (region `us-west-2`)
+- AWS CLI configured: `aws configure` (region `us-west-2` is what the rest of this doc assumes)
 - SSM plugin: `brew install --cask session-manager-plugin`
-- Your Snowflake service-user **private key** (`~/.snowtuner/snowflake_rsa_key.p8`
-  if you've been running snowtuner locally)
+- Your Snowflake service-user **private key** (a `.p8` file — `~/.snowtuner/snowflake_rsa_key.p8` if you've been running snowtuner locally)
 - Your Snowflake account locator, service-user name, default warehouse, role
 
 Confirm AWS is wired up:
@@ -70,277 +68,204 @@ aws sts get-caller-identity
 
 ---
 
-## 1. Stash the Snowflake credentials in Secrets Manager
+## 1. Push the Snowflake credentials to Secrets Manager
 
-One JSON secret carries everything: connection info **and** the RSA private key.
-The bootstrap script fetches it on every boot and writes the key to `/var/lib/snowtuner/snowflake_rsa_key.p8` mode 0600.
+This step stays a CLI command (not part of the CloudFormation stack)
+because the RSA PEM is multi-line, and CloudFormation's console form
+fields are single-line. One command on your laptop:
 
 ```bash
-cd /tmp
-cat > snowtuner-secret.json <<'EOF'
-{
-  "account":         "REPLACE_ME-abc12345",
-  "user":            "SNOWTUNER_SVC",
-  "warehouse":       "COMPUTE_WH",
-  "role":            "SNOWTUNER_ROLE",
-  "private_key_pem": "REPLACE_WITH_PEM_CONTENT"
-}
-EOF
+# Fill these in:
+SNOWFLAKE_ACCOUNT="xy12345.us-west-2"
+SNOWFLAKE_USER="SNOWTUNER_SVC"
+SNOWFLAKE_WAREHOUSE="COMPUTE_WH"
+SNOWFLAKE_ROLE="SNOWTUNER_ROLE"
+PRIVATE_KEY_PATH="$HOME/.snowtuner/snowflake_rsa_key.p8"
 
-# Slurp your local PEM file in (preserves newlines as \n)
-jq --rawfile pem ~/.snowtuner/snowflake_rsa_key.p8 \
-   '.private_key_pem = $pem' \
-   snowtuner-secret.json > snowtuner-secret-final.json
-
-# Open and fix the other fields:
-$EDITOR snowtuner-secret-final.json
-```
-
-Push it to Secrets Manager and capture the ARN:
-```bash
-SECRET_ARN=$(aws secretsmanager create-secret \
-  --name snowtuner/snowflake \
-  --description "Snowflake service-user creds for snowtuner" \
-  --secret-string file:///tmp/snowtuner-secret-final.json \
-  --region us-west-2 \
-  --query ARN --output text)
+# Build the JSON + push it in one shot.  --rawfile preserves the PEM newlines
+# as \n inside the JSON string.
+SECRET_ARN=$(
+  jq -n \
+    --arg account   "$SNOWFLAKE_ACCOUNT"   \
+    --arg user      "$SNOWFLAKE_USER"      \
+    --arg warehouse "$SNOWFLAKE_WAREHOUSE" \
+    --arg role      "$SNOWFLAKE_ROLE"      \
+    --rawfile pem   "$PRIVATE_KEY_PATH"    \
+    '{account: $account, user: $user, warehouse: $warehouse, role: $role, private_key_pem: $pem}' \
+  | aws secretsmanager create-secret \
+      --name snowtuner/snowflake \
+      --description "Snowflake service-user creds for snowtuner" \
+      --secret-string file:///dev/stdin \
+      --region us-west-2 \
+      --query ARN --output text
+)
 echo "Secret ARN: ${SECRET_ARN}"
 ```
 
-When you're done: `shred -u /tmp/snowtuner-secret*.json`.
+That ARN is what the CloudFormation stack reads. Save it; you'll paste it
+in step 2.
 
 ---
 
-## 2. Create an IAM role for the EC2 instance
+## 2. Launch the CloudFormation stack
 
-The instance needs `secretsmanager:GetSecretValue` on the secret you just
-created, and the AWS-managed SSM policy so we can shell in.
+The big-button way (assumes the template is at `main` in the public repo):
 
-```bash
-# 2a. Trust policy — EC2 can assume this role.
-cat > /tmp/trust.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Service": "ec2.amazonaws.com"},
-    "Action": "sts:AssumeRole"
-  }]
-}
-EOF
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?templateURL=https://raw.githubusercontent.com/austinkjensen/snowtuner/main/deploy/snowtuner.cf.yaml&stackName=snowtuner)
 
-aws iam create-role \
-  --role-name snowtuner-ec2 \
-  --assume-role-policy-document file:///tmp/trust.json
+Click it. The AWS console opens with the template pre-loaded. Fill in:
 
-# 2b. SSM session manager.
-aws iam attach-role-policy \
-  --role-name snowtuner-ec2 \
-  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+| Field | What to enter |
+|-------|---------------|
+| **Stack name** | `snowtuner` (already prefilled) |
+| **Snowflake credentials secret ARN** | Paste the ARN from step 1 |
+| **EC2 instance type** | Leave as `t3.small` |
+| **Root volume size (GB)** | Leave as `30` |
+| **VPC** | Pick your default VPC (the only one shown unless you've created others) |
+| **Subnet** | Pick any subnet in that VPC |
+| **snowtuner repo URL** | Leave as default unless you forked |
+| **Branch / tag / commit** | Leave as `main` (or pin to a tag for stable deploys) |
 
-# 2c. Read the snowtuner secret.
-cat > /tmp/secret-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "secretsmanager:GetSecretValue",
-    "Resource": "${SECRET_ARN}"
-  }]
-}
-EOF
+Click "Create stack." Wait 5–10 minutes — the stack waits for snowtuner to
+finish bootstrapping before marking CREATE_COMPLETE, so when the green check
+appears you know it's actually up.
 
-aws iam put-role-policy \
-  --role-name snowtuner-ec2 \
-  --policy-name read-snowtuner-secret \
-  --policy-document file:///tmp/secret-policy.json
+### CLI alternative
 
-# 2d. Instance profile (the thing EC2 actually attaches).
-aws iam create-instance-profile --instance-profile-name snowtuner-ec2
-aws iam add-role-to-instance-profile \
-  --instance-profile-name snowtuner-ec2 \
-  --role-name snowtuner-ec2
-
-# IAM takes a few seconds to propagate.  Give it a moment.
-sleep 10
-```
-
----
-
-## 3. Create a security group with no inbound rules
+If you'd rather drive from the CLI than the console:
 
 ```bash
+# Look up your default VPC + a subnet
 VPC_ID=$(aws ec2 describe-vpcs \
   --filters Name=isDefault,Values=true \
   --query 'Vpcs[0].VpcId' --output text)
-
-SG_ID=$(aws ec2 create-security-group \
-  --group-name snowtuner-ec2 \
-  --description "snowtuner: SSM-only, no inbound" \
-  --vpc-id "${VPC_ID}" \
-  --query 'GroupId' --output text)
-echo "SG: ${SG_ID}"
-```
-
-The default outbound (all traffic) is what we need — SSM agent, package
-mirrors, Secrets Manager, Snowflake. The default inbound is closed.
-
----
-
-## 4. Create the EBS data volume
-
-```bash
-AZ=$(aws ec2 describe-availability-zones --region us-west-2 \
-  --query 'AvailabilityZones[0].ZoneName' --output text)
-
-VOL_ID=$(aws ec2 create-volume \
-  --size 20 \
-  --volume-type gp3 \
-  --availability-zone "${AZ}" \
-  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=snowtuner-data}]' \
-  --query 'VolumeId' --output text)
-echo "Volume: ${VOL_ID}"
-```
-
----
-
-## 5. Launch the EC2 instance
-
-```bash
-AMI=$(aws ssm get-parameter \
-  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-  --query 'Parameter.Value' --output text)
-
-SUBNET=$(aws ec2 describe-subnets \
-  --filters "Name=vpc-id,Values=${VPC_ID}" "Name=availability-zone,Values=${AZ}" \
+SUBNET_ID=$(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=${VPC_ID}" \
   --query 'Subnets[0].SubnetId' --output text)
 
-INSTANCE_ID=$(aws ec2 run-instances \
-  --image-id "${AMI}" \
-  --instance-type t3.small \
-  --subnet-id "${SUBNET}" \
-  --security-group-ids "${SG_ID}" \
-  --iam-instance-profile Name=snowtuner-ec2 \
-  --metadata-options 'HttpTokens=required,HttpPutResponseHopLimit=2' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=snowtuner}]' \
-  --query 'Instances[0].InstanceId' --output text)
-echo "Instance: ${INSTANCE_ID}"
+# Create the stack
+aws cloudformation create-stack \
+  --stack-name snowtuner \
+  --template-url https://raw.githubusercontent.com/austinkjensen/snowtuner/main/deploy/snowtuner.cf.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters \
+    ParameterKey=SnowflakeSecretArn,ParameterValue="${SECRET_ARN}" \
+    ParameterKey=VpcId,ParameterValue="${VPC_ID}" \
+    ParameterKey=SubnetId,ParameterValue="${SUBNET_ID}" \
+  --region us-west-2
 
-aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+# Wait for it to finish (5-10 min)
+aws cloudformation wait stack-create-complete \
+  --stack-name snowtuner --region us-west-2
+```
 
-aws ec2 attach-volume \
-  --instance-id "${INSTANCE_ID}" \
-  --volume-id "${VOL_ID}" \
-  --device /dev/sdf
+If the stack fails, before deleting it run:
+```bash
+aws cloudformation describe-stack-events --stack-name snowtuner \
+  --region us-west-2 --max-items 20
+```
+…and grab the userdata log with SSM:
+```bash
+INSTANCE_ID=$(aws cloudformation describe-stack-resource \
+  --stack-name snowtuner \
+  --logical-resource-id EC2Instance \
+  --query 'StackResourceDetail.PhysicalResourceId' --output text \
+  --region us-west-2)
+aws ssm start-session --target "${INSTANCE_ID}"
+# inside the session:
+sudo cat /var/log/snowtuner-userdata.log | tail -100
 ```
 
 ---
 
-## 6. SSM into the instance and run bootstrap
+## 3. Reach the UI
+
+Pull the SSM port-forward command from the stack outputs:
 
 ```bash
+aws cloudformation describe-stacks \
+  --stack-name snowtuner --region us-west-2 \
+  --query 'Stacks[0].Outputs[?OutputKey==`PortForwardCommand`].OutputValue' \
+  --output text
+```
+
+That prints something like:
+```
+aws ssm start-session --target i-0abc...  --document-name AWS-StartPortForwardingSession --parameters '{"portNumber":["8770"],"localPortNumber":["8770"]}' --region us-west-2
+```
+
+Run it. Leave it running. Open <http://localhost:8770> in your browser.
+
+You'll get the snowtuner auth screen — paste in your API token.
+
+To grab the token, open another terminal and SSM-session in:
+```bash
+INSTANCE_ID=$(aws cloudformation describe-stacks \
+  --stack-name snowtuner --region us-west-2 \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
+  --output text)
 aws ssm start-session --target "${INSTANCE_ID}"
-```
-
-You're now sitting on the EC2 box. Switch to `ec2-user` (the one with sudo):
-
-```bash
-sudo -i -u ec2-user
-```
-
-Clone the repo and run bootstrap. **Replace `${SECRET_ARN}`** with the value
-from step 1 (the session doesn't carry your local shell vars):
-
-```bash
-sudo dnf -y install git
-sudo mkdir -p /opt/snowtuner
-sudo chown ec2-user:ec2-user /opt/snowtuner
-git clone https://github.com/austinkjensen/snowtuner.git /opt/snowtuner
-
-sudo \
-  SNOWTUNER_SECRET_ID=arn:aws:secretsmanager:us-west-2:...:secret:snowtuner/snowflake-XXXXX \
-  AWS_REGION=us-west-2 \
-  bash /opt/snowtuner/deploy/bootstrap.sh
-```
-
-The script:
-- formats + mounts the EBS volume at `/var/lib/snowtuner`
-- installs git, Node 22, Python 3.11, uv
-- creates the `snowtuner` system user
-- builds the SPA (`web/dist`)
-- fetches the secret and writes the env file
-- installs and starts the systemd unit
-
-Wait for `✓ snowtuner API responding on :8770` at the end.
-
-Grab the auto-generated API token — you'll paste it into the UI in step 8:
-
-```bash
+# inside:
 sudo cat /var/lib/snowtuner/api_token
 ```
 
-Exit the SSM session: `exit` twice (once to leave `ec2-user`, once to leave `ssm-user`).
+Paste it into the UI's Settings page. It's stored in localStorage and
+attached to every subsequent request.
 
----
-
-## 7. Reach the UI from your laptop
-
-From your laptop terminal:
+### Save the port-forward as an alias
 
 ```bash
-aws ssm start-session \
-  --target ${INSTANCE_ID} \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["8770"],"localPortNumber":["8770"]}'
-```
-
-Leave that running. Open http://localhost:8770 in your browser. You should
-get the snowtuner UI's auth screen.
-
-Paste the API token from step 6 into Settings. The token is stored in
-localStorage and attached to every subsequent request.
-
-**Save the port-forward command as a shell alias** so you don't have to
-re-type it:
-
-```bash
-# in ~/.zshrc or ~/.bashrc
-alias snowtuner-up="aws ssm start-session --target ${INSTANCE_ID} \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{\"portNumber\":[\"8770\"],\"localPortNumber\":[\"8770\"]}'"
+# in ~/.zshrc
+alias snowtuner-up='aws ssm start-session --target i-0abc...  --document-name AWS-StartPortForwardingSession --parameters "{\"portNumber\":[\"8770\"],\"localPortNumber\":[\"8770\"]}" --region us-west-2'
 ```
 
 ---
 
-## 8. First sync
+## 4. First sync
 
-Still in your laptop terminal (separate from the port-forward), open a new
-SSM session and run the sync:
+Still in your SSM shell session on the instance:
 
 ```bash
-aws ssm start-session --target "${INSTANCE_ID}"
-
-# inside the session:
 sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner verify
 sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner sync
 ```
 
 After 1–10 minutes (depending on your Snowflake account size), refresh the
-UI — the freshness pill should turn green, warehouses populate, recommenders
-fire on the next automation tick.
+UI — the freshness pill turns green, warehouses populate, recommenders fire
+on the next automation tick (default 1 hour after boot).
 
 ---
 
 ## Operating it
 
-| Task | Command |
+| Task | Command (from inside an SSM session) |
 |------|---------|
-| Logs | `journalctl -u snowtuner -f` (from inside an SSM session) |
+| Tail logs | `journalctl -u snowtuner -f` |
 | Restart | `sudo systemctl restart snowtuner` |
-| Upgrade snowtuner | re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` — clones latest, rebuilds, restarts |
+| Upgrade snowtuner | re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` — pulls latest, rebuilds, restarts |
 | Rotate API token | `sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner auth rotate`, then update Settings page |
-| Rotate Snowflake creds | update the Secrets Manager secret; `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh && sudo systemctl restart snowtuner` |
-| Tear down | `aws ec2 terminate-instances --instance-ids ${INSTANCE_ID}` + delete volume, role, SG, secret |
+| Rotate Snowflake creds | update the secret value in Secrets Manager, then `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh && sudo systemctl restart snowtuner` |
+
+## Tearing it down
+
+```bash
+aws cloudformation delete-stack --stack-name snowtuner --region us-west-2
+```
+
+The CF stack deletes the EC2 instance, role, instance profile, SG.
+**The Snowflake secret survives** — it's intentionally outside the stack
+because credentials should outlive infrastructure. Delete it separately
+when you're sure you're done:
+
+```bash
+aws secretsmanager delete-secret \
+  --secret-id snowtuner/snowflake \
+  --recovery-window-in-days 7 \
+  --region us-west-2
+```
+
+(Use `--force-delete-without-recovery` to skip the 7-day grace if you're
+really sure.)
 
 ---
 
@@ -349,46 +274,47 @@ fire on the next automation tick.
 | Item | Monthly |
 |------|---------|
 | EC2 t3.small on-demand | ~$15 |
-| EBS gp3 20GB | $1.60 |
+| EBS gp3 30GB (root) | $2.40 |
 | Secrets Manager (1 secret) | $0.40 |
 | Data transfer (negligible) | $0 |
-| **Total** | **~$17/mo** |
+| **Total** | **~$18/mo** |
 
-A 1-year reserved t3.small drops the compute portion ~30% if you commit to
-keeping it running.
+A 1-year reserved t3.small drops the compute portion ~30%.
 
 ---
 
 ## Upgrade paths
 
-The SSM-port-forward path is the lightest possible deploy. When you want
-more, you can layer on:
+The SSM-port-forward path is the lightest deploy. When you want more, you
+layer one of these onto the same instance:
 
-- **Tailscale**: install `tailscale` on the instance + your laptops/team
-  laptops; reach snowtuner at `https://snowtuner.your-tailnet.ts.net`.
-  TLS handled by Tailscale, no domain needed. Free for personal use.
+- **Tailscale**: install `tailscale` on the instance + your laptops; reach
+  snowtuner at `https://snowtuner.your-tailnet.ts.net`. TLS handled by
+  Tailscale, no domain needed, free for personal use. Good for small teams.
 
-- **Cloudflare Tunnel**: see `deploy/install-cloudflared.sh`. Get a
-  `*.trycloudflare.com` URL (quick) or a custom hostname if your domain
-  is on Cloudflare. Useful when you want a public URL and don't want to
-  put Tailscale on every device. Free.
+- **Cloudflare Tunnel**: `dnf install cloudflared`, `cloudflared tunnel
+  login`, and a `cloudflared.yml` with `ingress: snowtuner.example.com →
+  http://127.0.0.1:8770`. Get a `*.trycloudflare.com` URL (quick) or a
+  custom hostname if your domain's on Cloudflare. Useful when you want a
+  public URL without putting Tailscale on every device.
 
 - **ALB + ACM**: pure AWS, real custom domain. Add an Application Load
-  Balancer, ACM cert, Route 53 record. ~$18/mo extra for the ALB. The
+  Balancer, ACM cert, Route 53 record. Need to open port 8770 from the
+  ALB's SG to snowtuner's SG. ~$18/mo extra for the ALB. The
   fully-managed-by-AWS path.
 
-Each is a layer on top of the same instance — you keep everything from
-this guide and add the URL surface.
+Each is additive — you keep everything from this guide and add the URL
+surface.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Look at |
-|---------|---------|
-| `snowtuner` won't start | `sudo journalctl -u snowtuner -n 100` |
-| Port-forward exits immediately | Instance not in SSM yet — `aws ssm describe-instance-information` should list it. Takes 1–2 min after launch. |
+| Symptom | What to look at |
+|---------|-----------------|
+| Stack creation stuck > 15 min | `aws cloudformation describe-stack-events --stack-name snowtuner` — usually a user-data crash. SSM in and grep `/var/log/snowtuner-userdata.log`. |
+| Stack creation failed; can't SSM in | The instance may have already been terminated by rollback. Re-launch with `--on-failure DO_NOTHING` so the instance survives for inspection. |
+| Port-forward exits immediately | Instance not registered with SSM yet — usually clears in 1-2 min after launch. `aws ssm describe-instance-information` should list it. |
 | UI returns 401 on every request | Token mismatch. Re-grab `sudo cat /var/lib/snowtuner/api_token` and paste into Settings. |
-| Sync fails: "no Snowflake credentials" | env file missing. `sudo cat /var/lib/snowtuner/env` should list `SNOWTUNER_SNOWFLAKE_ACCOUNT=...`. Re-run `fetch-secrets.sh`. |
-| Sync fails: "JWT token is invalid" | Snowflake hasn't seen your public key. From the Secrets Manager secret, extract the public half and `ALTER USER … SET RSA_PUBLIC_KEY = '…'` on Snowflake. |
-| `bootstrap.sh` halts on `mkfs.ext4` | The EBS volume already had a filesystem. Either fine (script skips) or `wipefs -a /dev/nvme1n1` and re-run. |
+| `snowtuner verify` fails: "no Snowflake credentials" | env file missing. `sudo cat /var/lib/snowtuner/env` should list `SNOWTUNER_SNOWFLAKE_ACCOUNT=...`. Re-run `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh`. |
+| `snowtuner sync` fails: "JWT token is invalid" | Snowflake hasn't seen your public key yet. Extract the public half from your local `.p8` and `ALTER USER ... SET RSA_PUBLIC_KEY = '...'` in Snowflake. |

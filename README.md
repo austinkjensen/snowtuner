@@ -104,6 +104,36 @@ snowtuner bootstrap-sql --enable-experiments > experiments-bootstrap.sql
 
 Then grant `SELECT` on whatever databases / tables you want experiments to replay queries against — see the comment block in the generated SQL.
 
+## Quick deploy to AWS
+
+When you want snowtuner running somewhere other than your laptop:
+
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?templateURL=https://raw.githubusercontent.com/austinkjensen/snowtuner/main/deploy/snowtuner.cf.yaml&stackName=snowtuner)
+
+Before clicking the button, push your Snowflake creds into Secrets Manager (one CLI command — multi-line PEM doesn't fit in the CloudFormation console form):
+
+```bash
+SECRET_ARN=$(
+  jq -n \
+    --arg account   "xy12345.us-west-2"   \
+    --arg user      "SNOWTUNER_SVC"       \
+    --arg warehouse "COMPUTE_WH"          \
+    --arg role      "SNOWTUNER_ROLE"      \
+    --rawfile pem   "$HOME/.snowtuner/snowflake_rsa_key.p8" \
+    '{account: $account, user: $user, warehouse: $warehouse, role: $role, private_key_pem: $pem}' \
+  | aws secretsmanager create-secret \
+      --name snowtuner/snowflake \
+      --secret-string file:///dev/stdin \
+      --region us-west-2 \
+      --query ARN --output text
+)
+echo "$SECRET_ARN"
+```
+
+Paste `$SECRET_ARN` into the stack form. Wait ~10 minutes for CREATE_COMPLETE. The stack outputs an `aws ssm start-session` command — copy it, run it on your laptop, hit `http://localhost:8770`. No public URL, no certificate management, no second vendor.
+
+Cost: ~$18/mo (t3.small + 30GB gp3 + 1 secret). Full runbook + troubleshooting in [docs/aws-deploy.md](docs/aws-deploy.md). If you outgrow the SSM-port-forward access pattern, the "Upgrade paths" section there walks through Tailscale, Cloudflare Tunnel, and ALB+ACM as additive options.
+
 ## Going autonomous (one warehouse at a time)
 
 ```bash

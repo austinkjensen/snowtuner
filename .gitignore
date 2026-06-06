@@ -1,16 +1,47 @@
+# ── Python ────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
+*.pyo
 .venv/
-.env
 .ruff_cache/
 .pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
 dist/
 build/
 *.egg-info/
+
+# ── Node (defense-in-depth; web/.gitignore covers this too) ───────
+node_modules/
+
+# ── OS / editor cruft ─────────────────────────────────────────────
 .DS_Store
+*.swp
+*.swo
+*.bak
+*~
 
-# Local data directory
+# ── Env / shell files ─────────────────────────────────────────────
+.env
+.env.*
+
+# ── Secrets — NEVER commit ────────────────────────────────────────
+# RSA private keys (Snowflake service-user, SSH, etc.)
+*.p8
+*.pem
+*.key
+# Local snowtuner data directory — DuckDB, api_token, creds.toml live here
 .snowtuner/
+# Same files by explicit name, in case data dir was relocated via env var
+*.duckdb
+*.duckdb.wal
+creds.toml
+api_token
 
-# Rendered diagram artifacts (regenerate with `python scripts/render_mermaid.py`)
+# ── Local IDE / agent settings ────────────────────────────────────
+.claude/settings.local.json
+
+# ── Rendered diagram artifacts (regenerate via scripts/render_mermaid.py) ──
 docs/img/
