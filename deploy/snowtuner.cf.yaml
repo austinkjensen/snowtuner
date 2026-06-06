@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║  snowtuner — single-instance Snowflake cost optimizer                  ║
+# ╠════════════════════════════════════════════════════════════════════════╣
+# ║                                                                        ║
+# ║  Provisions:                                                           ║
+# ║    • IAM role + instance profile (SSM Session Manager + Secrets read)  ║
+# ║    • Security group (no inbound rules — access via SSM only)           ║
+# ║    • EC2 instance (AL2023, default t3.small)                           ║
+# ║                                                                        ║
+# ║  Prereq (NOT in this stack — you create it once before launching):     ║
+# ║    • Secrets Manager secret containing your Snowflake creds JSON       ║
+# ║      (see README "Quick deploy to AWS" for the one-liner)              ║
+# ║                                                                        ║
+# ║  After CREATE_COMPLETE:                                                ║
+# ║    • Outputs.PortForwardCommand — copy/paste; opens localhost:8770     ║
+# ║    • Outputs.ShellCommand — SSM-in to grab the API token / run sync    ║
+# ║                                                                        ║
+# ║  Cost: ~$17/month  (t3.small + 30GB gp3 + Secrets Manager)             ║
+# ║                                                                        ║
+# ║  Tear down: aws cloudformation delete-stack --stack-name <name>        ║
+# ║    (The Snowflake secret survives; it's outside the stack.)            ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+
+Description: snowtuner — open-source Snowflake cost & performance advisor
+
+# Console form layout — groups related parameters so users see a sensible
+# top-to-bottom flow when filling out the launch form.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Snowflake credentials"}
+        Parameters: [SnowflakeSecretArn]
+      - Label: {default: "Compute"}
+        Parameters: [InstanceType, VolumeSize, VpcId, SubnetId]
+      - Label: {default: "Source (advanced — usually leave alone)"}
+        Parameters: [RepoUrl, RepoRef]
+    ParameterLabels:
+      SnowflakeSecretArn: {default: "Snowflake credentials secret ARN"}
+      InstanceType:       {default: "EC2 instance type"}
+      VolumeSize:         {default: "Root volume size (GB)"}
+      VpcId:              {default: "VPC"}
+      SubnetId:           {default: "Subnet"}
+      RepoUrl:            {default: "snowtuner repo URL"}
+      RepoRef:            {default: "Branch / tag / commit"}
+
+Parameters:
+  SnowflakeSecretArn:
+    Type: String
+    AllowedPattern: '^arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$'
+    ConstraintDescription: Must be a Secrets Manager ARN (arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME-XXXXX).
+    Description: >
+      ARN of your pre-created Secrets Manager secret holding the Snowflake
+      creds JSON.  CREATE THIS BEFORE LAUNCHING THE STACK — see the README's
+      "Quick deploy to AWS" section for the one-line command.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium, t3.large, m6i.large, m6i.xlarge]
+    Description: >
+      EC2 instance size.  t3.small (~$15/mo) handles a few-thousand-warehouse
+      Snowflake account comfortably.  Step up if you see the API hitting CPU
+      ceilings during heavy syncs.
+
+  VolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 500
+    Description: >
+      Root volume size in GB.  Holds the OS, the snowtuner venv (~500MB),
+      the SPA build, the DuckDB (typically 1-5 GB), and audit archives.
+      30 GB is plenty for most accounts.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the instance into.  Default VPC is fine.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Subnet in the VPC above.  Pick any one — must have a route to the
+      internet (default VPC subnets do).  Public or private both work since
+      access is via SSM, not a public IP.
+
+  RepoUrl:
+    Type: String
+    Default: https://github.com/austinkjensen/snowtuner.git
+    Description: >
+      snowtuner repo to clone on first boot.  Override if you forked, or to
+      pin to your own enterprise mirror.
+
+  RepoRef:
+    Type: String
+    Default: main
+    Description: >
+      Git ref (branch, tag, or commit SHA) to deploy.  Defaults to main; pin
+      to a tag like v0.1.0 for stable deploys.
+
+Resources:
+
+  # ── IAM ──────────────────────────────────────────────────────────────
+  # The EC2 instance assumes this role.  Two permissions: SSM (so you can
+  # session-manager in) and read on YOUR specific Snowflake secret (so
+  # bootstrap.sh can pull the creds at first boot).
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadSnowtunerSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SnowflakeSecretArn
+      Tags:
+        - Key: ManagedBy
+          Value: snowtuner-cfn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # ── Network ──────────────────────────────────────────────────────────
+  # No inbound rules.  Default outbound = all traffic, which is what we
+  # need (Snowflake on 443, SSM endpoints on 443, dnf mirrors, etc.).
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: snowtuner — SSM only, no inbound rules
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound (Snowflake, SSM, dnf, etc.)
+      Tags:
+        - Key: Name
+          Value: snowtuner
+
+  # ── Compute ──────────────────────────────────────────────────────────
+  # CreationPolicy makes the stack wait for `cfn-signal` from inside
+  # user-data — so CREATE_COMPLETE genuinely means "snowtuner is running",
+  # not just "EC2 is running."
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    Properties:
+      # AL2023 latest, looked up dynamically — no region-specific AMI maps.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref SecurityGroup]
+      MetadataOptions:
+        # IMDSv2 required — defense against SSRF that could otherwise grab
+        # the instance's IAM creds.
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: snowtuner
+        - Key: ManagedBy
+          Value: snowtuner-cfn
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Log everything to disk so failures are debuggable via SSM after
+          # we set OnFailure=DO_NOTHING on the stack (or while it's still alive).
+          exec > >(tee -a /var/log/snowtuner-userdata.log) 2>&1
+          set -euo pipefail
+
+          # `cfn-signal` lives in the aws-cfn-bootstrap package on AL2023 —
+          # not preinstalled.  Install it FIRST so the trap below can rely on it.
+          dnf -y install aws-cfn-bootstrap git
+
+          # Whatever the script's exit code, signal it back to CloudFormation.
+          # Without this trap, a bootstrap failure leaves the stack waiting
+          # for the full 15-minute timeout before rolling back.
+          trap 'rc=$?; /opt/aws/bin/cfn-signal -e $rc \
+            --stack ${AWS::StackName} \
+            --resource EC2Instance \
+            --region ${AWS::Region}' EXIT
+
+          # IAM role propagation can take a few seconds after instance start.
+          # Without this, the first AWS API call sometimes hits a stale cache
+          # and gets "no IAM role attached" — which the secret fetch in
+          # bootstrap.sh would then surface as a confusing AccessDenied.
+          sleep 10
+
+          mkdir -p /opt/snowtuner
+          chown ec2-user:ec2-user /opt/snowtuner
+          sudo -u ec2-user git clone --depth=1 --branch ${RepoRef} ${RepoUrl} /opt/snowtuner
+
+          SNOWTUNER_SECRET_ID='${SnowflakeSecretArn}' \
+          AWS_REGION='${AWS::Region}' \
+            bash /opt/snowtuner/deploy/bootstrap.sh
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID — use with aws ssm commands
+    Value: !Ref EC2Instance
+
+  PortForwardCommand:
+    Description: >
+      Run this on your laptop to access the snowtuner UI at localhost:8770.
+      Leave it running while you use the UI; Ctrl-C disconnects.
+    Value: !Sub >
+      aws ssm start-session --target ${EC2Instance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["8770"],"localPortNumber":["8770"]}'
+      --region ${AWS::Region}
+
+  ShellCommand:
+    Description: >
+      SSM-session into the instance.  Use this to grab the API token
+      (sudo cat /var/lib/snowtuner/api_token) or to run snowtuner CLI
+      commands (sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner …).
+    Value: !Sub aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}
+
+  ApiTokenInstructions:
+    Description: >
+      Once SSM-sessioned in, run this to fetch the auto-generated API token
+      to paste into the UI's Settings page.
+    Value: sudo cat /var/lib/snowtuner/api_token

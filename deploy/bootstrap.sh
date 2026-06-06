@@ -45,26 +45,22 @@ mount_data_volume() {
         return
     fi
 
-    # Find the unmounted volume.  On modern Nitro instances the OS sees them
-    # as /dev/nvme1n1, /dev/nvme2n1, etc.  Pick the first that has no
-    # filesystem and isn't the root disk.
+    # Find a separate EBS volume.  On modern Nitro instances the OS sees them
+    # as /dev/nvme1n1, /dev/nvme2n1, etc.  Pick the first that exists.
     local candidate=""
     for dev in /dev/nvme1n1 /dev/nvme2n1 /dev/xvdf /dev/sdf; do
-        if [[ -b "${dev}" ]] && ! blkid -p "${dev}" >/dev/null 2>&1; then
-            candidate="${dev}"
-            break
-        fi
-        # Already-formatted volume — accept if /dev/nvme1n1 (default) since
-        # this script may have been run before.
-        if [[ -b "${dev}" ]] && blkid -p "${dev}" 2>/dev/null | grep -q ext4; then
+        if [[ -b "${dev}" ]]; then
             candidate="${dev}"
             break
         fi
     done
 
     if [[ -z "${candidate}" ]]; then
-        echo "No data volume found.  Attach an EBS volume and re-run." >&2
-        exit 1
+        # No separate data volume present — the CloudFormation flow puts
+        # ${DATA_DIR} on the root volume (sized via the VolumeSize template
+        # parameter), and that's fine.  Just make sure the directory exists.
+        echo "No separate EBS volume found; using root volume for ${DATA_DIR}."
+        return
     fi
 
     if ! blkid -p "${candidate}" >/dev/null 2>&1; then

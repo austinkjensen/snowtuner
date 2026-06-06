@@ -80,4 +80,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section). This is correct for healthy small accounts but produces no demo
   output without the synthetic seed.
 
-[0.1.0]: https://github.com/austin/snowtuner/releases/tag/v0.1.0
+[0.1.0]: https://github.com/austinkjensen/snowtuner/releases/tag/v0.1.0
