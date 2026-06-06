@@ -199,7 +199,11 @@ main() {
     smoke_test
 
     log "Done"
-    echo "Next: install Cloudflare Tunnel — see deploy/install-cloudflared.sh"
+    echo "Next: from your laptop,"
+    echo "  aws ssm start-session --target <instance-id> \\"
+    echo "    --document-name AWS-StartPortForwardingSession \\"
+    echo "    --parameters '{\"portNumber\":[\"8770\"],\"localPortNumber\":[\"8770\"]}'"
+    echo "  open http://localhost:8770"
 }
 
 main "$@"
