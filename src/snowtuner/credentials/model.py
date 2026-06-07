@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AuthMethod(str, Enum):
@@ -30,6 +30,31 @@ class SnowflakeCredentials(BaseModel):
 
     account: str = Field(..., description="e.g. 'xy12345.us-east-1'")
     user: str
+
+    @field_validator("account", mode="before")
+    @classmethod
+    def _strip_fqdn_suffix(cls, v: Any) -> Any:
+        """Tolerate users pasting the full hostname.
+
+        The Snowflake Python connector ALWAYS appends ``.snowflakecomputing.com``
+        to the ``account`` it's given.  If the caller pasted the full URL
+        (``KOGJAPL-TLB33724.snowflakecomputing.com``), the connector ends up
+        POSTing to ``KOGJAPL-TLB33724.snowflakecomputing.com.snowflakecomputing.com``
+        and gets a confusing 404.  Strip the suffix here so either form works.
+
+        Also strips an https:// scheme and any trailing slashes/paths for the
+        same reason — they're real things people copy from the Snowsight URL bar.
+        """
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        for scheme in ("https://", "http://"):
+            if s.startswith(scheme):
+                s = s[len(scheme):]
+        s = s.split("/", 1)[0]                       # drop any path
+        if s.endswith(".snowflakecomputing.com"):
+            s = s[: -len(".snowflakecomputing.com")]
+        return s
     auth_method: AuthMethod = AuthMethod.KEY_PAIR
     password: str | None = None
     private_key_path: str | None = Field(

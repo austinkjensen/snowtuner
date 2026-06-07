@@ -45,9 +45,14 @@ Parameters:
 
   InstanceType:
     Type: String
-    Default: t3.small
+    Default: t3.medium
     AllowedValues: [t3.small, t3.medium, t3.large, m6i.large, m6i.xlarge]
-    Description: EC2 instance size. t3.small (~$15/mo) handles a few-thousand-warehouse account comfortably.
+    Description: >
+      EC2 instance size.  Default is t3.medium (~$30/mo, 4 GB RAM) — t3.small
+      (2 GB) works for a quick demo but OOMs during sync on any non-trivial
+      account because the systemd API + an interactive sync run hold large
+      Snowflake QUERY_HISTORY chunks in memory at the same time.  Step up to
+      t3.large or m6i.large for very large accounts.
 
   VolumeSize:
     Type: Number
@@ -164,6 +169,24 @@ Resources:
 
           # IAM role propagation can take a few seconds after instance start.
           sleep 10
+
+          # Belt-and-suspenders swap.  Even on t3.medium the QUERY_HISTORY
+          # sync can briefly spike past 4 GB when QUERY_HISTORY is dense.
+          # 2 GB swap absorbs the spike at the cost of a slower sync.
+          # Without this, OOM-killer ate the API and wedged the instance
+          # to the point of needing a full CF redeploy — discovered the
+          # hard way during dogfooding on a t3.small.
+          if [[ ! -f /swapfile ]]; then
+            dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null
+            swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            # Low swappiness so the kernel only swaps under real pressure,
+            # not preemptively.
+            sysctl -w vm.swappiness=10 >/dev/null
+            echo 'vm.swappiness=10' > /etc/sysctl.d/99-snowtuner-swap.conf
+          fi
 
           # Initial clone happens as root so bootstrap.sh (also root) can
           # `git fetch` in here on re-runs without hitting git's

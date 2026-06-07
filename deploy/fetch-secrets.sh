@@ -76,7 +76,11 @@ tmp_env="$(mktemp "${ENV_PATH}.XXXXXX")"
 {
     printf 'SNOWTUNER_SNOWFLAKE_ACCOUNT=%s\n'        "$(extract account)"
     printf 'SNOWTUNER_SNOWFLAKE_USER=%s\n'           "$(extract user)"
-    printf 'SNOWTUNER_SNOWFLAKE_AUTHENTICATOR=%s\n'  "keypair"
+    # NOTE: must match the AuthMethod enum value in src/snowtuner/credentials/model.py
+    # — that's "key_pair" with an underscore.  Spelling "keypair" or "key-pair" silently
+    # falls back to PASSWORD mode and yields a confusing "password auth requires a
+    # password" downstream.  env_backend.py also normalizes both forms as belt-and-suspenders.
+    printf 'SNOWTUNER_SNOWFLAKE_AUTHENTICATOR=%s\n'  "key_pair"
     printf 'SNOWTUNER_SNOWFLAKE_PRIVATE_KEY_PATH=%s\n' "${KEY_PATH}"
     wh="$(extract_optional warehouse)"
     [[ -n "${wh}" ]] && printf 'SNOWTUNER_SNOWFLAKE_WAREHOUSE=%s\n' "${wh}"
