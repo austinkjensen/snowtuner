@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from snowtuner.api.schemas import (
@@ -172,22 +172,21 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    @app.middleware("http")
-    async def strip_api_prefix(request, call_next):
-        """Rewrite ``/api/<path>`` to ``/<path>`` before route matching.
-
-        The React SPA in ``web/`` calls ``/api/*`` everywhere — that's the
-        path Vite's dev proxy serves.  In production we mount the built SPA
-        at ``/`` and run the API on the same origin (no proxy), so the
-        ``/api`` prefix would otherwise miss every route.  Stripping it here
-        keeps dev and prod aligned without needing to re-prefix every
-        ``@app.get(...)`` and every test.  TODO: real fix is to refactor
-        all routes under an APIRouter with ``prefix='/api'``.
-        """
-        if request.url.path.startswith("/api/"):
-            request.scope["path"] = request.url.path[4:]
-            request.scope["raw_path"] = request.scope["path"].encode("ascii")
-        return await call_next(request)
+    # ── Routing structure ─────────────────────────────────────────
+    # All API endpoints live under ``/api/*`` via this router, mounted at
+    # the bottom of ``create_app()``.  The SPA's ``lib/api.ts`` uses
+    # ``BASE = '/api'`` and Vite's dev proxy strips that prefix for the
+    # backend in dev, so in production we just expose the prefix natively.
+    # Two endpoints stay at the bare root by ops convention:
+    #
+    #   * ``/health`` — load-balancer / probe target, must be public + cheap
+    #   * ``/version`` — unauthenticated discovery / "is this snowtuner?"
+    #
+    # FastAPI's auto-generated ``/openapi.json``, ``/docs``, ``/redoc`` also
+    # stay at root (the openapi-typescript gen-types script in web/ hits
+    # ``http://localhost:8770/openapi.json`` to regenerate the SPA's typed
+    # API client).
+    router = APIRouter()
 
     @app.get("/version")
     def version_info() -> dict[str, str]:
@@ -206,7 +205,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     # ── Recommender discovery ─────────────────────────────────────
-    @app.get("/recommenders", response_model=list[RecommenderInfo])
+    @router.get("/recommenders", response_model=list[RecommenderInfo])
     def list_recommenders(
         reg: RecommenderRegistry = Depends(_get_registry),
     ) -> list[RecommenderInfo]:
@@ -222,7 +221,7 @@ def create_app() -> FastAPI:
         ]
 
     # ── Running ───────────────────────────────────────────────────
-    @app.post("/orchestrator/run", response_model=RunResponse)
+    @router.post("/orchestrator/run", response_model=RunResponse)
     def run_all(
         req: RunRequest = RunRequest(),
         reg: RecommenderRegistry = Depends(_get_registry),
@@ -260,7 +259,7 @@ def create_app() -> FastAPI:
             ],
         )
 
-    @app.post("/recommenders/{name}/run", response_model=RunRecommenderReport)
+    @router.post("/recommenders/{name}/run", response_model=RunRecommenderReport)
     def run_one(
         name: str,
         req: RunRequest = RunRequest(),
@@ -292,7 +291,7 @@ def create_app() -> FastAPI:
             raise HTTPException(500, "orchestrator returned no results")
         return RunRecommenderReport(**vars(report.recommender_results[0]))
 
-    @app.post("/features/run")
+    @router.post("/features/run")
     def run_features() -> dict[str, list[dict[str, float | str]]]:
         pipeline = FeaturePipeline(DEFAULT_TRANSFORMS)
         results = pipeline.run(get_connection())
@@ -303,7 +302,7 @@ def create_app() -> FastAPI:
             ]
         }
 
-    @app.post("/sync/backfill")
+    @router.post("/sync/backfill")
     def run_backfill(
         days: int = Query(..., gt=0, le=365),
         source: str | None = Query(None),
@@ -360,7 +359,7 @@ def create_app() -> FastAPI:
             ],
         }
 
-    @app.post("/sync/run")
+    @router.post("/sync/run")
     def run_sync() -> dict[str, Any]:
         """Run sync only (no features, no recommenders).
 
@@ -395,7 +394,7 @@ def create_app() -> FastAPI:
         }
 
     # ── Recommendations ───────────────────────────────────────────
-    @app.get("/recommendations", response_model=list[RecommendationOut])
+    @router.get("/recommendations", response_model=list[RecommendationOut])
     def list_recs(
         status: RecommendationStatus = RecommendationStatus.PROPOSED,
         action_type: str | None = None,
@@ -405,7 +404,7 @@ def create_app() -> FastAPI:
         recs = store.list(status=status, action_type=action_type, limit=limit)
         return [RecommendationOut.from_model(r) for r in recs]
 
-    @app.get("/recommendations/{rec_id}", response_model=RecommendationOut)
+    @router.get("/recommendations/{rec_id}", response_model=RecommendationOut)
     def get_rec(
         rec_id: int,
         store: RecommendationStore = Depends(_get_store),
@@ -415,7 +414,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"recommendation {rec_id} not found")
         return RecommendationOut.from_model(rec)
 
-    @app.post("/recommendations/{rec_id}/accept", response_model=RecommendationOut)
+    @router.post("/recommendations/{rec_id}/accept", response_model=RecommendationOut)
     def accept(
         rec_id: int,
         body: StatusUpdateRequest = StatusUpdateRequest(),
@@ -438,7 +437,7 @@ def create_app() -> FastAPI:
         )
         return RecommendationOut.from_model(store.get(rec_id))  # type: ignore[arg-type]
 
-    @app.post("/recommendations/{rec_id}/reject", response_model=RecommendationOut)
+    @router.post("/recommendations/{rec_id}/reject", response_model=RecommendationOut)
     def reject(
         rec_id: int,
         body: StatusUpdateRequest = StatusUpdateRequest(),
@@ -468,11 +467,11 @@ def create_app() -> FastAPI:
     def _apps_store() -> AutonomousApplicationStore:
         return AutonomousApplicationStore(get_connection())
 
-    @app.get("/autonomous/config", response_model=list[AutonomousConfigOut])
+    @router.get("/autonomous/config", response_model=list[AutonomousConfigOut])
     def autonomous_list() -> list[AutonomousConfigOut]:
         return [AutonomousConfigOut(**c.__dict__) for c in _config_store().list()]
 
-    @app.put(
+    @router.put(
         "/autonomous/config/{action_type}/{warehouse_name}/{knob}",
         response_model=AutonomousConfigOut,
     )
@@ -489,14 +488,14 @@ def create_app() -> FastAPI:
         )
         return AutonomousConfigOut(**cfg.__dict__)
 
-    @app.delete("/autonomous/config/{action_type}/{warehouse_name}/{knob}")
+    @router.delete("/autonomous/config/{action_type}/{warehouse_name}/{knob}")
     def autonomous_delete(
         action_type: str, warehouse_name: str, knob: str,
     ) -> dict[str, str]:
         _config_store().delete(action_type, warehouse_name, knob)
         return {"status": "deleted"}
 
-    @app.post(
+    @router.post(
         "/autonomous/config/{action_type}/{warehouse_name}/{knob}/reset-circuit"
     )
     def autonomous_reset_circuit(
@@ -505,7 +504,7 @@ def create_app() -> FastAPI:
         _config_store().reset_circuit(action_type, warehouse_name, knob)
         return {"status": "circuit reset"}
 
-    @app.get(
+    @router.get(
         "/autonomous/applications",
         response_model=list[AutonomousApplicationOut],
     )
@@ -522,7 +521,7 @@ def create_app() -> FastAPI:
             for r in rows
         ]
 
-    @app.post("/autonomous/applications/{application_id}/rollback")
+    @router.post("/autonomous/applications/{application_id}/rollback")
     def autonomous_rollback(application_id: int) -> dict[str, str]:
         try:
             client = SnowflakeClient.from_resolver()
@@ -538,7 +537,7 @@ def create_app() -> FastAPI:
         return {"status": "rolled back", "application_id": str(application_id)}
 
     # ── Warehouses + status ───────────────────────────────────────
-    @app.get("/warehouses", response_model=list[WarehouseSummaryOut])
+    @router.get("/warehouses", response_model=list[WarehouseSummaryOut])
     def list_warehouses() -> list[WarehouseSummaryOut]:
         conn = get_connection()
         rows = conn.execute(
@@ -569,7 +568,7 @@ def create_app() -> FastAPI:
             for r in rows
         ]
 
-    @app.get("/events", response_model=EventsResponse)
+    @router.get("/events", response_model=EventsResponse)
     def list_events(
         actor: str | None = Query(None, description="Filter by exact actor"),
         action: str | None = Query(None, description="Filter by exact action verb"),
@@ -660,7 +659,7 @@ def create_app() -> FastAPI:
             ))
         return EventsResponse(rows=out, total=int(total), limit=limit, offset=offset)
 
-    @app.get("/automation/status", response_model=AutomationStatusOut)
+    @router.get("/automation/status", response_model=AutomationStatusOut)
     def get_automation_status() -> AutomationStatusOut:
         """Snapshot the AutomationLoop's state.
 
@@ -701,7 +700,7 @@ def create_app() -> FastAPI:
             last_tick=last_tick_out,
         )
 
-    @app.post("/automation/run-now", response_model=TickReportOut)
+    @router.post("/automation/run-now", response_model=TickReportOut)
     def run_automation_now() -> TickReportOut:
         """Trigger one tick of the AutomationLoop synchronously.
 
@@ -734,7 +733,7 @@ def create_app() -> FastAPI:
             skip_reason=report.skip_reason,
         )
 
-    @app.get("/schema/drift", response_model=DriftReportOut)
+    @router.get("/schema/drift", response_model=DriftReportOut)
     def get_schema_drift() -> DriftReportOut:
         """Compare each source's expected Snowflake columns against the live
         view's actual columns.
@@ -763,7 +762,7 @@ def create_app() -> FastAPI:
             any_actionable=report.any_actionable,
         )
 
-    @app.get("/status", response_model=StatusOut)
+    @router.get("/status", response_model=StatusOut)
     def get_status() -> StatusOut:
         conn = get_connection()
         sources_meta = [
@@ -835,7 +834,7 @@ def create_app() -> FastAPI:
         )
 
     # ── Credentials (read-only summary + connectivity test) ─────────
-    @app.get("/credentials", response_model=CredentialStatusOut)
+    @router.get("/credentials", response_model=CredentialStatusOut)
     def get_credentials() -> CredentialStatusOut:
         from snowtuner.credentials import CredentialResolver
         result = CredentialResolver().load()
@@ -853,7 +852,7 @@ def create_app() -> FastAPI:
             private_key_path=c.private_key_path,
         )
 
-    @app.post("/credentials/verify", response_model=CredentialVerifyOut)
+    @router.post("/credentials/verify", response_model=CredentialVerifyOut)
     def verify_credentials() -> CredentialVerifyOut:
         from snowtuner.credentials import CredentialResolver
         from snowtuner.ingestion.snowflake_client import SnowflakeClient
@@ -890,7 +889,7 @@ def create_app() -> FastAPI:
     def _experiment_store() -> ExperimentStore:
         return ExperimentStore(get_connection())
 
-    @app.get("/experiments/recipes", response_model=list[RecipeInfo])
+    @router.get("/experiments/recipes", response_model=list[RecipeInfo])
     def list_recipes() -> list[RecipeInfo]:
         out: list[RecipeInfo] = []
         for name, recipe in PRESET_RECIPES.items():
@@ -898,7 +897,7 @@ def create_app() -> FastAPI:
             out.append(RecipeInfo(name=name, summary=doc))
         return out
 
-    @app.get("/experiments", response_model=list[Experiment])
+    @router.get("/experiments", response_model=list[Experiment])
     def list_experiments(
         status: ExperimentStatus | None = None,
         target_warehouse: str | None = None,
@@ -909,7 +908,7 @@ def create_app() -> FastAPI:
             status=status, target_warehouse=target_warehouse, limit=limit,
         )
 
-    @app.get("/experiments/{experiment_id}", response_model=Experiment)
+    @router.get("/experiments/{experiment_id}", response_model=Experiment)
     def get_experiment(
         experiment_id: int,
         store: ExperimentStore = Depends(_experiment_store),
@@ -919,7 +918,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"experiment {experiment_id} not found")
         return exp
 
-    @app.get("/experiments/{experiment_id}/runs", response_model=list[ExperimentRun])
+    @router.get("/experiments/{experiment_id}/runs", response_model=list[ExperimentRun])
     def list_experiment_runs(
         experiment_id: int,
         arm_name: str | None = None,
@@ -929,7 +928,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"experiment {experiment_id} not found")
         return store.runs_for(experiment_id, arm_name=arm_name)
 
-    @app.post("/experiments/propose", response_model=Experiment)
+    @router.post("/experiments/propose", response_model=Experiment)
     def propose_experiment(
         req: ProposeExperimentRequest,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1010,7 +1009,7 @@ def create_app() -> FastAPI:
         )
         return store.get(new_id)  # type: ignore[return-value]
 
-    @app.post("/experiments/propose-benchmark", response_model=Experiment)
+    @router.post("/experiments/propose-benchmark", response_model=Experiment)
     def propose_benchmark_experiment(
         req: ProposeBenchmarkRequest,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1182,7 +1181,7 @@ def create_app() -> FastAPI:
         )
         return store.get(new_id)  # type: ignore[return-value]
 
-    @app.post("/experiments/{experiment_id}/accept", response_model=Experiment)
+    @router.post("/experiments/{experiment_id}/accept", response_model=Experiment)
     def accept_experiment(
         experiment_id: int,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1217,7 +1216,7 @@ def create_app() -> FastAPI:
         )
         return store.get(experiment_id)  # type: ignore[return-value]
 
-    @app.post("/experiments/{experiment_id}/reject", response_model=Experiment)
+    @router.post("/experiments/{experiment_id}/reject", response_model=Experiment)
     def reject_experiment(
         experiment_id: int,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1244,7 +1243,7 @@ def create_app() -> FastAPI:
         )
         return store.get(experiment_id)  # type: ignore[return-value]
 
-    @app.delete(
+    @router.delete(
         "/experiments/{experiment_id}/sampled-queries/{query_id}",
         response_model=Experiment,
     )
@@ -1336,7 +1335,7 @@ def create_app() -> FastAPI:
         store.set_proposed(experiment_id, new_proposed)
         return store.get(experiment_id)  # type: ignore[return-value]
 
-    @app.post("/experiments/{experiment_id}/backfill-metrics")
+    @router.post("/experiments/{experiment_id}/backfill-metrics")
     def backfill_experiment_metrics(
         experiment_id: int,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1364,7 +1363,7 @@ def create_app() -> FastAPI:
         except ValueError as e:
             raise HTTPException(409, str(e))
 
-    @app.post("/experiments/{experiment_id}/run", response_model=Experiment)
+    @router.post("/experiments/{experiment_id}/run", response_model=Experiment)
     def run_experiment(
         experiment_id: int,
         store: ExperimentStore = Depends(_experiment_store),
@@ -1416,7 +1415,7 @@ def create_app() -> FastAPI:
         # caller polls for transitions.
         return store.get(experiment_id)  # type: ignore[return-value]
 
-    @app.post("/experiments/{experiment_id}/abort", response_model=Experiment)
+    @router.post("/experiments/{experiment_id}/abort", response_model=Experiment)
     def abort_experiment(
         experiment_id: int,
         body: AbortExperimentRequest,
@@ -1456,7 +1455,7 @@ def create_app() -> FastAPI:
         return store.get(experiment_id)  # type: ignore[return-value]
 
     # ── Queries explorer ──────────────────────────────────────────
-    @app.get("/queries", response_model=QueryListResponse)
+    @router.get("/queries", response_model=QueryListResponse)
     def list_queries(
         warehouse: str | None = Query(None, description="Comma-separated warehouse names"),
         user: str | None = Query(None, description="Comma-separated user names"),
@@ -1569,7 +1568,7 @@ def create_app() -> FastAPI:
             total=total, limit=limit, offset=offset,
         )
 
-    @app.get("/queries/facets", response_model=QueryFilterFacets)
+    @router.get("/queries/facets", response_model=QueryFilterFacets)
     def query_facets(
         lookback_days: int = Query(30, ge=1, le=365),
         semantic_limit: int = Query(
@@ -1627,7 +1626,7 @@ def create_app() -> FastAPI:
             where_columns=_semantic("query_where_columns", "column_ref"),
         )
 
-    @app.get("/queries/{query_id}", response_model=QueryDetail)
+    @router.get("/queries/{query_id}", response_model=QueryDetail)
     def get_query(query_id: str) -> QueryDetail:
         conn = get_connection()
         row = conn.execute(
@@ -1681,7 +1680,7 @@ def create_app() -> FastAPI:
             where_columns=[str(r[0]) for r in col_rows],
         )
 
-    @app.get("/query-families", response_model=list[QueryFamily])
+    @router.get("/query-families", response_model=list[QueryFamily])
     def list_query_families(
         warehouse: str | None = Query(None, description="Comma-separated warehouse names"),
         user: str | None = Query(None, description="Comma-separated user names"),
@@ -1779,7 +1778,7 @@ def create_app() -> FastAPI:
     def _group_store() -> QueryGroupStore:
         return QueryGroupStore(get_connection())
 
-    @app.post("/query-groups", response_model=QueryGroup)
+    @router.post("/query-groups", response_model=QueryGroup)
     def create_query_group(
         req: CreateQueryGroupRequest,
         store: QueryGroupStore = Depends(_group_store),
@@ -1825,7 +1824,7 @@ def create_app() -> FastAPI:
         group.member_count = _group_member_count(group)
         return group
 
-    @app.get("/query-groups", response_model=list[QueryGroup])
+    @router.get("/query-groups", response_model=list[QueryGroup])
     def list_query_groups(
         kind: str | None = Query(None, description="Filter to 'static' or 'dynamic'"),
         limit: int = Query(200, ge=1, le=500),
@@ -1842,7 +1841,7 @@ def create_app() -> FastAPI:
             g.member_count = _group_member_count(g)
         return groups
 
-    @app.get("/query-groups/{group_id}", response_model=QueryGroup)
+    @router.get("/query-groups/{group_id}", response_model=QueryGroup)
     def get_query_group(
         group_id: int,
         store: QueryGroupStore = Depends(_group_store),
@@ -1853,7 +1852,7 @@ def create_app() -> FastAPI:
         group.member_count = _group_member_count(group)
         return group
 
-    @app.delete("/query-groups/{group_id}")
+    @router.delete("/query-groups/{group_id}")
     def delete_query_group(
         group_id: int,
         store: QueryGroupStore = Depends(_group_store),
@@ -1862,7 +1861,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, f"query group {group_id} not found")
         return {"status": "deleted", "id": str(group_id)}
 
-    @app.get("/query-groups/{group_id}/members", response_model=QueryListResponse)
+    @router.get("/query-groups/{group_id}/members", response_model=QueryListResponse)
     def query_group_members(
         group_id: int,
         limit: int = Query(50, ge=1, le=500),
@@ -1942,7 +1941,7 @@ def create_app() -> FastAPI:
         )
 
     # ── Self-documentation (Docs tab) ─────────────────────────────
-    @app.get("/cli-help", response_model=CliCommand)
+    @router.get("/cli-help", response_model=CliCommand)
     def cli_help() -> CliCommand:
         """Introspect the snowtuner CLI and return a structured tree of commands.
 
@@ -1953,7 +1952,7 @@ def create_app() -> FastAPI:
         from snowtuner.cli import cli as snowtuner_cli
         return _introspect_click_command(snowtuner_cli, "snowtuner", ["snowtuner"])
 
-    @app.get("/mcp-tools", response_model=list[McpToolInfo])
+    @router.get("/mcp-tools", response_model=list[McpToolInfo])
     def mcp_tools_list() -> list[McpToolInfo]:
         """List MCP tools registered on the admin server with descriptions and
         JSON-schema parameter specs.  Used by the web UI's Docs tab."""
@@ -1973,9 +1972,17 @@ def create_app() -> FastAPI:
         return out
 
     # ── Dev helpers ───────────────────────────────────────────────
-    @app.post("/seed")
+    @router.post("/seed")
     def seed(req: SeedRequest = SeedRequest()) -> dict[str, int]:
         return seed_demo_data(get_connection(), days=req.days, seed=req.seed)
+
+    # ── Wire the router under /api ────────────────────────────────
+    # All routes above were registered on ``router`` (an APIRouter); attach
+    # them to the app with the ``/api`` prefix here so they're reachable at
+    # ``/api/<path>``.  Must happen BEFORE the static mount below — FastAPI
+    # matches routes in include order, and the static mount at ``/`` is a
+    # catch-all that would otherwise win.
+    app.include_router(router, prefix="/api")
 
     # ── Built SPA (production only) ───────────────────────────────
     # When ``SNOWTUNER_STATIC_DIR`` is set, mount the built React SPA at ``/``
@@ -1985,7 +1992,7 @@ def create_app() -> FastAPI:
     # client-side router (TanStack Router) handles deep links like
     # ``/experiments/42`` after a hard refresh.
     #
-    # This mount goes LAST so all the ``@app.get(...)`` routes above match
+    # This mount goes LAST so all the ``@router.get(...)`` routes above match
     # first; the static handler only sees requests that didn't hit an API
     # endpoint.  In dev (``npm run dev``) Vite serves the SPA on a different
     # port and proxies ``/api/*`` over here — env var stays unset.

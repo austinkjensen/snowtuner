@@ -55,8 +55,14 @@ def _auth_headers() -> dict[str, str]:
 
 
 def _client() -> httpx.Client:
+    # All admin API routes live under ``/api/*`` (see
+    # ``snowtuner.api.app.create_app`` — APIRouter mounted at that prefix).
+    # Append it once here so individual ``_get`` / ``_post`` calls keep using
+    # the short, route-name-only paths.
     return httpx.Client(
-        base_url=_api_url(), timeout=30.0, headers=_auth_headers(),
+        base_url=_api_url().rstrip("/") + "/api",
+        timeout=30.0,
+        headers=_auth_headers(),
     )
 
 

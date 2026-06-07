@@ -48,7 +48,7 @@ def _seed_events(n_user: int = 3, n_automation: int = 2, n_failed: int = 1) -> N
 class TestEventsQueryFilters:
     def test_no_filter_returns_all(self, api_client):
         _seed_events()
-        r = api_client.get("/events")
+        r = api_client.get("/api/events")
         assert r.status_code == 200
         body = r.json()
         # 3 user + 2 automation + 1 failed = 6
@@ -57,34 +57,34 @@ class TestEventsQueryFilters:
 
     def test_filter_by_actor(self, api_client):
         _seed_events()
-        r = api_client.get("/events?actor=user")
+        r = api_client.get("/api/events?actor=user")
         assert r.json()["total"] == 3
 
     def test_filter_by_action(self, api_client):
         _seed_events()
-        r = api_client.get("/events?action=sync.source.failure")
+        r = api_client.get("/api/events?action=sync.source.failure")
         assert r.json()["total"] == 1
         assert r.json()["rows"][0]["error"] == "connection refused"
 
     def test_filter_by_action_prefix(self, api_client):
         _seed_events()
         # 'recommendation.' matches all 3 user events (which use recommendation.accept)
-        r = api_client.get("/events?action_prefix=recommendation.")
+        r = api_client.get("/api/events?action_prefix=recommendation.")
         assert r.json()["total"] == 3
 
     def test_filter_by_outcome(self, api_client):
         _seed_events()
-        r = api_client.get("/events?outcome=failed")
+        r = api_client.get("/api/events?outcome=failed")
         assert r.json()["total"] == 1
 
     def test_filter_by_subject(self, api_client):
         _seed_events()
-        r = api_client.get("/events?subject=0")
+        r = api_client.get("/api/events?subject=0")
         assert r.json()["total"] == 1
 
     def test_ordering_is_newest_first(self, api_client):
         _seed_events()
-        r = api_client.get("/events")
+        r = api_client.get("/api/events")
         rows = r.json()["rows"]
         # Each event has a strictly-increasing ID (the sequence) so
         # descending-by-(timestamp, id) puts the highest ID first.
@@ -93,8 +93,8 @@ class TestEventsQueryFilters:
 
     def test_pagination(self, api_client):
         _seed_events(n_user=10, n_automation=0, n_failed=0)
-        page1 = api_client.get("/events?limit=3&offset=0").json()
-        page2 = api_client.get("/events?limit=3&offset=3").json()
+        page1 = api_client.get("/api/events?limit=3&offset=0").json()
+        page2 = api_client.get("/api/events?limit=3&offset=3").json()
         # Total stays the same across pages
         assert page1["total"] == page2["total"] == 10
         # No overlap between pages
@@ -115,7 +115,7 @@ class TestEventsQueryFilters:
         cutoff = (
             datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
         ).isoformat()
-        r = api_client.get(f"/events?since={cutoff}")
+        r = api_client.get(f"/api/events?since={cutoff}")
         actions = {row["action"] for row in r.json()["rows"]}
         assert "new.event" in actions
         assert "old.event" not in actions
@@ -161,15 +161,15 @@ class TestEventsAsAuditSideEffect:
     def test_accept_writes_event(self, api_client):
         rec_id = self._seed_one_recommendation()
         # No events yet
-        assert api_client.get("/events?actor=user").json()["total"] == 0
+        assert api_client.get("/api/events?actor=user").json()["total"] == 0
 
         r = api_client.post(
-            f"/recommendations/{rec_id}/accept",
+            f"/api/recommendations/{rec_id}/accept",
             json={"note": "looks good"},
         )
         assert r.status_code == 200
 
-        events = api_client.get("/events?action=recommendation.accept").json()
+        events = api_client.get("/api/events?action=recommendation.accept").json()
         assert events["total"] == 1
         event = events["rows"][0]
         assert event["subject"] == str(rec_id)
@@ -179,10 +179,10 @@ class TestEventsAsAuditSideEffect:
     def test_reject_writes_event(self, api_client):
         rec_id = self._seed_one_recommendation()
         r = api_client.post(
-            f"/recommendations/{rec_id}/reject",
+            f"/api/recommendations/{rec_id}/reject",
             json={"note": "not this one"},
         )
         assert r.status_code == 200
-        events = api_client.get("/events?action=recommendation.reject").json()
+        events = api_client.get("/api/events?action=recommendation.reject").json()
         assert events["total"] == 1
         assert events["rows"][0]["subject"] == str(rec_id)

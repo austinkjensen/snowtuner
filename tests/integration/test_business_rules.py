@@ -46,16 +46,16 @@ def _seed_recommendation(status: str = "PROPOSED") -> int:
 
 class TestRecommendationBusinessRules:
     def test_accept_nonexistent_returns_404(self, api_client):
-        r = api_client.post("/recommendations/99999/accept", json={})
+        r = api_client.post("/api/recommendations/99999/accept", json={})
         assert r.status_code == 404
 
     def test_reject_nonexistent_returns_404(self, api_client):
-        r = api_client.post("/recommendations/99999/reject", json={})
+        r = api_client.post("/api/recommendations/99999/reject", json={})
         assert r.status_code == 404
 
     def test_accept_then_status_is_accepted(self, api_client):
         rid = _seed_recommendation()
-        r = api_client.post(f"/recommendations/{rid}/accept", json={})
+        r = api_client.post(f"/api/recommendations/{rid}/accept", json={})
         assert r.status_code == 200
         assert r.json()["status"] == "ACCEPTED"
 
@@ -65,15 +65,15 @@ class TestSyncBackfillValidation:
     constraints (gt=0, le=365).  Verify those fire."""
 
     def test_zero_days_is_rejected(self, api_client):
-        r = api_client.post("/sync/backfill?days=0")
+        r = api_client.post("/api/sync/backfill?days=0")
         assert r.status_code == 422  # FastAPI validation error
 
     def test_negative_days_is_rejected(self, api_client):
-        r = api_client.post("/sync/backfill?days=-1")
+        r = api_client.post("/api/sync/backfill?days=-1")
         assert r.status_code == 422
 
     def test_over_max_days_is_rejected(self, api_client):
-        r = api_client.post("/sync/backfill?days=400")
+        r = api_client.post("/api/sync/backfill?days=400")
         assert r.status_code == 422
 
 
@@ -81,15 +81,15 @@ class TestEventsQueryValidation:
     """``GET /events?limit=`` is constrained gt=0 le=1000."""
 
     def test_limit_zero_rejected(self, api_client):
-        r = api_client.get("/events?limit=0")
+        r = api_client.get("/api/events?limit=0")
         assert r.status_code == 422
 
     def test_limit_too_large_rejected(self, api_client):
-        r = api_client.get("/events?limit=10000")
+        r = api_client.get("/api/events?limit=10000")
         assert r.status_code == 422
 
     def test_offset_negative_rejected(self, api_client):
-        r = api_client.get("/events?offset=-1")
+        r = api_client.get("/api/events?offset=-1")
         assert r.status_code == 422
 
 
@@ -111,12 +111,12 @@ class TestHealthAndStatus:
 
     def test_recommendations_empty_list(self, api_client):
         # No recs seeded — should return empty list, not 500
-        r = api_client.get("/recommendations")
+        r = api_client.get("/api/recommendations")
         assert r.status_code == 200
         assert r.json() == []
 
     def test_events_empty(self, api_client):
-        r = api_client.get("/events")
+        r = api_client.get("/api/events")
         assert r.status_code == 200
         body = r.json()
         assert body["total"] == 0

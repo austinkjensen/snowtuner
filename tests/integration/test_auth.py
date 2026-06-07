@@ -42,7 +42,7 @@ def _make_token_client(monkeypatch, tmp_path) -> Iterator[tuple[TestClient, str]
 class TestNoneMode:
     def test_loopback_request_succeeds(self, api_client):
         # TestClient connects from 127.0.0.1; 'none' mode authorizes it.
-        r = api_client.get("/recommendations")
+        r = api_client.get("/api/recommendations")
         assert r.status_code == 200
 
     def test_health_endpoint_always_accessible(self, api_client):
@@ -58,14 +58,14 @@ class TestTokenMode:
 
     def test_missing_bearer_returns_401(self, token_client):
         client, _ = token_client
-        r = client.get("/recommendations")
+        r = client.get("/api/recommendations")
         assert r.status_code == 401
         assert "missing Authorization" in r.json()["detail"]
 
     def test_wrong_bearer_returns_401(self, token_client):
         client, _ = token_client
         r = client.get(
-            "/recommendations",
+            "/api/recommendations",
             headers={"Authorization": "Bearer wrong-token"},
         )
         assert r.status_code == 401
@@ -74,7 +74,7 @@ class TestTokenMode:
     def test_correct_bearer_passes(self, token_client):
         client, token = token_client
         r = client.get(
-            "/recommendations",
+            "/api/recommendations",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert r.status_code == 200
