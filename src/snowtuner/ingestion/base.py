@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -62,6 +63,24 @@ class Source(ABC):
     @abstractmethod
     def upsert(self, conn: duckdb.DuckDBPyConnection, rows: list[dict[str, Any]]) -> None:
         """Insert or upsert rows into DuckDB."""
+
+    def fetch_chunked(
+        self, client: SnowflakeClient, since: datetime | None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield rows in memory-bounded chunks.
+
+        Default implementation: call ``fetch()`` and yield the whole result
+        as a single chunk.  Sources that pull large fact tables
+        (``QUERY_HISTORY``, anything per-query-per-day) should override this
+        to slice the time window and yield one chunk per slice, so the
+        orchestrator can ``upsert`` and free each batch before the next.
+
+        Returning early (no rows in a slice) is fine — the orchestrator
+        accepts an empty iterator as "nothing to sync."
+        """
+        rows = self.fetch(client, since)
+        if rows:
+            yield rows
 
     def get_high_water(self, conn: duckdb.DuckDBPyConnection) -> datetime | None:
         row = conn.execute(

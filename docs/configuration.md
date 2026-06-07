@@ -10,7 +10,7 @@ These mirror the Snowflake connector's standard names. `snowtuner init` writes t
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SNOWFLAKE_ACCOUNT` | — | Account identifier (e.g. `xyz12345.us-east-1`). |
+| `SNOWFLAKE_ACCOUNT` | - | Account identifier (e.g. `xyz12345.us-east-1`). |
 | `SNOWFLAKE_USER` | `SNOWTUNER_SVC` | Service user created by `snowtuner bootstrap-sql`. |
 | `SNOWFLAKE_ROLE` | `SNOWTUNER_ROLE` | Role granted ACCOUNT_USAGE access. |
 | `SNOWFLAKE_WAREHOUSE` | `SNOWTUNER_WH` | Warehouse used for snowtuner's own metadata queries. |
@@ -37,7 +37,7 @@ The background runner that fires the full pipeline (`sync → features → recom
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SNOWTUNER_AUTOMATION_INTERVAL` | `0` (disabled) | Seconds between ticks. `3600` (hourly) is the recommended production setting — matches Snowflake `ACCOUNT_USAGE`'s ~45-minute refresh cadence. |
+| `SNOWTUNER_AUTOMATION_INTERVAL` | `0` (disabled) | Seconds between ticks. `3600` (hourly) is the recommended production setting - matches Snowflake `ACCOUNT_USAGE`'s ~45-minute refresh cadence. |
 | `SNOWTUNER_AUTOMATION_ON_START` | `false` | If `true`, block API startup until the first tick completes. Used by ephemeral container deployments that want guaranteed-fresh state before accepting traffic. |
 
 A tick that fails on the sync stage aborts the rest of the pipeline ("fail-fast") and retries next interval. While an experiment is in `RUNNING` state, the autonomous stage defers automatically to avoid corrupting in-flight measurements. Inspect tick history via `GET /automation/status` or the freshness pill in the nav bar.

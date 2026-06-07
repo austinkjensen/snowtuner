@@ -4,11 +4,11 @@ Single source of truth: [`src/snowtuner/storage/schema.py`](../src/snowtuner/sto
 
 Three logical schemas:
 
-- **`raw.*`** — mirrors of Snowflake views/SHOW output. Populated by
+- **`raw.*`** - mirrors of Snowflake views/SHOW output. Populated by
   `ingestion/sources/*`. Treat as append-only telemetry.
-- **`features.*`** — derived tables computed by `features/library/*` transforms.
+- **`features.*`** - derived tables computed by `features/library/*` transforms.
   Recomputed each run; idempotent.
-- **`app.*`** — application state. Recommendations, training state, sync
+- **`app.*`** - application state. Recommendations, training state, sync
   watermarks, routing rules, autonomous config, autonomous applications.
 
 ## Entity-relationship diagram
@@ -205,13 +205,13 @@ training-gate check), reactivation-gap distribution.
 
 ### `raw.warehouses`
 
-Full-refresh snapshot of `SHOW WAREHOUSES`. Watermark column is `None` —
+Full-refresh snapshot of `SHOW WAREHOUSES`. Watermark column is `None` -
 we DELETE + INSERT each sync. The `size` column is the non-canonical form
 Snowflake returns (e.g. `"X-Small"`); use `recommenders/sizes.normalize` to
 get a canonical form.
 
 > **Known issue (v0.1):** when autonomous mode applies an `ALTER WAREHOUSE`
-> change, this table doesn't get patched in-place — only the next full sync
+> change, this table doesn't get patched in-place - only the next full sync
 > sees the new value. This means a re-`run` between syncs may emit a duplicate
 > recommendation. Fix queued for a v0.1 patch.
 
@@ -251,7 +251,7 @@ mode applies. Catch-all rows use the literal string `'*'` for `warehouse_name`
 catch-all.
 
 When `circuit_open_until` is non-NULL and in the future, autonomous skips
-this `(action_type, warehouse_name)` until the timestamp passes — set by the
+this `(action_type, warehouse_name)` until the timestamp passes - set by the
 runner when rollback budget is exhausted.
 
 ### `app.autonomous_applications`
@@ -286,7 +286,7 @@ deletion.  See [docs/architecture.md](architecture.md) and
 [docs/configuration.md](configuration.md) for the preservation defaults.
 
 For backfilling more history without a destructive reset, use
-`snowtuner backfill --days N` — it resets just `app.sync_watermarks` and
+`snowtuner backfill --days N` - it resets just `app.sync_watermarks` and
 re-pulls, leaving every other table untouched.
 
 A real migration framework (Alembic-style versioned files or DuckDB-native

@@ -43,20 +43,32 @@ def sync_source(
             if lookback is not None:
                 since = datetime.now(timezone.utc) - timedelta(days=lookback)
 
-    rows = source.fetch(client, since)
-    source.upsert(conn, rows)
-
+    # Stream chunks instead of materializing the whole pull at once.  Sources
+    # that don't need chunking ship a default fetch_chunked() that yields
+    # one chunk = the result of fetch() — see ingestion/base.py.  Sources
+    # that do (query_history with multi-day lookbacks) yield one chunk per
+    # time slice and we upsert + free between them.
+    rows_ingested = 0
     new_high_water: datetime | None = None
-    if source.watermark_column and rows:
-        wm = source.watermark_column
-        vals = [r.get(wm) for r in rows if r.get(wm) is not None]
-        if vals:
-            new_high_water = max(vals)
-    source.set_high_water(conn, new_high_water or since, len(rows))
+    wm = source.watermark_column
+    for chunk in source.fetch_chunked(client, since):
+        source.upsert(conn, chunk)
+        rows_ingested += len(chunk)
+        if wm:
+            vals = [r.get(wm) for r in chunk if r.get(wm) is not None]
+            if vals:
+                chunk_max = max(vals)
+                # Track running max across chunks.  Use the chunk_max as the
+                # seed if no high-water seen yet, otherwise compare.
+                new_high_water = (
+                    chunk_max if new_high_water is None
+                    else max(new_high_water, chunk_max)
+                )
+    source.set_high_water(conn, new_high_water or since, rows_ingested)
 
     return SyncResult(
         source_name=source.name,
-        rows_ingested=len(rows),
+        rows_ingested=rows_ingested,
         high_water=new_high_water,
         duration_seconds=time.time() - t0,
     )

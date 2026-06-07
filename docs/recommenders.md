@@ -111,7 +111,7 @@ rec = Recommendation(
 )
 ```
 
-Don't render SQL strings yourself in the recommender — `Action.to_sql()` does
+Don't render SQL strings yourself in the recommender - `Action.to_sql()` does
 that. The orchestrator persists each recommendation through
 `RecommendationStore.insert(rec)` and supersedes prior open proposals from
 the same recommender.
@@ -131,7 +131,7 @@ def default_registry() -> RecommenderRegistry:
     return reg
 ```
 
-There is no third-party plugin discovery in v0.1 — registrations are explicit.
+There is no third-party plugin discovery in v0.1 - registrations are explicit.
 
 ## Things to avoid
 
@@ -140,7 +140,7 @@ There is no third-party plugin discovery in v0.1 — registrations are explicit.
   pure functions of (already-built feature tables, persisted model state).
 - **Don't share state between fit/predict via class attributes.** Use the
   `model_state` dict the orchestrator round-trips.
-- **Don't forget to set `current_value` on each `KnobChange`** — that's how
+- **Don't forget to set `current_value` on each `KnobChange`** - that's how
   rollback SQL gets rendered.
 - **Don't compete with another recommender for the same `target_resource()`**
   unless you want them to mutually-supersede. `AlterWarehouse.target_resource`

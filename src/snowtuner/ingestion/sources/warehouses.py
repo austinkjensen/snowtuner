@@ -25,6 +25,21 @@ from snowtuner.ingestion.base import Source, SnowflakeClient
 logger = logging.getLogger(__name__)
 
 
+# Per-process memo: which warehouses have already had their access-control
+# error logged.  The Gen2/QAS probes hit three parameters per warehouse,
+# and the typical access-control failure mode is "the role lacks MONITOR
+# on this warehouse" — same root cause for all three.  Without dedup,
+# every sync logs 3× warning lines per ungranted warehouse, drowning real
+# issues.  This set caps the noise at one informative line per warehouse
+# per process lifetime.  Cleared by tests via _reset_access_error_memo().
+_access_error_memo: set[str] = set()
+
+
+def _reset_access_error_memo() -> None:
+    """Test hook — clears the per-process access-error dedup memo."""
+    _access_error_memo.clear()
+
+
 _COLUMNS = [
     "name", "size", "min_cluster_count", "max_cluster_count",
     "auto_suspend_seconds", "auto_resume", "scaling_policy", "state", "comment",
@@ -136,6 +151,24 @@ def _fetch_parameter(
         v = rows[0][value_idx]
         return str(v) if v is not None else None
     except Exception as e:
+        # SQL access control error (Snowflake error code 42501) is by far
+        # the most common reason this fails — it just means the role lacks
+        # MONITOR on the warehouse.  Three probes per warehouse × N
+        # ungranted warehouses would spam the log; consolidate to one
+        # actionable line per warehouse per process.  Non-permission errors
+        # (network, edition restriction, etc.) still log per-probe so we
+        # can see anything weird.
+        err_str = str(e)
+        if "42501" in err_str or "access control" in err_str.lower():
+            if warehouse_name not in _access_error_memo:
+                _access_error_memo.add(warehouse_name)
+                logger.warning(
+                    "warehouse %r: no MONITOR privilege — Gen2/QAS detection "
+                    "skipped.  To enable, run as ACCOUNTADMIN: "
+                    "GRANT MONITOR ON WAREHOUSE %s TO ROLE <snowtuner-role>",
+                    warehouse_name, warehouse_name,
+                )
+            return None
         logger.warning(
             "could not fetch parameter %s for warehouse %r: %s",
             param_name, warehouse_name, e,

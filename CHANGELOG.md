@@ -5,7 +5,7 @@ All notable changes to snowtuner will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — Initial release
+## [0.1.0] - Initial release
 
 ### Added
 
@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP API** (FastAPI) at `snowtuner api`. Endpoints for recommendations,
   recommenders, autonomous config + applications, status, and warehouses.
 - **Streamlit UI** (`snowtuner ui`) with two tabs: Recommendations and
-  Autonomous mode. Talks to the API, never DuckDB directly — sidesteps the
+  Autonomous mode. Talks to the API, never DuckDB directly - sidesteps the
   single-writer constraint.
 - **Admin MCP server** (`snowtuner mcp`) for Claude Desktop. 13 tools wrapping
   the API. Lets you ask Claude *"what recommendations are open?"* / *"roll
@@ -73,10 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next `snowtuner sync` refreshes the snapshot.
 - Multi-cluster warehouse tuning, `CREATE WAREHOUSE`, query routing, and
   result caching are all v0.2.
-- No unit-test suite shipped with v0.1 — validation is by integration smoke
+- No unit-test suite shipped with v0.1 - validation is by integration smoke
   tests against synthetic data + dogfooding on a personal Snowflake account.
 - Right-sizing on Snowflake accounts with no spill / no queueing produces no
-  recommendations (intentional — see the README "How recommenders decide"
+  recommendations (intentional - see the README "How recommenders decide"
   section). This is correct for healthy small accounts but produces no demo
   output without the synthetic seed.
 

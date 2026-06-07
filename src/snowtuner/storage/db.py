@@ -61,9 +61,36 @@ def _ensure_master() -> duckdb.DuckDBPyConnection:
             path = db_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             _master = duckdb.connect(str(path))
+            _apply_runtime_pragmas(_master)
             from snowtuner.storage.schema import init_schema
             init_schema(_master)
     return _master
+
+
+def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection) -> None:
+    """Memory-bound DuckDB for the typical snowtuner deploy.
+
+    The default snowtuner CloudFormation instance is t3.medium (4 GB RAM)
+    with 2 GB swap.  DuckDB's default ``memory_limit`` is roughly 80% of
+    physical RAM, which puts ingest under real OOM pressure when 14 days
+    of ``QUERY_HISTORY`` arrive in a single transaction (observed during
+    AWS dogfooding: DuckDB hit its limit at 2.9 GB and aborted).
+
+    Two pragmas help:
+
+      * ``memory_limit`` — explicit cap.  Set below physical RAM so the
+        kernel still has headroom for the API process and SSM agent.
+      * ``preserve_insertion_order = false`` — DuckDB doesn't need to
+        buffer entire rowsets to keep input order, which cuts insert-side
+        memory roughly 2-3× on the workloads we care about.
+
+    Both env-overridable.  Operators on bigger boxes (t3.large = 8 GB,
+    m6i.xlarge = 16 GB) can set ``SNOWTUNER_DUCKDB_MEMORY_LIMIT`` higher
+    to get more parallelism / less swap pressure during sync.
+    """
+    mem_limit = os.environ.get("SNOWTUNER_DUCKDB_MEMORY_LIMIT", "3GB")
+    conn.execute(f"SET memory_limit = '{mem_limit}'")
+    conn.execute("SET preserve_insertion_order = false")
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:

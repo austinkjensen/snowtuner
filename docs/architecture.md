@@ -77,7 +77,7 @@ to enable; otherwise the API is fully passive and only fires the pipeline
 when manually triggered.
 
 The `ExperimentEngine` is the only component besides `AutonomousRunner` that
-*writes* to Snowflake — and unlike autonomous-apply (which alters production
+*writes* to Snowflake - and unlike autonomous-apply (which alters production
 warehouses), the engine only ever creates and drops disposable test warehouses
 named `SNOWTUNER_EXP_*`.
 
@@ -86,7 +86,7 @@ named `SNOWTUNER_EXP_*`.
 ```
 snowtuner/
 ├── src/snowtuner/            # Python package
-│   ├── cli.py                # Click CLI — every user-facing command
+│   ├── cli.py                # Click CLI - every user-facing command
 │   ├── format.py             # Display helpers (credit-delta formatting)
 │   ├── storage/
 │   │   ├── db.py             # Thread-safe DuckDB via per-thread cursors;
@@ -121,7 +121,7 @@ snowtuner/
 │   │   ├── base.py           # Action ABC: target_resource, to_sql, apply, etc.
 │   │   ├── alter_warehouse.py# The action type used by both built-in recommenders
 │   │   ├── create_warehouse.py  # Stub (roadmap)
-│   │   ├── local_table.py    # Stub (roadmap — caching direction)
+│   │   ├── local_table.py    # Stub (roadmap - caching direction)
 │   │   └── registry.py       # Action subclass dispatch by ActionType
 │   ├── recommendations/
 │   │   ├── model.py          # Recommendation, EvidenceRef, Impact
@@ -136,7 +136,7 @@ snowtuner/
 │   │       ├── auto_suspend_tuner.py      # Earlier p25-heuristic version (kept for contrast)
 │   │       ├── rule_based_right_sizer.py  # WAREHOUSE_SIZE rule-based tuner (registered)
 │   │       └── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
-│   ├── experiments/           # v0.2 — replay-experiments framework
+│   ├── experiments/           # v0.2 - replay-experiments framework
 │   │   ├── axes.py            # Generation / QASState enums
 │   │   ├── config_delta.py    # WarehouseConfigDelta + WarehouseConfig (merge, render)
 │   │   ├── arm.py             # Arm = (name, delta, eligibility_issues)
@@ -153,7 +153,7 @@ snowtuner/
 │   │   ├── engine.py          # ExperimentEngine: orchestrates a full run end-to-end
 │   │   ├── backfill.py        # Post-hoc metric recovery from ACCOUNT_USAGE.QUERY_HISTORY
 │   │   └── store.py           # CRUD over app.experiments + app.experiment_runs
-│   ├── query_groups/          # v0.2 — saved filter sets
+│   ├── query_groups/          # v0.2 - saved filter sets
 │   │   ├── model.py           # QueryFilterSpec, QueryGroup, QueryGroupKind (static|dynamic)
 │   │   ├── sql.py             # build_filter_from_spec(): canonical filter→WHERE-clause
 │   │   └── store.py           # CRUD over app.query_groups
@@ -194,14 +194,14 @@ A typed description of something snowtuner proposes the user do. Subclasses
 own their own SQL rendering, dry-run preview, validation, and (for
 autonomous-eligible types) `apply()`.
 
-- `target_resource() -> str` — used to deduplicate proposals. For
+- `target_resource() -> str` - used to deduplicate proposals. For
   `AlterWarehouse`, scoped by knob set so `AUTO_SUSPEND` and `WAREHOUSE_SIZE`
   proposals on the same warehouse don't clobber each other.
-- `target_warehouse_name() -> str | None` — used by autonomous-mode config
+- `target_warehouse_name() -> str | None` - used by autonomous-mode config
   matching.  Named with `_name` to avoid shadowing future action types whose
   Pydantic schemas might want a separate `target_warehouse: str` field.
-- `supports_autonomous_apply() -> bool` — gate for the autonomous runner.
-- `apply(client) -> str` — execute against Snowflake, return SQL run.
+- `supports_autonomous_apply() -> bool` - gate for the autonomous runner.
+- `apply(client) -> str` - execute against Snowflake, return SQL run.
 
 Adding a new action type means subclassing `Action`, registering in
 `actions/registry.py`, and (if autonomous-eligible) implementing `apply()`.
@@ -225,12 +225,12 @@ class WarehouseIdleGapsTransform(FeatureTransform):
 
 A recommender encapsulates one inference strategy. Two pieces:
 
-- `TrainingGate.evaluate(conn) -> ReadinessReport` — "do we have enough data
+- `TrainingGate.evaluate(conn) -> ReadinessReport` - "do we have enough data
   to make recommendations?" Returns `is_ready` + a human-readable reason.
   Each recommender owns its own gate.
-- `Recommender.fit(conn) -> dict` — compute and return a JSON-serializable
+- `Recommender.fit(conn) -> dict` - compute and return a JSON-serializable
   state dict. Persisted to `app.training_state`.
-- `Recommender.predict(conn, model_state) -> list[Recommendation]` — emit
+- `Recommender.predict(conn, model_state) -> list[Recommendation]` - emit
   recommendations.
 
 The orchestrator runs `fit` whether the gate is ready or not (so the model
@@ -248,7 +248,7 @@ Walks open `PROPOSED` recommendations and applies the ones whose
 - circuit not currently open
 - ≤ N rollbacks in the last 7 days (else: trip circuit, skip)
 - `action.supports_autonomous_apply()` returns True
-- **no experiment is currently in `RUNNING` state** — applying `ALTER WAREHOUSE`
+- **no experiment is currently in `RUNNING` state** - applying `ALTER WAREHOUSE`
   mid-replay would corrupt the experiment's measurements
 
 Every apply records an `app.autonomous_applications` row with the SQL it ran
@@ -262,7 +262,7 @@ startup if `SNOWTUNER_AUTOMATION_INTERVAL > 0`.
 
 **One tick = full pipeline**: `sync → features → recommenders → autonomous`.
 Each stage is the same code path `snowtuner run` and `POST /orchestrator/run`
-use — there's no parallel implementation.
+use - there's no parallel implementation.
 
 Invariants:
 
@@ -286,9 +286,9 @@ the most recent tick's per-stage outcome alongside the oldest source's
 
 Pluggable middleware via `SNOWTUNER_AUTH_MODE`:
 
-- `none` (default) — open access, but the app refuses to start if bound to
+- `none` (default) - open access, but the app refuses to start if bound to
   a non-loopback host.  The right pick for local single-operator dev.
-- `token` — bearer token required on every endpoint except a small allowlist
+- `token` - bearer token required on every endpoint except a small allowlist
   (`/health`, `/openapi.json`, `/docs`).  Token sourced from
   `SNOWTUNER_API_TOKEN` env var, falling back to an auto-generated
   `~/.snowtuner/api_token` (mode 0600).  Compared with `hmac.compare_digest`.
@@ -304,27 +304,27 @@ Where recommenders make *observational* claims ("based on history, do X"),
 experiments make *interventional* ones ("we tried Y on a clone of your
 warehouse and measured the result"). The framework has two layers:
 
-**Primitives** — the typed vocabulary that recipes and recommenders use to
+**Primitives** - the typed vocabulary that recipes and recommenders use to
 describe an experiment:
 
-- `WarehouseConfigDelta` — typed "diff from control" (size, generation, qas_state,
+- `WarehouseConfigDelta` - typed "diff from control" (size, generation, qas_state,
   qas_max_scale_factor). Empty delta = inherit everything from control.
 - `Arm` = `(name, delta, eligibility_issues)`. One cell of the experiment matrix.
-- `check_arm_eligibility(arm, control, AccountInfo)` — pre-flight against
+- `check_arm_eligibility(arm, control, AccountInfo)` - pre-flight against
   Snowflake's compatibility matrix (Gen2 region, size cap, QAS edition, etc.).
   Returns issues with `error` (blocks) or `warning` (surfaces but allows).
-- `StratifiedByFamily` — sampling strategy: rank query families by
+- `StratifiedByFamily` - sampling strategy: rank query families by
   `frequency × mean_elapsed`, pick representative queries per family.
-- `recipes.PRESET_RECIPES` — preset constructors (`gen1_to_gen2`,
+- `recipes.PRESET_RECIPES` - preset constructors (`gen1_to_gen2`,
   `size_sweep_pm1`, `qas_on_off`, `factorial_gen_x_size`) that build arm sets
   for common comparisons.
 
-**Engine** — `ExperimentEngine` walks an ACCEPTED experiment through its full
+**Engine** - `ExperimentEngine` walks an ACCEPTED experiment through its full
 lifecycle:
 
 1. Sample fresh queries via the configured sampling strategy.
 2. Persist test warehouse names to `app.experiments.test_warehouses` *before*
-   the CREATE — so crash recovery (`recover_orphaned_warehouses()`) can clean
+   the CREATE - so crash recovery (`recover_orphaned_warehouses()`) can clean
    up after a process death.
 3. Provision one test warehouse per arm (`SNOWTUNER_EXP_{id}_{arm_name}`).
 4. Mark experiment `RUNNING`, run replay loop:
@@ -341,18 +341,18 @@ lifecycle:
 
 `Recommender.propose_experiments(conn, model_state) -> list[ProposedExperiment]`
 is the hook by which a recommender can defer commitment when its confidence
-is low — instead of (or alongside) emitting a recommendation, it proposes an
+is low - instead of (or alongside) emitting a recommendation, it proposes an
 experiment that, if accepted and run, produces a confident derived
 recommendation via `derive_actions(arm, control) -> list[Action]`.
 
 ## How a typical run works
 
-All three trigger paths — `snowtuner run`, `POST /orchestrator/run`, and
-the AutomationLoop's per-tick fire — call `Orchestrator.run()` which does:
+All three trigger paths - `snowtuner run`, `POST /orchestrator/run`, and
+the AutomationLoop's per-tick fire - call `Orchestrator.run()` which does:
 
 1. **Sync** (if `skip_sync=False` and a `client` was provided): each `Source`
    pulls from Snowflake, upserts to `raw.*`, updates `app.sync_watermarks`.
-   Per-source error isolation — one failing source doesn't kill the others.
+   Per-source error isolation - one failing source doesn't kill the others.
 2. **Feature pipeline**: each `FeatureTransform` runs in topological order,
    writing to `features.*`.
 3. **Per-recommender loop**:
@@ -371,11 +371,11 @@ The `RunReport` returned at each step is what the CLI/UI/MCP report on.
 
 **The AutomationLoop wraps this with fail-fast on sync errors.**  If the sync
 stage of a tick fails, the loop skips the rest of the pipeline for that tick
-and tries fresh next interval — better than running features + recommenders
+and tries fresh next interval - better than running features + recommenders
 against partially-stale state.  Manual triggers don't fail-fast; they run the
 whole pipeline regardless because the caller is presumed to want everything.
 
-**Experiment execution is *not* part of the orchestrator** — it's a separate,
+**Experiment execution is *not* part of the orchestrator** - it's a separate,
 on-demand flow. An accepted experiment is run via `snowtuner experiments run
 <id>`, `POST /experiments/{id}/run`, or by clicking "Run" in the web UI
 (which spawns the engine in a background thread off the API process).
@@ -385,22 +385,22 @@ they aren't safe to bundle into an automated cron-frequency flow.
 
 ## Three DuckDB schemas
 
-- **`raw.*`** — mirrors of Snowflake `ACCOUNT_USAGE` views and `SHOW WAREHOUSES`.
+- **`raw.*`** - mirrors of Snowflake `ACCOUNT_USAGE` views and `SHOW WAREHOUSES`.
   Append-only (mostly); `raw.warehouses` is a full-refresh snapshot.
-- **`features.*`** — derived tables produced by `FeatureTransform`s.
+- **`features.*`** - derived tables produced by `FeatureTransform`s.
   Recomputed each run; safe to drop and rebuild.
-- **`app.*`** — application state: the "memory" of the system across runs.
+- **`app.*`** - application state: the "memory" of the system across runs.
   Includes:
   - `recommendations` + `autonomous_config` + `autonomous_applications` (v0.1)
-  - `experiments` + `experiment_runs` (v0.2) — the `experiments` row carries the
+  - `experiments` + `experiment_runs` (v0.2) - the `experiments` row carries the
     `ProposedExperiment` as a JSON `spec` blob plus first-class columns for
     things we filter / aggregate by (status, target_warehouse, cost columns,
     lifecycle timestamps). `experiment_runs` is one row per `(arm, query, rep)`
     replay with elapsed / spill / credits captured at completion.
-  - `query_groups` (v0.2) — user-authored saved filter sets. Static groups
+  - `query_groups` (v0.2) - user-authored saved filter sets. Static groups
     snapshot member query IDs at creation; dynamic groups re-evaluate
     their `filter_spec` against `raw.query_history` on every read.
-  - `training_state`, `sync_watermarks` — operational metadata.
+  - `training_state`, `sync_watermarks` - operational metadata.
 
 `snowtuner backfill --days N` resets `sync_watermarks` for incremental sources
 and re-pulls, preserving everything else.  `snowtuner reset` is the heavy
@@ -434,7 +434,7 @@ See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
   `recommenders/sizes.py:normalize` function handles aliases.
 
 - **Two right-sizing recommenders, only one registered.** `RuleBasedRightSizer`
-  ships in `default_registry`. `SpillAwareRightSizer` is the alternative — both
+  ships in `default_registry`. `SpillAwareRightSizer` is the alternative - both
   target the same `(action_type, target_resource)`, so running both
   simultaneously would have them mutually-supersede each other's proposals.
   Proper ensemble / voting logic is on the roadmap; for now, swap by editing
@@ -462,7 +462,7 @@ See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
   columns we actually filter / aggregate by (status, target_warehouse,
   cost_estimate, lifecycle timestamps). Trade-off: you can't `SELECT
   spec.arms[0].name FROM app.experiments` ergonomically, but we never need
-  to — the spec is opaque to anyone except the engine. The benefit is that
+  to - the spec is opaque to anyone except the engine. The benefit is that
   adding a new field to `ProposedExperiment` doesn't require a migration.
 
 - **Single-experiment-at-a-time invariant.** `ExperimentStore.has_running_experiment()`
@@ -478,5 +478,5 @@ See [docs/schema.md](schema.md) for the Mermaid ERD and table-by-table notes.
   under `src/snowtuner/ui/` for early-development convenience; it was
   removed once the React app under `web/` reached feature parity.  The SPA
   is served by Vite in dev (port 5173, proxying `/api/*` to 8770) and will
-  be bundled into the API container for prod (planned, not yet built — see
+  be bundled into the API container for prod (planned, not yet built - see
   the deployment task in the roadmap).

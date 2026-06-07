@@ -41,8 +41,8 @@ running while your laptop is asleep, or when you want a team to share it.
 ```
 
 **No inbound ports.** The security group has zero ingress rules. Everything
-the box does — talking to Snowflake, fetching the secret, accepting the
-SSM port-forward — happens over connections **the EC2 instance opens**.
+the box does - talking to Snowflake, fetching the secret, accepting the
+SSM port-forward - happens over connections **the EC2 instance opens**.
 AWS security groups are stateful, so response packets on those established
 connections flow back automatically. Nobody from the public internet can
 initiate a connection to the box.
@@ -58,7 +58,7 @@ outgrow it, see [Upgrade paths](#upgrade-paths).
 - AWS CLI installed: `brew install awscli`
 - AWS CLI configured: `aws configure` (region `us-west-2` is what the rest of this doc assumes)
 - SSM plugin: `brew install --cask session-manager-plugin`
-- Your Snowflake service-user **private key** (a `.p8` file — `~/.snowtuner/snowflake_rsa_key.p8` if you've been running snowtuner locally)
+- Your Snowflake service-user **private key** (a `.p8` file - `~/.snowtuner/snowflake_rsa_key.p8` if you've been running snowtuner locally)
 - Your Snowflake account locator, service-user name, default warehouse, role
 
 Confirm AWS is wired up:
@@ -126,7 +126,7 @@ Click it. The AWS console opens with the template pre-loaded. Fill in:
 | **snowtuner repo URL** | Leave as default unless you forked |
 | **Branch / tag / commit** | Leave as `main` (or pin to a tag for stable deploys) |
 
-Click "Create stack." Wait 5–10 minutes — the stack waits for snowtuner to
+Click "Create stack." Wait 5–10 minutes - the stack waits for snowtuner to
 finish bootstrapping before marking CREATE_COMPLETE, so when the green check
 appears you know it's actually up.
 
@@ -196,7 +196,7 @@ aws ssm start-session --target i-0abc...  --document-name AWS-StartPortForwardin
 
 Run it. Leave it running. Open <http://localhost:8770> in your browser.
 
-You'll get the snowtuner auth screen — paste in your API token.
+You'll get the snowtuner auth screen - paste in your API token.
 
 To grab the token, open another terminal and SSM-session in:
 ```bash
@@ -231,7 +231,7 @@ sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner sync
 ```
 
 After 1–10 minutes (depending on your Snowflake account size), refresh the
-UI — the freshness pill turns green, warehouses populate, recommenders fire
+UI - the freshness pill turns green, warehouses populate, recommenders fire
 on the next automation tick (default 1 hour after boot).
 
 ---
@@ -242,7 +242,7 @@ on the next automation tick (default 1 hour after boot).
 |------|---------|
 | Tail logs | `journalctl -u snowtuner -f` |
 | Restart | `sudo systemctl restart snowtuner` |
-| Upgrade snowtuner | re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` — pulls latest, rebuilds, restarts |
+| Upgrade snowtuner | re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` - pulls latest, rebuilds, restarts |
 | Rotate API token | `sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner auth rotate`, then update Settings page |
 | Rotate Snowflake creds | update the secret value in Secrets Manager, then `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh && sudo systemctl restart snowtuner` |
 
@@ -253,7 +253,7 @@ aws cloudformation delete-stack --stack-name snowtuner --region us-west-2
 ```
 
 The CF stack deletes the EC2 instance, role, instance profile, SG.
-**The Snowflake secret survives** — it's intentionally outside the stack
+**The Snowflake secret survives** - it's intentionally outside the stack
 because credentials should outlive infrastructure. Delete it separately
 when you're sure you're done:
 
@@ -303,7 +303,7 @@ layer one of these onto the same instance:
   ALB's SG to snowtuner's SG. ~$18/mo extra for the ALB. The
   fully-managed-by-AWS path.
 
-Each is additive — you keep everything from this guide and add the URL
+Each is additive - you keep everything from this guide and add the URL
 surface.
 
 ---
@@ -312,9 +312,9 @@ surface.
 
 | Symptom | What to look at |
 |---------|-----------------|
-| Stack creation stuck > 15 min | `aws cloudformation describe-stack-events --stack-name snowtuner` — usually a user-data crash. SSM in and grep `/var/log/snowtuner-userdata.log`. |
+| Stack creation stuck > 15 min | `aws cloudformation describe-stack-events --stack-name snowtuner` - usually a user-data crash. SSM in and grep `/var/log/snowtuner-userdata.log`. |
 | Stack creation failed; can't SSM in | The instance may have already been terminated by rollback. Re-launch with `--on-failure DO_NOTHING` so the instance survives for inspection. |
-| Port-forward exits immediately | Instance not registered with SSM yet — usually clears in 1-2 min after launch. `aws ssm describe-instance-information` should list it. |
+| Port-forward exits immediately | Instance not registered with SSM yet - usually clears in 1-2 min after launch. `aws ssm describe-instance-information` should list it. |
 | UI returns 401 on every request | Token mismatch. Re-grab `sudo cat /var/lib/snowtuner/api_token` and paste into Settings. |
 | `snowtuner verify` fails: "no Snowflake credentials" | env file missing. `sudo cat /var/lib/snowtuner/env` should list `SNOWTUNER_SNOWFLAKE_ACCOUNT=...`. Re-run `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh`. |
 | `snowtuner sync` fails: "JWT token is invalid" | Snowflake hasn't seen your public key yet. Extract the public half from your local `.p8` and `ALTER USER ... SET RSA_PUBLIC_KEY = '...'` in Snowflake. |

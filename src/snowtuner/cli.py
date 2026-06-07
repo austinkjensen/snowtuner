@@ -1070,15 +1070,37 @@ GRANT MONITOR USAGE ON ACCOUNT TO ROLE {role};
 
 -- Unredacted query_text in QUERY_HISTORY across the account.
 -- Without this, Snowflake redacts query_text for queries that were run by
--- roles snowtuner hasn't been granted MONITOR on — which makes those queries
+-- roles snowtuner hasn't been granted MONITOR on, which makes those queries
 -- invisible to the explorer and unreplayable in experiments.  GOVERNANCE_VIEWER
 -- is Snowflake's standard role for "observability across the account" and is
 -- the right default for a self-hosted optimizer (the query text never leaves
 -- your cloud account).
 --
 -- For stricter scoping: comment this out and grant MONITOR per warehouse
--- instead — e.g. `GRANT MONITOR ON WAREHOUSE ANALYTICS_WH TO ROLE {role};`
+-- instead, e.g. `GRANT MONITOR ON WAREHOUSE ANALYTICS_WH TO ROLE {role};`
 GRANT DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER TO ROLE {role};
+
+-- =====================================================================
+-- OPTIONAL: fleet-wide Gen2/QAS detection
+-- =====================================================================
+-- The Gen2 candidate finder + QAS candidate finder use SHOW PARAMETERS to
+-- read each warehouse's GENERATION / ENABLE_QUERY_ACCELERATION /
+-- QUERY_ACCELERATION_MAX_SCALE_FACTOR settings.  Without MONITOR privilege
+-- on a warehouse, those probes fail and the recommenders silently skip
+-- that warehouse.
+--
+-- Uncomment the two grants below to enable Gen2/QAS recommendations
+-- across every warehouse in the account.  The FUTURE grant means new
+-- warehouses (created after running this) automatically pick up the
+-- privilege too, so you don't need to re-grant whenever a warehouse is
+-- added.
+--
+-- Trade-off: snowtuner's role gains read-only visibility into ALL
+-- warehouses, not just the one it owns.  Skip this block if your security
+-- posture requires per-warehouse opt-in.
+--
+--   GRANT MONITOR ON ALL WAREHOUSES IN ACCOUNT TO ROLE {role};
+--   GRANT MONITOR ON FUTURE WAREHOUSES IN ACCOUNT TO ROLE {role};
 """
 
 
