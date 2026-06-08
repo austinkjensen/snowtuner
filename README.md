@@ -105,6 +105,21 @@ snowtuner bootstrap-sql --enable-experiments > experiments-bootstrap.sql
 
 Then grant `SELECT` on whatever databases / tables you want experiments to replay queries against. See the comment block in the generated SQL.
 
+### Demo mode (see it work on your own account)
+
+If you want to watch snowtuner light up end-to-end before you commit time to figuring out what it'd say about your real workload:
+
+```bash
+snowtuner demo seed       # ~30 min wall, asks y/n on cost first
+# (wait ~45 min for Snowflake ACCOUNT_USAGE to catch up)
+snowtuner sync && snowtuner run
+snowtuner demo teardown   # drops the 6 demo warehouses
+```
+
+Demo mode provisions 6 throwaway warehouses prefixed `SNOWTUNER_DEMO_*`, runs cooked workloads (TPC-H sample data) shaped to trip specific recommender rules, and tears them down on completion. Cost is ~0.85 credits (~$2.55 at standard $3/credit) per run; the command prints the estimate and waits for confirmation. Two extra grants required - `snowtuner bootstrap-sql` prints them under the "OPTIONAL: enable `snowtuner demo seed`" block.
+
+Demo data is intentionally cooked - the workloads are engineered to trigger known recommendations. Real-account findings come from `snowtuner sync` against your actual history.
+
 ## Quick deploy to AWS
 
 When you want snowtuner running somewhere other than your laptop:

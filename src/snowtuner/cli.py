@@ -1,6 +1,9 @@
 """`snowtuner` CLI — drive the optimizer from a terminal."""
 from __future__ import annotations
 
+import signal
+import threading
+
 import click
 from rich.console import Console
 from rich.table import Table
@@ -1101,6 +1104,33 @@ GRANT DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER TO ROLE {role};
 --
 --   GRANT MONITOR ON ALL WAREHOUSES IN ACCOUNT TO ROLE {role};
 --   GRANT MONITOR ON FUTURE WAREHOUSES IN ACCOUNT TO ROLE {role};
+
+-- =====================================================================
+-- OPTIONAL: enable `snowtuner demo seed`
+-- =====================================================================
+-- Demo mode provisions 6 throwaway warehouses (prefix SNOWTUNER_DEMO_)
+-- on your real Snowflake account and runs cooked workloads against them.
+-- After ~45 minutes (the ACCOUNT_USAGE lag), `snowtuner sync && snowtuner
+-- run` will surface known recommendations on those demo warehouses,
+-- letting you see the optimizer end-to-end on your own account.
+--
+-- Cost: ~0.85 credits (~$2.55 at $3/credit standard edition) per run.
+-- Tear down with `snowtuner demo teardown` (drops all SNOWTUNER_DEMO_*
+-- warehouses).  AUTO_SUSPEND caps idle cost at 60-120s per warehouse
+-- even if the process crashes mid-run.
+--
+-- Requirements:
+--   1. CREATE WAREHOUSE on the account, so snowtuner can provision the
+--      6 cooked warehouses (and so `snowtuner demo teardown` can drop them).
+--   2. USAGE on SNOWFLAKE_SAMPLE_DATA (TPC-H), so the workloads have
+--      something to read.  SNOWFLAKE_SAMPLE_DATA is a free share that
+--      exists by default on every account.
+--
+-- Skip this block if you don't plan to run `snowtuner demo seed`.  Real
+-- recommendations on your actual workload don't need either grant.
+--
+--   GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE {role};
+--   GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA TO ROLE {role};
 """
 
 
@@ -1805,6 +1835,240 @@ def experiments_recover() -> None:
             console.print(f"  • {name}")
     else:
         console.print("[dim]No orphaned warehouses to clean up.[/dim]")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Demo mode: cooked workloads against real Snowflake
+# ─────────────────────────────────────────────────────────────────────────
+# Unlike `snowtuner seed` (which writes synthetic rows to local DuckDB and
+# never touches Snowflake), `snowtuner demo` provisions real Snowflake
+# warehouses and runs intentionally-shaped query patterns.  The cooked
+# patterns trip specific recommender rules so a new user can see the
+# optimizer end-to-end on their own account.
+#
+# Cost-bounded by AUTO_SUSPEND caps + always-on teardown.  See the OPTIONAL
+# DEMO MODE block in `snowtuner bootstrap-sql` for the prereq grants.
+
+
+@cli.group()
+def demo() -> None:
+    """Provision cooked Snowflake workloads to demonstrate snowtuner."""
+
+
+@demo.command("seed")
+@click.option("--yes", is_flag=True, default=False,
+              help="Skip the cost-confirmation prompt.  Useful for scripted runs.")
+@click.option("--skip-teardown", is_flag=True, default=False,
+              help="Leave demo warehouses up after the run.  For debugging only; "
+                   "you'll need to run `snowtuner demo teardown` later to stop "
+                   "paying for them.")
+def demo_seed(yes: bool, skip_teardown: bool) -> None:
+    """Provision 6 cooked warehouses and run their workloads.
+
+    \b
+    What happens:
+      1. Pre-flight check: verifies CREATE WAREHOUSE + SNOWFLAKE_SAMPLE_DATA grants.
+      2. Provisions 6 warehouses prefixed SNOWTUNER_DEMO_*.
+      3. Runs the workloads in parallel (~30 min wall time).
+      4. Tears down the warehouses on completion (or on Ctrl-C).
+
+    \b
+    After this command finishes, wait ~45 min for ACCOUNT_USAGE to catch
+    up, then:
+      snowtuner sync && snowtuner run
+    to see the cooked recommendations land in the UI / CLI.
+
+    Demo data is intentionally cooked; real recommendations on your real
+    workload come from running [cyan]snowtuner sync[/cyan] against your
+    actual Snowflake history.
+    """
+    from snowtuner.demo import DEMO_SPECS
+    from snowtuner.demo.runner import (
+        cost_summary, latest_status, preflight, run_demo,
+    )
+
+    conn = get_connection()
+
+    # Refuse if a previous run is still mid-flight - two concurrent demo
+    # runs would race on Snowflake warehouse names and on the per_workload
+    # JSON merge.  Caller can `snowtuner demo teardown` to clear it.
+    last = latest_status(conn)
+    if last is not None and last.status == "RUNNING":
+        console.print(
+            f"[yellow]Demo run #{last.run_id} is still marked RUNNING.[/yellow]\n"
+            f"If you're sure it's dead (process killed, laptop closed), run "
+            f"[cyan]snowtuner demo teardown[/cyan] to clear it before starting "
+            f"a new one."
+        )
+        raise SystemExit(1)
+
+    try:
+        client = SnowflakeClient.from_resolver()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    console.print("[bold]Running pre-flight grant check...[/bold]")
+    report = preflight(client)
+    if not report.ok:
+        console.print("[red]Pre-flight failed:[/red]\n")
+        console.print(report.message)
+        client.close()
+        raise SystemExit(1)
+    console.print("[green]OK[/green] - all required grants present.\n")
+
+    console.print(f"[bold]About to provision {len(DEMO_SPECS)} demo warehouses:[/bold]")
+    for spec in DEMO_SPECS:
+        console.print(
+            f"  - {spec.warehouse_name} ({spec.size}, AS={spec.auto_suspend_seconds}s) "
+            f"-> {spec.expected_finding}"
+        )
+    console.print()
+    console.print(cost_summary())
+    console.print()
+
+    if not yes:
+        if not click.confirm("Proceed?", default=False):
+            console.print("[yellow]Aborted.[/yellow]  No warehouses created.")
+            client.close()
+            return
+
+    # Run.  ThreadPoolExecutor inside run_demo dispatches the workloads;
+    # we block here until they all finish (or Ctrl-C signals teardown).
+    stop_event = threading.Event()
+    original_sigint = signal.signal(
+        signal.SIGINT,
+        lambda *_: (
+            console.print(
+                "\n[yellow]Stop signal received.  Waiting for in-flight "
+                "queries to wind down, then tearing down warehouses...[/yellow]"
+            ),
+            stop_event.set(),
+        ),
+    )
+    try:
+        run_id = run_demo(
+            client=client, conn=conn,
+            stop_event=stop_event,
+            skip_teardown=skip_teardown,
+        )
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        client.close()
+
+    final = latest_status(conn)
+    console.print()
+    if final and final.status == "TORN_DOWN":
+        console.print(
+            f"[green]Demo run #{run_id} complete and torn down.[/green]\n"
+            f"Wait ~45 min for Snowflake ACCOUNT_USAGE to catch up, then "
+            f"run [cyan]snowtuner sync && snowtuner run[/cyan] to see the "
+            f"cooked recommendations."
+        )
+    elif final and final.status in ("COMPLETED", "FAILED"):
+        console.print(
+            f"[yellow]Demo run #{run_id} finished with status "
+            f"{final.status} but warehouses are still up.[/yellow]\n"
+            f"Run [cyan]snowtuner demo teardown[/cyan] when you're done."
+        )
+    else:
+        console.print(
+            f"Demo run #{run_id} status: {final.status if final else 'unknown'}"
+        )
+
+
+@demo.command("status")
+def demo_status() -> None:
+    """Show the most recent demo run's progress + per-workload result."""
+    from snowtuner.demo.runner import latest_status
+
+    conn = get_connection()
+    s = latest_status(conn)
+    if s is None:
+        console.print(
+            "[dim]No demo runs yet.  Try [cyan]snowtuner demo seed[/cyan].[/dim]"
+        )
+        return
+
+    tbl = Table(show_header=False)
+    tbl.add_row("Run ID", str(s.run_id))
+    tbl.add_row("Status", s.status)
+    tbl.add_row("Started", s.started_at)
+    if s.completed_at:
+        tbl.add_row("Completed", s.completed_at)
+    if s.torn_down_at:
+        tbl.add_row("Torn down", s.torn_down_at)
+    if s.notes:
+        tbl.add_row("Notes", s.notes)
+    console.print(tbl)
+
+    if not s.per_workload:
+        console.print("\n[dim]No per-workload results yet.[/dim]")
+        return
+
+    wl_tbl = Table(show_header=True, header_style="bold")
+    wl_tbl.add_column("Workload")
+    wl_tbl.add_column("Warehouse")
+    wl_tbl.add_column("OK", justify="right")
+    wl_tbl.add_column("Fail", justify="right")
+    wl_tbl.add_column("Last error")
+    for key, w in s.per_workload.items():
+        wl_tbl.add_row(
+            key,
+            w.get("warehouse_name", "-"),
+            str(w.get("queries_succeeded", 0)),
+            str(w.get("queries_failed", 0)),
+            (w.get("last_error") or "-")[:60],
+        )
+    console.print(wl_tbl)
+
+
+@demo.command("teardown")
+@click.option("--yes", is_flag=True, default=False,
+              help="Skip the confirmation prompt.")
+def demo_teardown(yes: bool) -> None:
+    """Drop all SNOWTUNER_DEMO_* warehouses on the account.
+
+    Idempotent: if no demo warehouses exist, this is a no-op.  Use this
+    after a `--skip-teardown` run, or to recover from a killed
+    [cyan]snowtuner demo seed[/cyan] that left warehouses up.
+    """
+    from snowtuner.demo.runner import list_demo_warehouses, teardown_demo
+
+    conn = get_connection()
+    try:
+        client = SnowflakeClient.from_resolver()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    names = list_demo_warehouses(client)
+    if not names:
+        console.print(
+            "[dim]No SNOWTUNER_DEMO_* warehouses found on the account.[/dim]"
+        )
+        client.close()
+        return
+
+    console.print(f"[bold]About to drop {len(names)} demo warehouse(s):[/bold]")
+    for n in names:
+        console.print(f"  - {n}")
+
+    if not yes:
+        if not click.confirm("Drop them?", default=True):
+            console.print("[yellow]Aborted.[/yellow]")
+            client.close()
+            return
+
+    dropped, errors = teardown_demo(client=client, conn=conn)
+    client.close()
+
+    console.print(f"[green]Dropped[/green] {len(dropped)} warehouse(s).")
+    if errors:
+        console.print(f"[yellow]{len(errors)} drop(s) failed:[/yellow]")
+        for name, msg in errors:
+            console.print(f"  - {name}: {msg}")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

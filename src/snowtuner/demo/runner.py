@@ -1,0 +1,486 @@
+"""Demo runner: provision -> execute -> teardown, with progress persistence.
+
+Coordinates the 6 cooked workloads against a real Snowflake account.  Each
+warehouse runs in its own thread (with its own client / connection) so the
+6 specs progress in parallel and the total wall time is dominated by the
+slowest one (BURSTY's idle gaps, ~30 min).
+
+State persistence lives in ``app.demo_runs`` so:
+  - ``snowtuner demo status`` works after the seeding process dies.
+  - ``snowtuner demo teardown`` can find leftover warehouses even if the
+    user shut their laptop mid-run.
+
+Cancellation: a single ``threading.Event`` is passed to every workload.
+The CLI installs a SIGINT handler that sets the event, which propagates to
+all workloads via their cooperative-cancellation checks.  Teardown still
+runs on cancel - the alternative is leaking warehouses.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+
+import duckdb
+
+from snowtuner.demo.warehouses import (
+    DEMO_SPECS,
+    DEMO_WAREHOUSE_PREFIX,
+    DemoWarehouseSpec,
+)
+from snowtuner.demo.workloads import DEMO_WORKLOADS, WorkloadResult
+from snowtuner.ingestion.snowflake_client import SnowflakeClient
+
+logger = logging.getLogger(__name__)
+
+
+# Standard Snowflake credit cost per "demo run" - rough order-of-magnitude
+# estimate shown to the user before they hit y/n.  Real cost depends on
+# edition and current credit price.  Numbers are based on each warehouse's
+# size * estimated wall-clock active time:
+#   MEMORY_HOG  XSMALL  * ~5 min active  ≈ 0.08 credits
+#   LOCAL_SPILL SMALL   * ~3 min active  ≈ 0.10 credits
+#   SATURATED   SMALL   * ~3 min active  ≈ 0.10 credits
+#   OVERKILL    LARGE   * ~3 min active  ≈ 0.40 credits
+#   BURSTY      SMALL   * ~3 min active  ≈ 0.10 credits  (idle is free)
+#   HEALTHY     SMALL   * ~2 min active  ≈ 0.07 credits
+# Total ≈ 0.85 credits ≈ $2.50 at $3/credit (standard edition).
+EST_CREDITS_PER_RUN = 0.85
+EST_DOLLARS_PER_RUN = 2.55
+
+
+@dataclass
+class PreflightReport:
+    """Result of the pre-flight grant check.
+
+    If ``ok`` is False, ``message`` contains a copy-pasteable remediation
+    SQL block for the operator to run as ACCOUNTADMIN.
+    """
+    ok: bool
+    message: str
+
+
+def preflight(client: SnowflakeClient) -> PreflightReport:
+    """Verify the current role has the grants demo mode needs.
+
+    Two requirements:
+      1. CREATE WAREHOUSE ON ACCOUNT - we provision 6 warehouses.
+      2. USAGE on SNOWFLAKE_SAMPLE_DATA - all workloads read TPC-H.
+
+    We test each by attempting a no-op operation and catching the
+    Snowflake-side AccessControlError.  A clean error message is far more
+    helpful than letting the failure surface deep inside a CREATE
+    WAREHOUSE call.
+    """
+    issues: list[str] = []
+
+    # 1. CREATE WAREHOUSE: try creating + immediately dropping a sentinel.
+    #    Using IF NOT EXISTS + INITIALLY_SUSPENDED so even a leak costs $0.
+    sentinel = f"{DEMO_WAREHOUSE_PREFIX}PREFLIGHT_PROBE"
+    try:
+        client.execute(
+            f"CREATE WAREHOUSE IF NOT EXISTS {sentinel} "
+            f"WITH WAREHOUSE_SIZE='XSMALL' AUTO_SUSPEND=60 "
+            f"INITIALLY_SUSPENDED=TRUE"
+        )
+        client.execute(f"DROP WAREHOUSE IF EXISTS {sentinel}")
+    except Exception as e:
+        if _is_access_error(e):
+            issues.append(
+                "Role lacks CREATE WAREHOUSE on the account.  Run as "
+                "ACCOUNTADMIN:\n"
+                "  GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE <snowtuner-role>;"
+            )
+        else:
+            issues.append(f"CREATE WAREHOUSE probe failed unexpectedly: {e}")
+
+    # 2. SNOWFLAKE_SAMPLE_DATA access: trivial select that needs USAGE on
+    #    the database and SELECT on the table.  TPCH_SF1.NATION is the
+    #    smallest TPC-H table - rows back in <100ms when accessible.
+    try:
+        client.execute(
+            "SELECT COUNT(*) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.NATION"
+        )
+    except Exception as e:
+        if _is_access_error(e) or "does not exist" in str(e).lower():
+            issues.append(
+                "Role can't read SNOWFLAKE_SAMPLE_DATA.  Run as ACCOUNTADMIN:\n"
+                "  GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA\n"
+                "    TO ROLE <snowtuner-role>;\n"
+                "(SNOWFLAKE_SAMPLE_DATA is a free share that exists by default "
+                "on every account; the grant just makes the snowtuner role "
+                "able to read it.)"
+            )
+        else:
+            issues.append(f"SNOWFLAKE_SAMPLE_DATA probe failed unexpectedly: {e}")
+
+    if issues:
+        return PreflightReport(
+            ok=False,
+            message="\n\n".join(issues),
+        )
+    return PreflightReport(ok=True, message="all required grants present")
+
+
+def _is_access_error(e: Exception) -> bool:
+    """Snowflake error code 42501 = SQL access control error.
+
+    Same heuristic used by ingestion/sources/warehouses.py for the
+    GENERATION parameter probe.  Substring match because the Snowflake
+    Python connector wraps the code into the exception message rather
+    than exposing it as a structured attribute.
+    """
+    s = str(e)
+    return "42501" in s or "access control" in s.lower()
+
+
+def cost_summary() -> str:
+    """Short human-readable cost preamble for ``snowtuner demo seed``.
+
+    Intentionally explicit about the dollar number - users on a small
+    Snowflake plan need to know this isn't free.  Pinned to standard
+    edition pricing for the estimate; enterprise customers pay 1.5-2x.
+    """
+    return (
+        f"Estimated cost: ~{EST_CREDITS_PER_RUN:.2f} credits "
+        f"(~${EST_DOLLARS_PER_RUN:.2f} at $3/credit standard edition).\n"
+        f"Workload runtime: ~30 minutes (BURSTY is the long pole).\n"
+        f"Then ACCOUNT_USAGE catches up after ~45 minutes; run "
+        f"`snowtuner sync && snowtuner run` at that point."
+    )
+
+
+# ── Persistence helpers ───────────────────────────────────────────────────
+
+
+def _insert_run(
+    conn: duckdb.DuckDBPyConnection, warehouses: list[str],
+) -> int:
+    """Insert a new RUNNING row into app.demo_runs.  Returns the id."""
+    conn.execute(
+        """
+        INSERT INTO app.demo_runs (status, warehouses, per_workload)
+        VALUES ('RUNNING', ?, ?)
+        """,
+        [json.dumps(warehouses), json.dumps({})],
+    )
+    row = conn.execute(
+        "SELECT id FROM app.demo_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return int(row[0])
+
+
+def _update_workload(
+    conn: duckdb.DuckDBPyConnection, run_id: int, result: WorkloadResult,
+) -> None:
+    """Merge a finished workload's result into the run's per_workload JSON.
+
+    Done in one transaction to avoid lost updates if two workloads finish
+    near-simultaneously.  We re-read the column under the lock, merge, and
+    write back.
+    """
+    row = conn.execute(
+        "SELECT per_workload FROM app.demo_runs WHERE id = ?", [run_id],
+    ).fetchone()
+    current = json.loads(row[0]) if row and row[0] else {}
+    current[result.workload_key] = asdict(result)
+    conn.execute(
+        "UPDATE app.demo_runs SET per_workload = ? WHERE id = ?",
+        [json.dumps(current), run_id],
+    )
+
+
+def _finalize_run(
+    conn: duckdb.DuckDBPyConnection,
+    run_id: int,
+    *,
+    status: str,
+    notes: str | None = None,
+) -> None:
+    """Mark the run COMPLETED / FAILED / TORN_DOWN with a timestamp."""
+    if status == "TORN_DOWN":
+        conn.execute(
+            "UPDATE app.demo_runs SET status = ?, torn_down_at = current_timestamp, "
+            "notes = COALESCE(notes, '') || COALESCE(?, '') WHERE id = ?",
+            [status, ("\n" + notes) if notes else "", run_id],
+        )
+    else:
+        conn.execute(
+            "UPDATE app.demo_runs SET status = ?, completed_at = current_timestamp, "
+            "notes = COALESCE(?, notes) WHERE id = ?",
+            [status, notes, run_id],
+        )
+
+
+# ── Provisioning ─────────────────────────────────────────────────────────
+
+
+def render_create_demo_warehouse_sql(spec: DemoWarehouseSpec) -> str:
+    """CREATE WAREHOUSE statement for one demo spec.
+
+    INITIALLY_SUSPENDED=TRUE so the warehouse doesn't bill from creation
+    until the first query resumes it.  COMMENT carries provenance so a
+    human poking around in Snowsight understands what these are.
+    """
+    return (
+        f"CREATE WAREHOUSE IF NOT EXISTS {spec.warehouse_name}\n"
+        f"  WAREHOUSE_SIZE = '{spec.size}'\n"
+        f"  AUTO_SUSPEND = {spec.auto_suspend_seconds}\n"
+        f"  AUTO_RESUME = TRUE\n"
+        f"  INITIALLY_SUSPENDED = TRUE\n"
+        f"  COMMENT = 'snowtuner demo: {spec.workload_key}'"
+    )
+
+
+def _provision_one(client: SnowflakeClient, spec: DemoWarehouseSpec) -> None:
+    """Provision one demo warehouse.  Raises on failure - the caller
+    should fall through to teardown."""
+    client.execute(render_create_demo_warehouse_sql(spec))
+
+
+# ── Top-level orchestration ──────────────────────────────────────────────
+
+
+def run_demo(
+    *,
+    client: SnowflakeClient,
+    conn: duckdb.DuckDBPyConnection,
+    specs: Iterable[DemoWarehouseSpec] = DEMO_SPECS,
+    stop_event: threading.Event | None = None,
+    skip_teardown: bool = False,
+) -> int:
+    """Provision, run all workloads in parallel, then tear down.
+
+    Args:
+        client:        the primary SnowflakeClient.  Cloned per warehouse
+                       thread so each gets its own connection.
+        conn:          DuckDB connection for app.demo_runs persistence.
+                       MUST be the per-thread cursor pattern if called from
+                       a server thread - the CLI passes the main connection.
+        specs:         which demo warehouses to run.  Defaults to all 6;
+                       tests pass a subset.
+        stop_event:    cooperative-cancellation hook.  If set during
+                       execution, in-flight workloads bail out and we move
+                       to teardown.  Created internally if None.
+        skip_teardown: leave warehouses up after the run completes.  Useful
+                       when debugging on a real account; never set in
+                       production.
+
+    Returns the ``app.demo_runs.id`` of the run row so the CLI can show it.
+
+    On exception during workload execution, we still try to tear down the
+    warehouses - leaking them is worse than re-raising.
+    """
+    specs = list(specs)
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    warehouse_names = [s.warehouse_name for s in specs]
+    run_id = _insert_run(conn, warehouse_names)
+    logger.info("demo run %d started: %s", run_id, warehouse_names)
+
+    provisioned: list[str] = []
+    final_status = "COMPLETED"
+    final_notes: str | None = None
+
+    try:
+        # ── Provision phase ──
+        # Serial because CREATE WAREHOUSE is cheap (<1s each) and
+        # error messages are clearer when not racing.
+        for spec in specs:
+            if stop_event.is_set():
+                break
+            try:
+                _provision_one(client, spec)
+                provisioned.append(spec.warehouse_name)
+                logger.info("provisioned %s", spec.warehouse_name)
+            except Exception as e:
+                logger.error("failed to provision %s: %s", spec.warehouse_name, e)
+                final_status = "FAILED"
+                final_notes = f"provision failed for {spec.warehouse_name}: {e}"
+                return run_id  # finally block tears down what we got
+
+        # ── Execute phase ──
+        # One thread per warehouse, each with its own cloned client so
+        # connections don't share.  Workloads run for up to ~30 min; we
+        # block here on the pool waiting for all to finish.
+        def _run_one(spec: DemoWarehouseSpec) -> WorkloadResult | None:
+            workload = DEMO_WORKLOADS.get(spec.workload_key)
+            if workload is None:
+                logger.error(
+                    "spec %s has no workload for key=%r",
+                    spec.short_name, spec.workload_key,
+                )
+                return None
+            per_warehouse_client = client.clone()
+            try:
+                return workload.execute(
+                    per_warehouse_client,
+                    spec.warehouse_name,
+                    stop_event=stop_event,
+                )
+            finally:
+                per_warehouse_client.close()
+
+        with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+            futures = {pool.submit(_run_one, s): s for s in specs}
+            for fut in as_completed(futures):
+                spec = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    logger.exception(
+                        "workload %s crashed: %s", spec.workload_key, e,
+                    )
+                    # Stub a failed result so the operator can see what blew up.
+                    result = WorkloadResult(
+                        workload_key=spec.workload_key,
+                        warehouse_name=spec.warehouse_name,
+                        started_at=time.time(),
+                        completed_at=time.time(),
+                        last_error=f"workload crashed: {type(e).__name__}: {e}",
+                    )
+                if result is not None:
+                    _update_workload(conn, run_id, result)
+
+        if stop_event.is_set():
+            final_status = "FAILED"
+            final_notes = "cancelled by stop_event"
+
+    finally:
+        # ── Finalize execute state FIRST ──
+        # Write COMPLETED / FAILED + completed_at before teardown so the
+        # subsequent TORN_DOWN transition doesn't clobber the execute
+        # status.  Without this ordering, teardown's _finalize_run sets
+        # status=TORN_DOWN and then the second _finalize_run here would
+        # overwrite it back to COMPLETED, losing the teardown signal.
+        _finalize_run(conn, run_id, status=final_status, notes=final_notes)
+
+        # ── Teardown phase ──
+        # Always runs (unless --skip-teardown).  Leaking warehouses costs
+        # the user real money; aggressively try DROP for every name we
+        # provisioned, even if some fail.
+        if not skip_teardown:
+            torn_down, drop_errors = teardown_demo(
+                client=client, conn=conn,
+                names=provisioned, run_id=run_id,
+            )
+            if drop_errors:
+                logger.warning(
+                    "teardown partial: %d drop(s) failed", len(drop_errors),
+                )
+            logger.info("dropped %d demo warehouses", len(torn_down))
+
+    return run_id
+
+
+# ── Teardown ─────────────────────────────────────────────────────────────
+
+
+def list_demo_warehouses(client: SnowflakeClient) -> list[str]:
+    """Ask Snowflake for all warehouses with the demo prefix.
+
+    Source of truth for teardown - even if app.demo_runs has stale rows,
+    this finds the actual leftover warehouses.  Filter on the prefix so
+    we never DROP a non-demo warehouse by mistake.
+    """
+    cols, rows = client.execute_with_columns(
+        f"SHOW WAREHOUSES LIKE '{DEMO_WAREHOUSE_PREFIX}%'"
+    )
+    name_idx = {c.lower(): i for i, c in enumerate(cols)}.get("name")
+    if name_idx is None:
+        return []
+    return [str(r[name_idx]) for r in rows]
+
+
+def teardown_demo(
+    *,
+    client: SnowflakeClient,
+    conn: duckdb.DuckDBPyConnection,
+    names: Iterable[str] | None = None,
+    run_id: int | None = None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Drop the named demo warehouses (or all SNOWTUNER_DEMO_* if names is None).
+
+    Returns (dropped_names, errors) where errors is list[(name, msg)].
+
+    Idempotent: DROP WAREHOUSE IF EXISTS never raises on a missing
+    warehouse, so re-running teardown on a cleaned account is a no-op.
+
+    Marks app.demo_runs.run_id as TORN_DOWN if a run_id is supplied.  When
+    called via ``snowtuner demo teardown`` (no run_id), we also mark any
+    RUNNING / COMPLETED / FAILED rows as TORN_DOWN since their warehouses
+    just got dropped.
+    """
+    if names is None:
+        names = list_demo_warehouses(client)
+    names = [n for n in names if n.startswith(DEMO_WAREHOUSE_PREFIX)]
+
+    dropped: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for name in names:
+        try:
+            client.execute(f"DROP WAREHOUSE IF EXISTS {name}")
+            dropped.append(name)
+        except Exception as e:
+            errors.append((name, str(e)))
+            logger.warning("failed to drop %s: %s", name, e)
+
+    if run_id is not None:
+        _finalize_run(
+            conn, run_id, status="TORN_DOWN",
+            notes=f"dropped {len(dropped)} warehouses",
+        )
+    else:
+        # Sweep teardown - mark any non-TORN_DOWN rows as torn down.
+        conn.execute(
+            "UPDATE app.demo_runs "
+            "SET status = 'TORN_DOWN', torn_down_at = current_timestamp "
+            "WHERE status != 'TORN_DOWN'"
+        )
+
+    return dropped, errors
+
+
+# ── Status reporting ─────────────────────────────────────────────────────
+
+
+@dataclass
+class RunStatus:
+    """Read-only snapshot for ``snowtuner demo status`` rendering."""
+    run_id: int
+    status: str
+    started_at: str
+    completed_at: str | None
+    torn_down_at: str | None
+    warehouses: list[str]
+    per_workload: dict
+    notes: str | None
+
+
+def latest_status(conn: duckdb.DuckDBPyConnection) -> RunStatus | None:
+    """Return the most recent app.demo_runs row, or None if no runs exist."""
+    row = conn.execute(
+        """
+        SELECT id, status, started_at, completed_at, torn_down_at,
+               warehouses, per_workload, notes
+        FROM app.demo_runs
+        ORDER BY id DESC LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return RunStatus(
+        run_id=int(row[0]),
+        status=str(row[1]),
+        started_at=str(row[2]),
+        completed_at=str(row[3]) if row[3] is not None else None,
+        torn_down_at=str(row[4]) if row[4] is not None else None,
+        warehouses=json.loads(row[5]) if row[5] else [],
+        per_workload=json.loads(row[6]) if row[6] else {},
+        notes=str(row[7]) if row[7] else None,
+    )

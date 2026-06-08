@@ -71,3 +71,15 @@ class SnowflakeClient:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def clone(self) -> "SnowflakeClient":
+        """Return a new client with the same credentials but a fresh, unconnected
+        state.
+
+        Snowflake's Python connector cursors aren't safely shareable across
+        threads via one underlying connection, so concurrent workloads need
+        their own client instances (and thus their own connections).  The
+        clone is lazy: no Snowflake round-trip until the caller calls
+        ``execute()`` on it.
+        """
+        return SnowflakeClient(self.credentials)

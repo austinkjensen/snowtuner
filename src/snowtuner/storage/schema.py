@@ -413,6 +413,29 @@ _DDL = [
         created_by          VARCHAR NOT NULL DEFAULT 'user'
     )
     """,
+    # ── Demo runs ─────────────────────────────────────────────────
+    # One row per `snowtuner demo seed` invocation.  Tracks what was
+    # provisioned + per-workload status so `snowtuner demo status` can
+    # show progress without re-querying Snowflake, and so `teardown`
+    # knows which warehouses to drop even if the original process died.
+    # status transitions: RUNNING -> COMPLETED | FAILED, then -> TORN_DOWN
+    # once teardown succeeds.
+    """
+    CREATE SEQUENCE IF NOT EXISTS app.demo_runs_seq
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS app.demo_runs (
+        id            BIGINT PRIMARY KEY
+                      DEFAULT nextval('app.demo_runs_seq'),
+        started_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+        completed_at  TIMESTAMP,
+        torn_down_at  TIMESTAMP,
+        status        VARCHAR NOT NULL,                       -- RUNNING | COMPLETED | FAILED | TORN_DOWN
+        warehouses    JSON NOT NULL,                          -- list[str] - SNOWTUNER_DEMO_* names provisioned
+        per_workload  JSON,                                   -- dict[workload_key, WorkloadResult]
+        notes         VARCHAR
+    )
+    """,
 ]
 
 
