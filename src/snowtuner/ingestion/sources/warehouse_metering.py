@@ -28,12 +28,25 @@ class WarehouseMeteringSource(Source):
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "start_time >= %s" if since else "TRUE"
         params: list = [since] if since else []
+        # WAREHOUSE_METERING_HISTORY legitimately has rows with NULL
+        # warehouse_name - these are cloud-services / serverless metering
+        # not attributable to a single warehouse.  We can't store them
+        # because raw.warehouse_metering_history's primary key is
+        # (warehouse_name, start_time) and DuckDB enforces NOT NULL on
+        # PK columns.  More importantly, the per-warehouse recommenders
+        # have nothing useful to do with non-attributed credit rows, so
+        # filtering at the source matches intent.
+        # Discovered in prod 2026-06-07: without this filter, ingestion
+        # raises ConstraintException, fail-fast skips features +
+        # recommenders, and the product produces zero recommendations
+        # on any account with cloud-services metering (i.e. most accounts).
         sql = f"""
         SELECT
             warehouse_id, warehouse_name, start_time, end_time,
             credits_used, credits_used_compute, credits_used_cloud_services
         FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
         WHERE {since_clause}
+          AND warehouse_name IS NOT NULL
         ORDER BY start_time ASC
         """
         rows = client.execute(sql, params)
