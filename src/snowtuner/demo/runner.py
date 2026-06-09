@@ -462,6 +462,259 @@ class RunStatus:
     notes: str | None
 
 
+# ── Post-hoc verification ────────────────────────────────────────────────
+
+
+@dataclass
+class VerifyResult:
+    """One workload's PASS/FAIL after a `snowtuner demo verify` run."""
+    workload_key: str
+    warehouse_name: str
+    expected: str
+    observed: str
+    verdict: str   # 'PASS: ...' or 'FAIL: ...'
+
+    @property
+    def is_pass(self) -> bool:
+        return self.verdict.startswith("PASS")
+
+
+def verify_demo(
+    *,
+    client: SnowflakeClient,
+    conn: duckdb.DuckDBPyConnection,
+) -> list[VerifyResult] | None:
+    """Query ACCOUNT_USAGE for the last demo run and check each workload.
+
+    For each demo warehouse from the latest ``app.demo_runs`` row, runs
+    the appropriate ACCOUNT_USAGE query and compares the observed
+    spill / queue / elapsed signals against what the workload was
+    designed to produce.
+
+    Returns one ``VerifyResult`` per warehouse.  Returns None if there's
+    no demo run to verify.
+
+    ACCOUNT_USAGE lag: QUERY_HISTORY lags ~45 min historically (less in
+    modern accounts), WAREHOUSE_EVENTS_HISTORY can lag hours.  A FAIL
+    result with "no queries in ACCOUNT_USAGE" or "no events" means
+    "retry later" - not necessarily a bug.
+    """
+    last = latest_status(conn)
+    if last is None:
+        return None
+
+    results: list[VerifyResult] = []
+    for spec in DEMO_SPECS:
+        if spec.warehouse_name not in last.warehouses:
+            continue
+        if spec.workload_key == "bursty":
+            results.append(_verify_bursty(client, spec, last))
+        else:
+            results.append(_verify_via_query_history(client, spec, last))
+    return results
+
+
+def _verify_via_query_history(
+    client: SnowflakeClient, spec: DemoWarehouseSpec, last: "RunStatus",
+) -> VerifyResult:
+    """Aggregate ACCOUNT_USAGE.QUERY_HISTORY for one warehouse and judge."""
+    try:
+        # Identifier interpolation is safe here - warehouse_name comes from
+        # DEMO_SPECS (compile-time constant), not user input.  start_time
+        # likewise comes from our own DB.
+        rows = client.execute(f"""
+        SELECT
+            COUNT(*) AS n,
+            SUM(CASE WHEN bytes_spilled_to_local > 0 THEN 1 ELSE 0 END) AS n_local,
+            SUM(CASE WHEN bytes_spilled_to_remote > 0 THEN 1 ELSE 0 END) AS n_remote,
+            COALESCE(AVG(queued_overload_time), 0) AS avg_queue_ms,
+            COALESCE(APPROX_PERCENTILE(total_elapsed_time, 0.99), 0) AS p99_ms,
+            COALESCE(MAX(queued_overload_time), 0) AS max_queue_ms
+        FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+        WHERE warehouse_name = '{spec.warehouse_name}'
+          AND start_time >= TO_TIMESTAMP_NTZ('{last.started_at}')
+          AND execution_status = 'SUCCESS'
+        """)
+    except Exception as e:
+        return VerifyResult(
+            workload_key=spec.workload_key,
+            warehouse_name=spec.warehouse_name,
+            expected=spec.expected_finding,
+            observed=f"query failed: {e}",
+            verdict="FAIL: ACCOUNT_USAGE query errored",
+        )
+
+    if not rows:
+        return VerifyResult(
+            workload_key=spec.workload_key,
+            warehouse_name=spec.warehouse_name,
+            expected=spec.expected_finding,
+            observed="no rows returned",
+            verdict="FAIL: ACCOUNT_USAGE returned no aggregate",
+        )
+
+    n, n_local, n_remote, avg_queue_ms, p99_ms, max_queue_ms = rows[0]
+    n = int(n or 0)
+    n_local = int(n_local or 0)
+    n_remote = int(n_remote or 0)
+    avg_queue_ms = float(avg_queue_ms or 0)
+    p99_ms = float(p99_ms or 0)
+    max_queue_ms = float(max_queue_ms or 0)
+
+    observed = (
+        f"n={n}, local_spill={n_local}, remote_spill={n_remote}, "
+        f"avg_queue={avg_queue_ms/1000:.2f}s, "
+        f"max_queue={max_queue_ms/1000:.2f}s, "
+        f"p99_elapsed={p99_ms/1000:.2f}s"
+    )
+
+    if n == 0:
+        return VerifyResult(
+            workload_key=spec.workload_key,
+            warehouse_name=spec.warehouse_name,
+            expected=spec.expected_finding,
+            observed=observed,
+            verdict=(
+                "FAIL: 0 queries in ACCOUNT_USAGE - either workload "
+                "didn't run, or ACCOUNT_USAGE hasn't caught up "
+                "(typically ~45 min lag)"
+            ),
+        )
+
+    # Per-workload judgment against the recommender's actual thresholds.
+    # Match the constants in recommenders/builtins/rule_based_right_sizer.py
+    # and auto_suspend_survival.py so a PASS here means the recommender
+    # will fire too.
+    if spec.workload_key == "memory_hog":
+        if n_remote > 0:
+            verdict = f"PASS: {n_remote} remote spill (rule 1 -> upsize)"
+        elif n_local > 0 and (n_local / n) >= 0.20:
+            verdict = (
+                f"PASS: {n_local}/{n} local spill = {n_local/n:.0%} "
+                f"(rule 2 -> upsize)"
+            )
+        else:
+            verdict = (
+                f"FAIL: no spill (got {n_local} local, {n_remote} remote "
+                f"on {n} queries; need any remote OR >=20% local)"
+            )
+    elif spec.workload_key == "local_spill":
+        ratio = n_local / n if n > 0 else 0
+        if ratio >= 0.20:
+            verdict = (
+                f"PASS: {n_local}/{n} local spill = {ratio:.0%} "
+                f"(rule 2 -> upsize)"
+            )
+        else:
+            verdict = (
+                f"FAIL: {n_local}/{n} = {ratio:.0%} local spill "
+                f"(need >=20%)"
+            )
+    elif spec.workload_key == "saturated":
+        if avg_queue_ms >= 5000 and n >= 30:
+            verdict = (
+                f"PASS: avg queue {avg_queue_ms/1000:.1f}s on {n} queries "
+                f"(rule 3 -> upsize)"
+            )
+        else:
+            verdict = (
+                f"FAIL: avg queue {avg_queue_ms/1000:.1f}s on {n} queries "
+                f"(need >=5s and >=30 queries)"
+            )
+    elif spec.workload_key == "overkill":
+        if n >= 100 and p99_ms <= 1000 and n_local == 0 and n_remote == 0 and avg_queue_ms < 1000:
+            verdict = (
+                f"PASS: p99 {p99_ms:.0f}ms on {n} queries, no spill/queue "
+                f"(rule 4 -> downsize)"
+            )
+        else:
+            verdict = (
+                f"FAIL: doesn't meet rule 4 (n={n}>=100? p99={p99_ms:.0f}<=1000? "
+                f"spill={n_local+n_remote}==0? queue={avg_queue_ms:.0f}<1000?)"
+            )
+    elif spec.workload_key == "healthy":
+        # Control: should NOT trip any upsize/downsize rule.
+        triggers = []
+        if n_remote > 0:
+            triggers.append("rule 1 (remote spill)")
+        if n > 0 and (n_local / n) >= 0.20:
+            triggers.append("rule 2 (local spill)")
+        if avg_queue_ms >= 5000 and n >= 30:
+            triggers.append("rule 3 (queue)")
+        if n >= 100 and p99_ms <= 1000 and n_local == 0 and n_remote == 0 and avg_queue_ms < 1000:
+            triggers.append("rule 4 (downsize)")
+        if not triggers:
+            verdict = f"PASS: control - no rule triggered on {n} queries"
+        else:
+            verdict = f"FAIL: control unexpectedly triggers {', '.join(triggers)}"
+    else:
+        verdict = f"FAIL: unknown workload_key {spec.workload_key!r}"
+
+    return VerifyResult(
+        workload_key=spec.workload_key,
+        warehouse_name=spec.warehouse_name,
+        expected=spec.expected_finding,
+        observed=observed,
+        verdict=verdict,
+    )
+
+
+def _verify_bursty(
+    client: SnowflakeClient, spec: DemoWarehouseSpec, last: "RunStatus",
+) -> VerifyResult:
+    """The auto-suspend recommender needs WAREHOUSE_EVENTS_HISTORY.
+
+    That view lags hours, sometimes a full day on busy accounts - much
+    longer than QUERY_HISTORY's ~45 min.  We count suspend/resume cycles
+    and pass at >=10 (MIN_CYCLES_PER_WAREHOUSE in
+    auto_suspend_survival.py).
+    """
+    try:
+        rows = client.execute(f"""
+        SELECT
+            SUM(CASE WHEN event_name = 'SUSPEND_WAREHOUSE' THEN 1 ELSE 0 END) AS n_suspends,
+            SUM(CASE WHEN event_name = 'RESUME_WAREHOUSE'  THEN 1 ELSE 0 END) AS n_resumes
+        FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY
+        WHERE warehouse_name = '{spec.warehouse_name}'
+          AND timestamp >= TO_TIMESTAMP_NTZ('{last.started_at}')
+        """)
+    except Exception as e:
+        return VerifyResult(
+            workload_key=spec.workload_key,
+            warehouse_name=spec.warehouse_name,
+            expected=spec.expected_finding,
+            observed=f"events query failed: {e}",
+            verdict="FAIL: WAREHOUSE_EVENTS_HISTORY query errored",
+        )
+
+    n_suspends, n_resumes = (rows[0] if rows else (0, 0))
+    n_suspends = int(n_suspends or 0)
+    n_resumes = int(n_resumes or 0)
+    n_cycles = min(n_suspends, n_resumes)
+    observed = f"{n_suspends} suspends, {n_resumes} resumes, {n_cycles} complete cycles"
+
+    if n_cycles >= 10:
+        verdict = f"PASS: {n_cycles} cycles - auto-suspend tuner will fire"
+    elif n_cycles == 0:
+        verdict = (
+            "FAIL: 0 cycles - either workload's idle gaps didn't trigger "
+            "AUTO_SUSPEND, or WAREHOUSE_EVENTS_HISTORY hasn't caught up "
+            "(lag can be hours on this view)"
+        )
+    else:
+        verdict = (
+            f"FAIL: {n_cycles} cycles (need >=10; may be lag - retry later)"
+        )
+
+    return VerifyResult(
+        workload_key=spec.workload_key,
+        warehouse_name=spec.warehouse_name,
+        expected=spec.expected_finding,
+        observed=observed,
+        verdict=verdict,
+    )
+
+
 def latest_status(conn: duckdb.DuckDBPyConnection) -> RunStatus | None:
     """Return the most recent app.demo_runs row, or None if no runs exist."""
     row = conn.execute(

@@ -47,10 +47,14 @@ class FakeClient:
         *,
         raise_for_substring: dict[str, Exception] | None = None,
         show_warehouse_rows: list[tuple[Any, ...]] | None = None,
+        rows_for_substring: dict[str, list[tuple[Any, ...]]] | None = None,
     ) -> None:
         self.calls: list[str] = []
         self.raise_for_substring = raise_for_substring or {}
         self.show_warehouse_rows = show_warehouse_rows or []
+        # First substring match wins.  Useful for verify tests where the
+        # ACCOUNT_USAGE query needs to return specific rows per warehouse.
+        self.rows_for_substring = rows_for_substring or {}
         self.credentials = "fake-creds"  # what clone() copies
 
     def execute(self, sql: str, params: list | None = None) -> list[tuple]:
@@ -58,6 +62,9 @@ class FakeClient:
         for substr, exc in self.raise_for_substring.items():
             if substr.lower() in sql.lower():
                 raise exc
+        for substr, rows in self.rows_for_substring.items():
+            if substr.lower() in sql.lower():
+                return rows
         return []
 
     def execute_with_columns(self, sql: str, params: list | None = None):
@@ -74,6 +81,7 @@ class FakeClient:
         c = FakeClient(
             raise_for_substring=self.raise_for_substring,
             show_warehouse_rows=self.show_warehouse_rows,
+            rows_for_substring=self.rows_for_substring,
         )
         c.calls = self.calls
         return c
@@ -435,3 +443,223 @@ class TestSpecCoverage:
         import inspect
         sig = inspect.signature(run_demo)
         assert sig.parameters["specs"].default is demo_warehouses.DEMO_SPECS
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# verify_demo: post-hoc check that ACCOUNT_USAGE shows the expected signal
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _seed_demo_run(
+    duck: duckdb.DuckDBPyConnection, warehouse_names: list[str],
+) -> int:
+    """Helper: insert a demo_runs row so verify_demo has something to query."""
+    return _insert_run(duck, warehouse_names)
+
+
+class TestVerifyNoRun:
+    def test_no_runs_returns_none(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        assert verify_demo(client=FakeClient(), conn=duck) is None  # type: ignore[arg-type]
+
+
+class TestVerifyMemoryHog:
+    """memory_hog passes on any remote spill OR >=20% local spill."""
+
+    def test_pass_remote_spill(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
+        # ACCOUNT_USAGE aggregate: n=2, n_local=0, n_remote=1, queue=0, p99=200000ms, max_queue=0
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
+                [(2, 0, 1, 0, 200000, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        assert results is not None
+        mh = next(r for r in results if r.workload_key == "memory_hog")
+        assert mh.is_pass
+        assert "remote spill" in mh.verdict.lower()
+
+    def test_pass_high_local_spill(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
+        # n=2, both spilled local (100% local), no remote
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
+                [(2, 2, 0, 0, 200000, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        mh = next(r for r in results if r.workload_key == "memory_hog")
+        assert mh.is_pass
+        assert "local spill" in mh.verdict.lower()
+
+    def test_fail_no_spill(self, duck: duckdb.DuckDBPyConnection):
+        """Exactly the production failure mode from 2026-06-08: queries
+        ran but produced no spill.  Verdict must be FAIL with the actual
+        observed counts so the operator can triage."""
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
+                [(2, 0, 0, 0, 100, 0)],   # ran fast, no spill
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        mh = next(r for r in results if r.workload_key == "memory_hog")
+        assert not mh.is_pass
+        assert "no spill" in mh.verdict.lower()
+
+
+class TestVerifyLocalSpill:
+    def test_pass_at_threshold(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_LOCAL_SPILL_WH"])
+        # n=10, n_local=3 (30%); 30% > 20% threshold
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_LOCAL_SPILL_WH'":
+                [(10, 3, 0, 0, 5000, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        ls = next(r for r in results if r.workload_key == "local_spill")
+        assert ls.is_pass
+
+    def test_fail_below_threshold(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_LOCAL_SPILL_WH"])
+        # n=10, n_local=1 (10%); below 20% threshold
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_LOCAL_SPILL_WH'":
+                [(10, 1, 0, 0, 5000, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        ls = next(r for r in results if r.workload_key == "local_spill")
+        assert not ls.is_pass
+
+
+class TestVerifySaturated:
+    def test_pass_queue_above_5s(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_SATURATED_WH"])
+        # n=60, avg_queue=30s (above 5s threshold)
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_SATURATED_WH'":
+                [(60, 0, 0, 30000, 10000, 75000)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        sat = next(r for r in results if r.workload_key == "saturated")
+        assert sat.is_pass
+
+    def test_fail_queue_below_5s(self, duck: duckdb.DuckDBPyConnection):
+        """The exact 2026-06-08 production observation: 121 queries,
+        max_queue 0.28s, avg ~10ms.  Should FAIL clearly."""
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_SATURATED_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_SATURATED_WH'":
+                [(121, 0, 0, 10, 200, 280)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        sat = next(r for r in results if r.workload_key == "saturated")
+        assert not sat.is_pass
+        assert "0.0s" in sat.verdict or "0.01s" in sat.verdict
+
+
+class TestVerifyOverkill:
+    def test_pass_when_fast_no_spill_no_queue(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_OVERKILL_WH"])
+        # n=120, p99=300ms, no spill, no queue - matches the production
+        # OVERKILL case that the user reported working correctly.
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_OVERKILL_WH'":
+                [(120, 0, 0, 0, 300, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        ov = next(r for r in results if r.workload_key == "overkill")
+        assert ov.is_pass
+
+    def test_fail_when_p99_too_high(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_OVERKILL_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_OVERKILL_WH'":
+                [(120, 0, 0, 0, 5000, 0)],   # p99=5s, breaks rule 4
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        ov = next(r for r in results if r.workload_key == "overkill")
+        assert not ov.is_pass
+
+
+class TestVerifyHealthy:
+    """The control case.  PASS = no recommender rule would trigger."""
+
+    def test_pass_when_no_signal(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_HEALTHY_WH"])
+        # n=50, no spill, no queue, p99 well under 1s but n<100 so rule 4
+        # won't trigger downsize either.
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_HEALTHY_WH'":
+                [(50, 0, 0, 0, 2000, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        hl = next(r for r in results if r.workload_key == "healthy")
+        assert hl.is_pass
+
+    def test_fail_when_unexpectedly_triggers(self, duck: duckdb.DuckDBPyConnection):
+        """If HEALTHY starts producing spill, something's wrong with the
+        cooked workload or the warehouse sizing."""
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_HEALTHY_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_HEALTHY_WH'":
+                [(50, 0, 5, 0, 2000, 0)],   # 5 remote spills - shouldn't happen
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        hl = next(r for r in results if r.workload_key == "healthy")
+        assert not hl.is_pass
+
+
+class TestVerifyBursty:
+    """bursty checks WAREHOUSE_EVENTS_HISTORY, not QUERY_HISTORY."""
+
+    def test_pass_with_ten_cycles(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_BURSTY_WH"])
+        # 10 suspends, 10 resumes = 10 complete cycles
+        client = FakeClient(rows_for_substring={
+            "WAREHOUSE_EVENTS_HISTORY": [(10, 10)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        br = next(r for r in results if r.workload_key == "bursty")
+        assert br.is_pass
+
+    def test_fail_with_no_events_calls_out_lag(self, duck: duckdb.DuckDBPyConnection):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_BURSTY_WH"])
+        client = FakeClient(rows_for_substring={
+            "WAREHOUSE_EVENTS_HISTORY": [(0, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        br = next(r for r in results if r.workload_key == "bursty")
+        assert not br.is_pass
+        # Must explicitly mention lag so the user knows to retry later.
+        assert "lag" in br.verdict.lower() or "caught up" in br.verdict.lower()
+
+
+class TestVerifyZeroQueriesCallsOutLag:
+    """When ACCOUNT_USAGE returns 0 queries (full lag scenario), the
+    verdict must say so explicitly so the user understands to retry."""
+
+    def test_zero_queries_mentions_account_usage_lag(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
+                [(0, 0, 0, 0, 0, 0)],
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        mh = next(r for r in results if r.workload_key == "memory_hog")
+        assert not mh.is_pass
+        assert "caught up" in mh.verdict.lower() or "lag" in mh.verdict.lower()

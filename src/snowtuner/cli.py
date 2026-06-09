@@ -2023,6 +2023,82 @@ def demo_status() -> None:
     console.print(wl_tbl)
 
 
+@demo.command("verify")
+def demo_verify() -> None:
+    """Check the last demo run's ACCOUNT_USAGE signals against expectations.
+
+    Each demo workload was designed to produce a specific signal (remote
+    spill / local spill / queue overload / fast queries with no spill /
+    suspend cycles).  This command queries Snowflake ACCOUNT_USAGE for
+    each demo warehouse and reports PASS or FAIL per workload, using the
+    same thresholds the recommenders use.
+
+    Useful when ``snowtuner demo seed`` completes but ``snowtuner run``
+    produces fewer recommendations than expected - this tells you
+    whether the workload itself failed (FAIL on a spill check) or whether
+    ACCOUNT_USAGE just hasn't caught up yet (FAIL with "0 queries" or
+    "ACCOUNT_USAGE hasn't caught up").
+
+    Run 45+ min after demo seed completes.  WAREHOUSE_EVENTS_HISTORY
+    (used by the BURSTY check) can lag hours.
+    """
+    from snowtuner.demo.runner import verify_demo
+
+    conn = get_connection()
+    try:
+        client = SnowflakeClient.from_resolver()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
+    results = verify_demo(client=client, conn=conn)
+    client.close()
+
+    if results is None:
+        console.print(
+            "[yellow]No demo runs found.[/yellow]  "
+            "Run [cyan]snowtuner demo seed[/cyan] first."
+        )
+        return
+    if not results:
+        console.print(
+            "[yellow]Latest demo run has no warehouses to verify.[/yellow]"
+        )
+        return
+
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("Workload")
+    tbl.add_column("Warehouse")
+    tbl.add_column("Verdict")
+    for r in results:
+        color = "green" if r.is_pass else "red"
+        tbl.add_row(
+            r.workload_key,
+            r.warehouse_name,
+            f"[{color}]{r.verdict}[/{color}]",
+        )
+    console.print(tbl)
+
+    # Also dump per-workload observed metrics in a second block so the
+    # user can see exact spill / queue numbers when triaging a FAIL.
+    console.print()
+    for r in results:
+        console.print(f"[dim]{r.workload_key}:[/dim] {r.observed}")
+
+    fails = [r for r in results if not r.is_pass]
+    if fails:
+        console.print(
+            f"\n[red]{len(fails)} of {len(results)} workload(s) didn't "
+            f"produce the expected signal.[/red]\n"
+            f"If failures say 'ACCOUNT_USAGE hasn't caught up' or '0 cycles', "
+            f"wait 30+ min and re-run.  Otherwise the cooked workload "
+            f"undershot - file a bug with the observed numbers above."
+        )
+        raise SystemExit(2)
+    console.print(f"\n[green]All {len(results)} workload(s) produced "
+                  f"their expected signals.[/green]")
+
+
 @demo.command("teardown")
 @click.option("--yes", is_flag=True, default=False,
               help="Skip the confirmation prompt.")
