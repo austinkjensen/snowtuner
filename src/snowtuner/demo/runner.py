@@ -41,20 +41,21 @@ logger = logging.getLogger(__name__)
 # Standard Snowflake credit cost per "demo run" - rough order-of-magnitude
 # estimate shown to the user before they hit y/n.  Real cost depends on
 # edition and current credit price.  Numbers are based on each warehouse's
-# size * estimated wall-clock active time.  Round-2 calibration: the spill
-# workloads got dramatically heavier (600M-key exact distincts that MUST
-# spill to demonstrate the rule), which is most of the cost increase from
-# the original 0.85-credit estimate:
-#   MEMORY_HOG  XSMALL (1 cr/hr) * ~25 min active  ≈ 0.45 credits
-#   LOCAL_SPILL SMALL  (2 cr/hr) * ~15 min active  ≈ 0.50 credits
-#   SATURATED   SMALL  (2 cr/hr) * ~6 min active   ≈ 0.20 credits
+# size * estimated wall-clock active time.  Round-3 calibration: spill
+# workloads moved to SF1000 (1.5B-key distincts + one 6B-key monster) so
+# spill is guaranteed regardless of node memory - demonstrating real
+# memory pressure costs real compute, by design:
+#   MEMORY_HOG  XSMALL (1 cr/hr) * ~60 min active  ≈ 1.00 credits
+#   LOCAL_SPILL SMALL  (2 cr/hr) * ~25 min active  ≈ 0.85 credits
+#   SATURATED   SMALL  (2 cr/hr) * ~8 min active   ≈ 0.27 credits
 #   OVERKILL    LARGE  (8 cr/hr) * ~3 min active   ≈ 0.40 credits
 #   BURSTY      SMALL  (2 cr/hr) * ~5 min active   ≈ 0.17 credits (idle suspended)
 #   HEALTHY     SMALL  (2 cr/hr) * ~2 min active   ≈ 0.07 credits
-# Total ≈ 1.8 credits; round up for variance.  Recalibrate against
-# WAREHOUSE_METERING_HISTORY after each dogfood run.
-EST_CREDITS_PER_RUN = 2.0
-EST_DOLLARS_PER_RUN = 6.00
+# Total ≈ 2.8 credits; round up for variance (the monster's runtime is
+# the big unknown).  Recalibrate against WAREHOUSE_METERING_HISTORY
+# after each dogfood run.
+EST_CREDITS_PER_RUN = 3.5
+EST_DOLLARS_PER_RUN = 10.50
 
 
 @dataclass
@@ -122,6 +123,31 @@ def preflight(client: SnowflakeClient) -> PreflightReport:
         else:
             issues.append(f"SNOWFLAKE_SAMPLE_DATA probe failed unexpectedly: {e}")
 
+    # 3. TPCH_SF1000 specifically: the spill workloads need its
+    #    billions-of-rows tables (ORDERS 1.5B, LINEITEM 6B).  Most
+    #    accounts' sample-data share includes SF1000, but some older or
+    #    partial mounts only carry SF1-SF100 - catch that here instead
+    #    of 20 minutes into the run.  NATION is 25 rows; the probe is free.
+    try:
+        client.execute(
+            "SELECT 1 FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.NATION LIMIT 1"
+        )
+    except Exception as e:
+        if _is_access_error(e) or "does not exist" in str(e).lower():
+            issues.append(
+                "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000 not found - the demo's "
+                "spill workloads need its billion-row tables.  Your "
+                "sample-data share may be a partial mount.  Re-mount as "
+                "ACCOUNTADMIN:\n"
+                "  DROP DATABASE IF EXISTS SNOWFLAKE_SAMPLE_DATA;\n"
+                "  CREATE DATABASE SNOWFLAKE_SAMPLE_DATA FROM SHARE "
+                "SFC_SAMPLES.SAMPLE_DATA;\n"
+                "  GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA\n"
+                "    TO ROLE <snowtuner-role>;"
+            )
+        else:
+            issues.append(f"TPCH_SF1000 probe failed unexpectedly: {e}")
+
     if issues:
         return PreflightReport(
             ok=False,
@@ -151,10 +177,13 @@ def cost_summary() -> str:
     """
     return (
         f"Estimated cost: ~{EST_CREDITS_PER_RUN:.2f} credits "
-        f"(~${EST_DOLLARS_PER_RUN:.2f} at $3/credit standard edition).\n"
-        f"Workload runtime: ~30 minutes (BURSTY is the long pole).\n"
+        f"(~${EST_DOLLARS_PER_RUN:.2f} at $3/credit standard edition); "
+        f"worst case roughly double if the deep-spill queries run long.\n"
+        f"Workload runtime: ~45-70 minutes (MEMORY_HOG's deep-spill "
+        f"queries are the long pole).\n"
         f"Then ACCOUNT_USAGE catches up after ~45 minutes; run "
-        f"`snowtuner sync && snowtuner run` at that point."
+        f"`snowtuner demo verify` at that point, then "
+        f"`snowtuner sync && snowtuner run`."
     )
 
 

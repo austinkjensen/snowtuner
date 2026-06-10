@@ -178,6 +178,21 @@ class TestPreflight:
         # Don't claim "missing grant" when the real error is something else.
         assert "network timeout" in report.message
 
+    def test_reports_missing_sf1000_schema(self):
+        """Some accounts' sample-data share omits TPCH_SF1000.  The spill
+        workloads hard-require it, so preflight must catch this before
+        the run starts, with the re-mount SQL in the message."""
+        client = FakeClient(raise_for_substring={
+            "TPCH_SF1000": Exception(
+                "002003 (42S02): Object 'SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000."
+                "NATION' does not exist or not authorized."
+            ),
+        })
+        report = preflight(client)  # type: ignore[arg-type]
+        assert report.ok is False
+        assert "TPCH_SF1000" in report.message
+        assert "SFC_SAMPLES.SAMPLE_DATA" in report.message
+
 
 # ── DB persistence helpers ────────────────────────────────────────────────
 

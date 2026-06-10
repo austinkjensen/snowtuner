@@ -172,21 +172,31 @@ class _SpillWorkloadBase(DemoWorkload):
     3. The spill primitive is exact COUNT(DISTINCT col_a, col_b) over a
        high-cardinality composite key.  Unlike ORDER BY (top-K shortcut)
        or low-cardinality GROUP BY (tiny hash table), exact distinct has
-       no shortcut: the hash table must hold every distinct key.  SF100
-       LINEITEM has ~600M near-unique (l_orderkey, l_partkey) pairs ->
-       15-20 GB of hash state, beyond any current XSMALL/SMALL node
-       memory.  Round-1 mistakes: TPC-H Q1 (4-row output, nothing to
-       spill) and ROW_NUMBER mid-range filter (bounded heap, ~600 MB).
+       no shortcut: the hash table must hold every distinct key.  SF1000
+       ORDERS has 1.5B near-unique (o_orderkey, o_custkey) pairs ->
+       roughly 36-45 GB of hash state, 2-3x beyond any current XSMALL or
+       SMALL node's memory, so spill happens regardless of the exact
+       node config (which Snowflake doesn't publish).  Round-1 mistakes:
+       TPC-H Q1 (4-row output, nothing to spill) and ROW_NUMBER mid-range
+       filter (bounded heap, ~600 MB).  Round-2 mistake: SF100's 600M
+       keys (~15-20 GB) sat too close to plausible node memory to be a
+       guarantee.
 
-    Heavies run through a small thread pool so wall time stays in the
-    ~15-25 min range instead of N_HEAVY * per-query minutes.  Concurrent
-    heavies also share node memory, which makes spill MORE likely, and
-    any queueing they cause is harmless (Rule 2 is checked before Rule 3).
+    Heavies run through a small thread pool so wall time stays bounded
+    instead of N_HEAVY * per-query minutes.  Concurrent heavies also
+    share node memory, which makes spill MORE likely, and any queueing
+    they cause is harmless (Rule 2 is checked before Rule 3).
+
+    ``_MONSTER_SQL`` (optional, MemoryHog only): one far bigger distinct
+    whose hash state (~150-180 GB) can exceed the node's local SSD - the
+    actual trigger for REMOTE spill (Rule 1).  Best-effort: it gets a
+    60-minute timeout and shares the pool, and the verify command counts
+    Rule 1 a bonus, not a requirement.
     """
 
     _HEAVY_SQL = """
-    SELECT COUNT(DISTINCT l_orderkey, l_partkey) AS n_pairs
-    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.LINEITEM
+    SELECT COUNT(DISTINCT o_orderkey, o_custkey) AS n_pairs
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.ORDERS
     """
 
     _LIGHT_SQL = """
@@ -198,6 +208,22 @@ class _SpillWorkloadBase(DemoWorkload):
     _N_HEAVY = 8
     _N_LIGHT = 20
     _HEAVY_CONCURRENCY = 4
+    _HEAVY_TIMEOUT_S = 1500
+
+    _MONSTER_SQL: str | None = None
+    _MONSTER_TIMEOUT_S = 3600
+
+    def _heavy_jobs(self) -> list[tuple[str, int]]:
+        """(sql, statement_timeout_seconds) per heavy query.
+
+        The monster goes FIRST so it grabs a pool slot immediately - wall
+        time becomes max(monster, remaining heavies through 3 slots)
+        instead of (heavies + monster) serially.
+        """
+        jobs = [(self._HEAVY_SQL.strip(), self._HEAVY_TIMEOUT_S)] * self._N_HEAVY
+        if self._MONSTER_SQL:
+            jobs.insert(0, (self._MONSTER_SQL.strip(), self._MONSTER_TIMEOUT_S))
+        return jobs
 
     def execute(
         self,
@@ -221,16 +247,19 @@ class _SpillWorkloadBase(DemoWorkload):
         )
 
         # Heavies through a small pool, each on its own cloned connection.
-        # Per-clone session needs its own timeout bump: a spilled 600M-key
-        # distinct on XSMALL runs 5-15 min, past prepare_session's 600s cap.
-        def _one_heavy(_i: int) -> tuple[bool, str | None]:
+        # Per-clone session needs its own timeout: a spilled 1.5B-key
+        # distinct on XSMALL runs 10-25 min, past prepare_session's 600s
+        # cap; the monster gets a full hour.
+        def _one_heavy(sql: str, timeout_s: int) -> tuple[bool, str | None]:
             if stop_event.is_set():
                 return False, "stopped"
             per_thread = client.clone()
             try:
                 ex = _new_executor(per_thread, warehouse_name)
-                ex.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1500")
-                ex.execute(self._HEAVY_SQL.strip())
+                ex.execute(
+                    f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {timeout_s}"
+                )
+                ex.execute(sql)
                 return True, None
             except Exception as e:
                 return False, f"{type(e).__name__}: {e}"
@@ -238,7 +267,10 @@ class _SpillWorkloadBase(DemoWorkload):
                 per_thread.close()
 
         with ThreadPoolExecutor(max_workers=self._HEAVY_CONCURRENCY) as pool:
-            futures = [pool.submit(_one_heavy, i) for i in range(self._N_HEAVY)]
+            futures = [
+                pool.submit(_one_heavy, sql, timeout_s)
+                for sql, timeout_s in self._heavy_jobs()
+            ]
             for fut in as_completed(futures):
                 result.queries_attempted += 1
                 ok, err = fut.result()
@@ -257,35 +289,44 @@ class _SpillWorkloadBase(DemoWorkload):
 
 
 class MemoryHogWorkload(_SpillWorkloadBase):
-    """600M-key exact distinct on XSMALL -> every heavy query spills hard.
+    """1.5B-key exact distincts on XSMALL -> every heavy drowns in spill.
 
-    Demonstrates right-sizer Rule 2 (sustained local spill -> upsize).
-    Rule 1 (remote spill) was the original target but is not demoable at
-    sane cost: remote spill requires exhausting the node's local SSD
-    (hundreds of GB of spill), which means a multi-hour query.  If a
-    heavy does push into remote on a constrained account, Rule 1 fires
-    instead - same upsize recommendation, stronger evidence.
+    Demonstrates right-sizer Rule 2 (sustained local spill -> upsize),
+    and takes a genuine shot at Rule 1: the monster query's ~150-180 GB
+    of hash state (6B near-unique LINEITEM pairs) is in the range of an
+    XSMALL node's entire local SSD, which is the actual remote-spill
+    trigger.  Whether it tips over depends on the node's disk config -
+    Rule 1 is a bonus, Rule 2 is the guarantee.  Either way the
+    recommendation is the same upsize.
     """
     key = "memory_hog"
-    description = "8x 600M-key exact distinct on XSMALL - sustained local spill"
-    estimated_minutes = 25.0
+    description = (
+        "8x 1.5B-key distincts + one 6B-key monster on XSMALL - deep spill"
+    )
+    estimated_minutes = 60.0
+
+    _MONSTER_SQL = """
+    SELECT COUNT(DISTINCT l_orderkey, l_partkey) AS n_pairs
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.LINEITEM
+    """
 
 
 # ── workload 2: LOCAL_SPILL ───────────────────────────────────────────────
 
 
 class LocalSpillWorkload(_SpillWorkloadBase):
-    """Same 600M-key distinct, but on SMALL -> intermittent local spill.
+    """Same 1.5B-key distinct, but on SMALL -> moderate local spill.
 
-    SMALL has roughly twice XSMALL's memory and spreads the hash state
-    across more capacity, so the same heavy query spills less deeply -
-    the "workload routinely runs out of memory but limps through" pattern
-    Rule 2 describes, vs MEMORY_HOG's every-query-drowns variant.  Faster
-    per-heavy than MEMORY_HOG (~3-6 min vs 5-15) for the same reason.
+    SMALL spreads the ~36-45 GB hash state across two nodes, so each
+    node sees ~18-22 GB against its memory - spills, but shallower than
+    MEMORY_HOG's single-node drowning.  The "workload routinely runs
+    out of memory but limps through" pattern Rule 2 describes.  No
+    monster query here: remote spill on this warehouse would muddy the
+    two-intensity story.
     """
     key = "local_spill"
-    description = "8x 600M-key exact distinct on SMALL - intermittent spill"
-    estimated_minutes = 15.0
+    description = "8x 1.5B-key exact distinct on SMALL - moderate spill"
+    estimated_minutes = 25.0
 
 
 # ── workload 3: SATURATED ─────────────────────────────────────────────────
@@ -301,12 +342,19 @@ class SaturatedWorkload(DemoWorkload):
     more than 8 of them concurrently - max queue landed at 4.76s, just
     under the 5s threshold.
 
-    Exact COUNT(DISTINCT l_orderkey) over 60M rows is CPU-bound: ~15M
-    distinct keys must be hashed and deduped regardless of cache state,
-    so per-query cost stays ~10-20s AND each query holds real memory,
-    which keeps effective concurrency near the nominal 8.  80 queries
-    deep, the tail waits through ~9 batches: avg queue 40-60s, far past
-    the rule-3 threshold (avg >=5s, n>=30).
+    Exact COUNT(DISTINCT c_custkey) over SF1000's 150M-row CUSTOMER is
+    CPU-bound: 150M distinct keys must be hashed and deduped regardless
+    of cache state, so per-query cost stays ~15-30s AND each query holds
+    real (but in-memory: ~2-3 GB) state, which keeps effective
+    concurrency near the nominal 8.  80 queries deep, the tail waits
+    through ~9 batches: avg queue 60-100s, far past the rule-3 threshold
+    (avg >=5s, n>=30).
+
+    Deliberately NOT one of the billion-row tables: per-query cost must
+    stay ~tens of seconds or 80 queries deep becomes an hours-long crawl,
+    and the state must FIT in memory so this warehouse queues without
+    spilling - spill here would make Rule 2 fire instead of Rule 3 and
+    muddy the demo story.
 
     Memory note: 80 concurrent Python threads each holding a Snowflake
     connection costs ~3-4 GB on the client host.  Fits t3.medium's 4 GB
@@ -314,14 +362,14 @@ class SaturatedWorkload(DemoWorkload):
     handful of connections.
     """
     key = "saturated"
-    description = "80 concurrent CPU-bound distincts on SMALL -> 40s+ queueing"
-    estimated_minutes = 8.0
+    description = "80 concurrent CPU-bound distincts on SMALL -> 60s+ queueing"
+    estimated_minutes = 10.0
 
-    # Cache-resistant: the cost is hashing 60M values into ~15M distinct
-    # keys, not reading bytes.  Output is 1 row.
+    # Cache-resistant: the cost is hashing 150M values, not reading bytes.
+    # Output is 1 row; state ~2-3 GB fits SMALL memory (no spill wanted).
     _CONCURRENT_SQL = """
-    SELECT COUNT(DISTINCT l_orderkey) AS n_orders
-    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM
+    SELECT COUNT(DISTINCT c_custkey) AS n_customers
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.CUSTOMER
     """
 
     _FAN_OUT = 80

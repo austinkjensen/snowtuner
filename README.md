@@ -116,7 +116,7 @@ snowtuner sync && snowtuner run
 snowtuner demo teardown   # drops the 6 demo warehouses
 ```
 
-Demo mode provisions 6 throwaway warehouses prefixed `SNOWTUNER_DEMO_*`, runs cooked workloads (TPC-H sample data) shaped to trip specific recommender rules, and tears them down on completion. Cost is ~2 credits (~$6 at standard $3/credit) per run; the command prints the estimate and waits for confirmation. After the run, `snowtuner demo verify` checks ACCOUNT_USAGE and reports PASS/FAIL per workload against the recommenders' own thresholds. Two extra grants required - `snowtuner bootstrap-sql` prints them under the "OPTIONAL: enable `snowtuner demo seed`" block.
+Demo mode provisions 6 throwaway warehouses prefixed `SNOWTUNER_DEMO_*`, runs cooked workloads (TPC-H sample data, up to the billion-row SF1000 tables) shaped to trip specific recommender rules, and tears them down on completion. Cost is ~3.5 credits (~$10 at standard $3/credit) per run; the command prints the estimate and waits for confirmation. After the run, `snowtuner demo verify` checks ACCOUNT_USAGE and reports PASS/FAIL per workload against the recommenders' own thresholds. Two extra grants required - `snowtuner bootstrap-sql` prints them under the "OPTIONAL: enable `snowtuner demo seed`" block.
 
 Demo data is intentionally cooked - the workloads are engineered to trigger known recommendations. Real-account findings come from `snowtuner sync` against your actual history.
 

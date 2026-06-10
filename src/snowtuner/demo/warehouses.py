@@ -55,16 +55,17 @@ class DemoWarehouseSpec:
 #
 # Sizes deliberately chosen relative to the workload so the right-sizer's
 # thresholds fire:
-#   Rule 2 (>=20% local spill -> +1)        : MEMORY_HOG     (XSMALL + 600M-key distincts, deep spill)
-#   Rule 2 (>=20% local spill -> +1)        : LOCAL_SPILL_WH (SMALL + same distincts, lighter spill)
+#   Rule 2 (>=20% local spill -> +1)        : MEMORY_HOG     (XSMALL + 1.5B-key distincts, deep spill)
+#   Rule 2 (>=20% local spill -> +1)        : LOCAL_SPILL_WH (SMALL + same distincts, moderate spill)
 #   Rule 3 (avg queue >=5s, n>=30 -> +1)    : SATURATED      (SMALL + 80 concurrent CPU-bound)
 #   Rule 4 (p99 <=1s, n>=100 -> -1)         : OVERKILL       (LARGE + trivial queries)
 #
-# Rule 1 (any remote spill -> +1) is deliberately NOT demoed: remote spill
-# only happens after a query exhausts the node's local SSD (hundreds of GB
-# of spill), which means a multi-hour query at real cost.  If MEMORY_HOG
-# happens to push into remote on a constrained account, Rule 1 fires
-# instead of Rule 2 - same upsize, stronger evidence.
+# Rule 1 (any remote spill -> +1) is attempted but not guaranteed:
+# MEMORY_HOG includes one monster query (6B-key distinct on SF1000
+# LINEITEM, ~150-180 GB hash state) sized to potentially exceed an
+# XSMALL node's local SSD - the actual remote-spill trigger.  Whether it
+# tips over depends on the node's disk config.  If it does, Rule 1
+# fires instead of Rule 2 - same upsize, stronger evidence.
 #
 # Every spill/queue warehouse must also clear the right-sizer's readiness
 # gate of >=30 SUCCESS queries in the window (MIN_QUERIES_FOR_READINESS) -
@@ -90,7 +91,8 @@ DEMO_SPECS: tuple[DemoWarehouseSpec, ...] = (
         workload_key="memory_hog",
         expected_finding=(
             "Right-sizer Rule 2: sustained local spill (memory-bound on "
-            "XSMALL) -> upsize to SMALL"
+            "XSMALL) -> upsize to SMALL.  Rule 1 (remote spill) possible "
+            "if the monster query exceeds local disk"
         ),
     ),
     DemoWarehouseSpec(

@@ -1114,9 +1114,10 @@ GRANT DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER TO ROLE {role};
 -- run` will surface known recommendations on those demo warehouses,
 -- letting you see the optimizer end-to-end on your own account.
 --
--- Cost: ~2 credits (~$6 at $3/credit standard edition) per run.  Most of
--- it goes to the spill workloads, which must run genuinely memory-bound
--- queries to demonstrate the right-sizer's spill rules.
+-- Cost: ~3.5 credits (~$10 at $3/credit standard edition) per run.  Most
+-- of it goes to the spill workloads, which run genuinely memory-bound
+-- queries against the billion-row TPCH_SF1000 tables - demonstrating
+-- real memory pressure costs real compute.
 -- Tear down with `snowtuner demo teardown` (drops all SNOWTUNER_DEMO_*
 -- warehouses).  AUTO_SUSPEND caps idle cost at 60-120s per warehouse
 -- even if the process crashes mid-run.
@@ -1869,9 +1870,11 @@ def demo_seed(yes: bool, skip_teardown: bool) -> None:
 
     \b
     What happens:
-      1. Pre-flight check: verifies CREATE WAREHOUSE + SNOWFLAKE_SAMPLE_DATA grants.
+      1. Pre-flight check: verifies CREATE WAREHOUSE + SNOWFLAKE_SAMPLE_DATA
+         grants (including the TPCH_SF1000 schema the spill workloads need).
       2. Provisions 6 warehouses prefixed SNOWTUNER_DEMO_*.
-      3. Runs the workloads in parallel (~30 min wall time).
+      3. Runs the workloads in parallel (~45-70 min wall time; the
+         deep-spill queries dominate).
       4. Tears down the warehouses on completion (or on Ctrl-C).
 
     \b
