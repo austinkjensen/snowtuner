@@ -1114,7 +1114,9 @@ GRANT DATABASE ROLE SNOWFLAKE.GOVERNANCE_VIEWER TO ROLE {role};
 -- run` will surface known recommendations on those demo warehouses,
 -- letting you see the optimizer end-to-end on your own account.
 --
--- Cost: ~0.85 credits (~$2.55 at $3/credit standard edition) per run.
+-- Cost: ~2 credits (~$6 at $3/credit standard edition) per run.  Most of
+-- it goes to the spill workloads, which must run genuinely memory-bound
+-- queries to demonstrate the right-sizer's spill rules.
 -- Tear down with `snowtuner demo teardown` (drops all SNOWTUNER_DEMO_*
 -- warehouses).  AUTO_SUSPEND caps idle cost at 60-120s per warehouse
 -- even if the process crashes mid-run.

@@ -41,16 +41,20 @@ logger = logging.getLogger(__name__)
 # Standard Snowflake credit cost per "demo run" - rough order-of-magnitude
 # estimate shown to the user before they hit y/n.  Real cost depends on
 # edition and current credit price.  Numbers are based on each warehouse's
-# size * estimated wall-clock active time:
-#   MEMORY_HOG  XSMALL  * ~5 min active  ≈ 0.08 credits
-#   LOCAL_SPILL SMALL   * ~3 min active  ≈ 0.10 credits
-#   SATURATED   SMALL   * ~3 min active  ≈ 0.10 credits
-#   OVERKILL    LARGE   * ~3 min active  ≈ 0.40 credits
-#   BURSTY      SMALL   * ~3 min active  ≈ 0.10 credits  (idle is free)
-#   HEALTHY     SMALL   * ~2 min active  ≈ 0.07 credits
-# Total ≈ 0.85 credits ≈ $2.50 at $3/credit (standard edition).
-EST_CREDITS_PER_RUN = 0.85
-EST_DOLLARS_PER_RUN = 2.55
+# size * estimated wall-clock active time.  Round-2 calibration: the spill
+# workloads got dramatically heavier (600M-key exact distincts that MUST
+# spill to demonstrate the rule), which is most of the cost increase from
+# the original 0.85-credit estimate:
+#   MEMORY_HOG  XSMALL (1 cr/hr) * ~25 min active  ≈ 0.45 credits
+#   LOCAL_SPILL SMALL  (2 cr/hr) * ~15 min active  ≈ 0.50 credits
+#   SATURATED   SMALL  (2 cr/hr) * ~6 min active   ≈ 0.20 credits
+#   OVERKILL    LARGE  (8 cr/hr) * ~3 min active   ≈ 0.40 credits
+#   BURSTY      SMALL  (2 cr/hr) * ~5 min active   ≈ 0.17 credits (idle suspended)
+#   HEALTHY     SMALL  (2 cr/hr) * ~2 min active   ≈ 0.07 credits
+# Total ≈ 1.8 credits; round up for variance.  Recalibrate against
+# WAREHOUSE_METERING_HISTORY after each dogfood run.
+EST_CREDITS_PER_RUN = 2.0
+EST_DOLLARS_PER_RUN = 6.00
 
 
 @dataclass
@@ -585,8 +589,18 @@ def _verify_via_query_history(
     # Match the constants in recommenders/builtins/rule_based_right_sizer.py
     # and auto_suspend_survival.py so a PASS here means the recommender
     # will fire too.
+    #
+    # The n >= 30 checks mirror MIN_QUERIES_FOR_READINESS: the right-sizer
+    # skips any warehouse below it, so spill with too few queries is still
+    # a FAIL.  Dogfood round 1 missed exactly this - 11 queries of perfect
+    # spill produce zero recommendations.
     if spec.workload_key == "memory_hog":
-        if n_remote > 0:
+        if n < 30:
+            verdict = (
+                f"FAIL: only {n} queries - below the right-sizer readiness "
+                f"gate (need >=30); spill is irrelevant until n clears it"
+            )
+        elif n_remote > 0:
             verdict = f"PASS: {n_remote} remote spill (rule 1 -> upsize)"
         elif n_local > 0 and (n_local / n) >= 0.20:
             verdict = (
@@ -600,7 +614,12 @@ def _verify_via_query_history(
             )
     elif spec.workload_key == "local_spill":
         ratio = n_local / n if n > 0 else 0
-        if ratio >= 0.20:
+        if n < 30:
+            verdict = (
+                f"FAIL: only {n} queries - below the right-sizer readiness "
+                f"gate (need >=30); spill is irrelevant until n clears it"
+            )
+        elif ratio >= 0.20:
             verdict = (
                 f"PASS: {n_local}/{n} local spill = {ratio:.0%} "
                 f"(rule 2 -> upsize)"

@@ -464,15 +464,19 @@ class TestVerifyNoRun:
 
 
 class TestVerifyMemoryHog:
-    """memory_hog passes on any remote spill OR >=20% local spill."""
+    """memory_hog passes on (n>=30) AND (any remote spill OR >=20% local).
+
+    The n>=30 gate mirrors the right-sizer's MIN_QUERIES_FOR_READINESS -
+    a warehouse below it is skipped entirely, so spill alone is not enough.
+    """
 
     def test_pass_remote_spill(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
-        # ACCOUNT_USAGE aggregate: n=2, n_local=0, n_remote=1, queue=0, p99=200000ms, max_queue=0
+        # n=34 (clears gate), 1 remote spill
         client = FakeClient(rows_for_substring={
             "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
-                [(2, 0, 1, 0, 200000, 0)],
+                [(34, 0, 1, 0, 200000, 0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         assert results is not None
@@ -483,10 +487,10 @@ class TestVerifyMemoryHog:
     def test_pass_high_local_spill(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
-        # n=2, both spilled local (100% local), no remote
+        # n=34, 10 local spills = 29%, no remote
         client = FakeClient(rows_for_substring={
             "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
-                [(2, 2, 0, 0, 200000, 0)],
+                [(34, 10, 0, 0, 200000, 0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         mh = next(r for r in results if r.workload_key == "memory_hog")
@@ -494,29 +498,48 @@ class TestVerifyMemoryHog:
         assert "local spill" in mh.verdict.lower()
 
     def test_fail_no_spill(self, duck: duckdb.DuckDBPyConnection):
-        """Exactly the production failure mode from 2026-06-08: queries
-        ran but produced no spill.  Verdict must be FAIL with the actual
-        observed counts so the operator can triage."""
+        """The 2026-06-08 round-1 failure mode: queries ran but produced
+        no spill.  Verdict must be FAIL with the actual observed counts
+        so the operator can triage."""
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
         client = FakeClient(rows_for_substring={
             "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
-                [(2, 0, 0, 0, 100, 0)],   # ran fast, no spill
+                [(34, 0, 0, 0, 100, 0)],   # n clears the gate; zero spill
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         mh = next(r for r in results if r.workload_key == "memory_hog")
         assert not mh.is_pass
         assert "no spill" in mh.verdict.lower()
 
+    def test_fail_below_readiness_gate_even_with_spill(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        """The 2026-06-08 round-2 discovery: MEMORY_HOG had only 11 rows
+        in QUERY_HISTORY, below MIN_QUERIES_FOR_READINESS=30, so the
+        right-sizer skipped the warehouse entirely - perfect spill would
+        still produce zero recommendations.  Verify must FAIL on n, not
+        PASS on the spill."""
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_MEMORY_HOG_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_MEMORY_HOG_WH'":
+                [(11, 2, 2, 0, 200000, 0)],   # spilling, but n=11 < 30
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        mh = next(r for r in results if r.workload_key == "memory_hog")
+        assert not mh.is_pass
+        assert "readiness" in mh.verdict.lower() or ">=30" in mh.verdict
+
 
 class TestVerifyLocalSpill:
     def test_pass_at_threshold(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_LOCAL_SPILL_WH"])
-        # n=10, n_local=3 (30%); 30% > 20% threshold
+        # n=34 (clears gate), 10 local = 29% > 20% threshold
         client = FakeClient(rows_for_substring={
             "warehouse_name = 'SNOWTUNER_DEMO_LOCAL_SPILL_WH'":
-                [(10, 3, 0, 0, 5000, 0)],
+                [(34, 10, 0, 0, 5000, 0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         ls = next(r for r in results if r.workload_key == "local_spill")
@@ -525,14 +548,28 @@ class TestVerifyLocalSpill:
     def test_fail_below_threshold(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_LOCAL_SPILL_WH"])
-        # n=10, n_local=1 (10%); below 20% threshold
+        # n=34, 3 local = 9%; below 20% threshold
         client = FakeClient(rows_for_substring={
             "warehouse_name = 'SNOWTUNER_DEMO_LOCAL_SPILL_WH'":
-                [(10, 1, 0, 0, 5000, 0)],
+                [(34, 3, 0, 0, 5000, 0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         ls = next(r for r in results if r.workload_key == "local_spill")
         assert not ls.is_pass
+
+    def test_fail_below_readiness_gate(self, duck: duckdb.DuckDBPyConnection):
+        """Production's exact round-1 shape: 27 queries with spill ratio
+        above threshold would STILL produce no rec (27 < 30)."""
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_LOCAL_SPILL_WH"])
+        client = FakeClient(rows_for_substring={
+            "warehouse_name = 'SNOWTUNER_DEMO_LOCAL_SPILL_WH'":
+                [(27, 9, 0, 0, 5000, 0)],   # 33% spill but n=27 < 30
+        })
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        ls = next(r for r in results if r.workload_key == "local_spill")
+        assert not ls.is_pass
+        assert "readiness" in ls.verdict.lower() or ">=30" in ls.verdict
 
 
 class TestVerifySaturated:

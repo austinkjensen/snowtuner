@@ -152,124 +152,53 @@ def _run_serial(
 # ── workload 1: MEMORY_HOG ────────────────────────────────────────────────
 
 
-class MemoryHogWorkload(DemoWorkload):
-    """Forced full-materialized sort on XSMALL -> heavy spill.
+class _SpillWorkloadBase(DemoWorkload):
+    """Shared machinery for the two spill workloads (memory_hog, local_spill).
 
-    The trick is the WHERE clause on row-number: filtering on a slice in
-    the MIDDLE of the sort order (not the top) defeats Snowflake's top-K
-    optimization, forcing the optimizer to actually materialize the entire
-    sort.  60M rows * ~16 bytes for the projected columns = ~1 GB of sort
-    state, plus algorithmic overhead 2-3x, well past XSMALL's working
-    memory.  Tested empirically against a clean account; produces local
-    spill reliably and remote spill on accounts with smaller local-disk
-    XSMALL configurations.
+    Design constraints discovered the hard way (2026-06-08 dogfood, two
+    failed rounds - read before "improving" this):
 
-    Previous version (TPC-H Q1 GROUP BY l_returnflag) produced 4-row
-    output, so the hash table held 4 partial aggregates and never
-    spilled.  Don't revert.
+    1. The right-sizer SKIPS warehouses with fewer than 30 SUCCESS queries
+       in the window (MIN_QUERIES_FOR_READINESS).  Session-setup statements
+       (USE WAREHOUSE / ALTER SESSION) count toward n, but only ~5 of them.
+       So every spill workload pads with light queries to clear the gate.
+
+    2. Rule 2 needs >=20% of queries spilling.  With N_HEAVY=8 heavy
+       spillers, N_LIGHT=20 lights, and ~6 setup statements, the ratio is
+       8/34 = 24% - headroom for one heavy failing (7/33 = 21%).  Failed
+       queries don't count in n at all (execution_status filter), so a
+       timeout hurts the sample size, not the ratio.
+
+    3. The spill primitive is exact COUNT(DISTINCT col_a, col_b) over a
+       high-cardinality composite key.  Unlike ORDER BY (top-K shortcut)
+       or low-cardinality GROUP BY (tiny hash table), exact distinct has
+       no shortcut: the hash table must hold every distinct key.  SF100
+       LINEITEM has ~600M near-unique (l_orderkey, l_partkey) pairs ->
+       15-20 GB of hash state, beyond any current XSMALL/SMALL node
+       memory.  Round-1 mistakes: TPC-H Q1 (4-row output, nothing to
+       spill) and ROW_NUMBER mid-range filter (bounded heap, ~600 MB).
+
+    Heavies run through a small thread pool so wall time stays in the
+    ~15-25 min range instead of N_HEAVY * per-query minutes.  Concurrent
+    heavies also share node memory, which makes spill MORE likely, and
+    any queueing they cause is harmless (Rule 2 is checked before Rule 3).
     """
-    key = "memory_hog"
-    description = "Forced full sort on TPCH_SF10.LINEITEM, sized to spill"
-    estimated_minutes = 10.0
 
-    # Mid-range row filter: optimizer can't use top-K because the slice
-    # isn't at the top of the sort.  Returns just 11 rows; the work is
-    # entirely in the sort.
-    _SQL = """
-    SELECT l_orderkey, l_partkey, l_extendedprice, rn
-    FROM (
-      SELECT l_orderkey, l_partkey, l_extendedprice,
-             ROW_NUMBER() OVER (ORDER BY l_extendedprice DESC, l_orderkey ASC) AS rn
-      FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM
-    )
-    WHERE rn BETWEEN 30000000 AND 30000010
-    """
-
-    def execute(
-        self,
-        client: SnowflakeClient,
-        warehouse_name: str,
-        *,
-        stop_event: threading.Event,
-    ) -> WorkloadResult:
-        result = WorkloadResult(
-            workload_key=self.key,
-            warehouse_name=warehouse_name,
-            started_at=time.time(),
-        )
-        # The default prepare_session() caps STATEMENT_TIMEOUT at 600s.
-        # XSMALL on SF10 with forced full sort takes 4-7 minutes when it
-        # has to spill, sometimes more on a slow account.  Override to
-        # 25 min so a marginal account doesn't kill the query before we
-        # see the spill - the surrounding workload runner enforces its
-        # own outer-bound timing.
-        executor = _new_executor(client, warehouse_name)
-        try:
-            executor.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1500")
-        except Exception as e:
-            logger.warning(
-                "memory_hog: failed to bump statement timeout: %s", e,
-            )
-        # Two reps so the recommender's "any remote spill" rule has a
-        # second chance if the first run lands just under the threshold.
-        for sql in [self._SQL.strip()] * 2:
-            if stop_event.is_set():
-                result.notes.append("stopped early")
-                break
-            result.queries_attempted += 1
-            try:
-                executor.execute(sql)
-                result.queries_succeeded += 1
-            except Exception as e:
-                result.queries_failed += 1
-                result.last_error = f"{type(e).__name__}: {e}"
-                logger.warning("memory_hog query failed: %s", e)
-        result.completed_at = time.time()
-        return result
-
-
-# ── workload 2: LOCAL_SPILL ───────────────────────────────────────────────
-
-
-class LocalSpillWorkload(DemoWorkload):
-    """SF10 forced-full-sort on SMALL -> ~30% of queries spill local.
-
-    Same ROW_NUMBER + mid-range filter trick as MemoryHog (defeats top-K),
-    but the slice and warehouse size are different: SF10 LINEITEM (60M
-    rows, ~1 GB projected sort state) on SMALL (~4-8 GB memory) is tight
-    enough that the heavy query spills LOCAL but won't blow past disk
-    into REMOTE - which is exactly what rule 2 wants to see.
-
-    Interleaved 3 heavy + 7 light = 30% heavy.  Recommender rule 2 fires
-    at >=20% local-spill ratio, so 30% gives us headroom for variance.
-
-    Previous version used SF1 with LIMIT 50000 - the LIMIT enables
-    top-K optimization (priority queue of 50000 elements, ~5 MB working
-    set) and nothing spilled.  The mid-range filter is the fix.
-    """
-    key = "local_spill"
-    description = "SF10 forced-sort on SMALL, ~30% of queries spill local"
-    estimated_minutes = 6.0
-
-    # Same mid-range filter trick - defeats top-K.  SF10 instead of SF1
-    # because SMALL is too big to spill on SF1.
     _HEAVY_SQL = """
-    SELECT l_orderkey, l_partkey, l_extendedprice, rn
-    FROM (
-      SELECT l_orderkey, l_partkey, l_extendedprice,
-             ROW_NUMBER() OVER (ORDER BY l_extendedprice DESC, l_orderkey ASC) AS rn
-      FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM
-    )
-    WHERE rn BETWEEN 25000000 AND 25000010
+    SELECT COUNT(DISTINCT l_orderkey, l_partkey) AS n_pairs
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.LINEITEM
     """
 
-    # Cheap aggregate that fits in memory; no spill.
     _LIGHT_SQL = """
     SELECT l_returnflag, COUNT(*) AS n
     FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.LINEITEM
     GROUP BY l_returnflag
     """
 
+    _N_HEAVY = 8
+    _N_LIGHT = 20
+    _HEAVY_CONCURRENCY = 4
+
     def execute(
         self,
         client: SnowflakeClient,
@@ -282,77 +211,120 @@ class LocalSpillWorkload(DemoWorkload):
             warehouse_name=warehouse_name,
             started_at=time.time(),
         )
-        # Bump timeout for heavy queries - same reasoning as MemoryHog.
-        executor = _new_executor(client, warehouse_name)
-        try:
-            executor.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1500")
-        except Exception as e:
-            logger.warning(
-                "local_spill: failed to bump statement timeout: %s", e,
-            )
-        # 3 heavy + 7 light = 30% heavy.  Interleaved so warehouse memory
-        # pressure doesn't get release time between heavies.
-        queries = (
-            [self._HEAVY_SQL.strip()] * 3
-            + [self._LIGHT_SQL.strip()] * 7
+
+        # Lights first: cheap (~1-2s each), get the warehouse resumed and
+        # the n>=30 readiness gate cleared even if every heavy times out.
+        _run_serial(
+            client=client, warehouse_name=warehouse_name,
+            queries=[self._LIGHT_SQL.strip()] * self._N_LIGHT,
+            stop_event=stop_event, result=result,
         )
-        for sql in queries:
+
+        # Heavies through a small pool, each on its own cloned connection.
+        # Per-clone session needs its own timeout bump: a spilled 600M-key
+        # distinct on XSMALL runs 5-15 min, past prepare_session's 600s cap.
+        def _one_heavy(_i: int) -> tuple[bool, str | None]:
             if stop_event.is_set():
-                result.notes.append("stopped early")
-                break
-            result.queries_attempted += 1
+                return False, "stopped"
+            per_thread = client.clone()
             try:
-                executor.execute(sql)
-                result.queries_succeeded += 1
+                ex = _new_executor(per_thread, warehouse_name)
+                ex.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 1500")
+                ex.execute(self._HEAVY_SQL.strip())
+                return True, None
             except Exception as e:
-                result.queries_failed += 1
-                result.last_error = f"{type(e).__name__}: {e}"
-                logger.warning("local_spill query failed: %s", e)
+                return False, f"{type(e).__name__}: {e}"
+            finally:
+                per_thread.close()
+
+        with ThreadPoolExecutor(max_workers=self._HEAVY_CONCURRENCY) as pool:
+            futures = [pool.submit(_one_heavy, i) for i in range(self._N_HEAVY)]
+            for fut in as_completed(futures):
+                result.queries_attempted += 1
+                ok, err = fut.result()
+                if ok:
+                    result.queries_succeeded += 1
+                else:
+                    result.queries_failed += 1
+                    if err and err != "stopped":
+                        result.last_error = err
+                        logger.warning(
+                            "%s heavy query failed: %s", self.key, err,
+                        )
+
         result.completed_at = time.time()
         return result
+
+
+class MemoryHogWorkload(_SpillWorkloadBase):
+    """600M-key exact distinct on XSMALL -> every heavy query spills hard.
+
+    Demonstrates right-sizer Rule 2 (sustained local spill -> upsize).
+    Rule 1 (remote spill) was the original target but is not demoable at
+    sane cost: remote spill requires exhausting the node's local SSD
+    (hundreds of GB of spill), which means a multi-hour query.  If a
+    heavy does push into remote on a constrained account, Rule 1 fires
+    instead - same upsize recommendation, stronger evidence.
+    """
+    key = "memory_hog"
+    description = "8x 600M-key exact distinct on XSMALL - sustained local spill"
+    estimated_minutes = 25.0
+
+
+# ── workload 2: LOCAL_SPILL ───────────────────────────────────────────────
+
+
+class LocalSpillWorkload(_SpillWorkloadBase):
+    """Same 600M-key distinct, but on SMALL -> intermittent local spill.
+
+    SMALL has roughly twice XSMALL's memory and spreads the hash state
+    across more capacity, so the same heavy query spills less deeply -
+    the "workload routinely runs out of memory but limps through" pattern
+    Rule 2 describes, vs MEMORY_HOG's every-query-drowns variant.  Faster
+    per-heavy than MEMORY_HOG (~3-6 min vs 5-15) for the same reason.
+    """
+    key = "local_spill"
+    description = "8x 600M-key exact distinct on SMALL - intermittent spill"
+    estimated_minutes = 15.0
 
 
 # ── workload 3: SATURATED ─────────────────────────────────────────────────
 
 
 class SaturatedWorkload(DemoWorkload):
-    """60 concurrent SF10 aggregates on single-cluster SMALL -> heavy queue.
+    """80 concurrent CPU-bound distincts on single-cluster SMALL -> queue.
 
-    Cost calculation:
-      - Each query: full scan of SF10 LINEITEM (60M rows), ~8-12 s on SMALL.
-      - SMALL single-cluster MAX_CONCURRENCY_LEVEL defaults to 8.
-      - 60 queries / 8 concurrent = ~7.5 batches at 10s each.
-      - Avg queue per query: ~30s (well past the 5s rule-3 threshold).
-      - Peak queue: ~70s on the last-fired queries.
+    Round-2 lesson (dogfood 2026-06-08): scan-bound queries do NOT queue.
+    The 60x SF10 GROUP BY l_returnflag version hit the local data cache
+    after the first batch (narrow columns compress to ~0.25 GB), queries
+    dropped to ~2-3s, and Snowflake's resource-based admission ran far
+    more than 8 of them concurrently - max queue landed at 4.76s, just
+    under the 5s threshold.
 
-    Previous version used 40 queries of SF1 COUNT-DISTINCT (~200 ms each).
-    With 200ms per query on 8 concurrent, even 40 in a burst clears in <2s
-    of wall time and peak queue was 280ms - nowhere near 5s.  The fix is
-    LONGER queries plus MORE of them; without both, modern Snowflake's
-    concurrency model swallows the load.
+    Exact COUNT(DISTINCT l_orderkey) over 60M rows is CPU-bound: ~15M
+    distinct keys must be hashed and deduped regardless of cache state,
+    so per-query cost stays ~10-20s AND each query holds real memory,
+    which keeps effective concurrency near the nominal 8.  80 queries
+    deep, the tail waits through ~9 batches: avg queue 40-60s, far past
+    the rule-3 threshold (avg >=5s, n>=30).
 
-    Memory note: 60 concurrent Python threads each with a Snowflake
-    connection eats ~3 GB.  Fits in t3.medium's 4 GB + 2 GB swap.  If we
-    hit OOM on a smaller instance, switch to execute_async on one
-    connection (TODO #76 followup).
+    Memory note: 80 concurrent Python threads each holding a Snowflake
+    connection costs ~3-4 GB on the client host.  Fits t3.medium's 4 GB
+    + 2 GB swap.  If a smaller host OOMs, switch to execute_async on a
+    handful of connections.
     """
     key = "saturated"
-    description = "60 concurrent SF10 aggregates on SMALL -> 30s+ queueing"
-    estimated_minutes = 6.0
+    description = "80 concurrent CPU-bound distincts on SMALL -> 40s+ queueing"
+    estimated_minutes = 8.0
 
-    # Full table scan + 3-row group-by output.  Cheap output but the scan
-    # itself takes 8-12s on SMALL, which is what we need for queue pile-up.
+    # Cache-resistant: the cost is hashing 60M values into ~15M distinct
+    # keys, not reading bytes.  Output is 1 row.
     _CONCURRENT_SQL = """
-    SELECT
-        l_returnflag,
-        COUNT(*) AS n,
-        AVG(l_extendedprice) AS avg_price,
-        MAX(l_shipdate) AS max_ship
+    SELECT COUNT(DISTINCT l_orderkey) AS n_orders
     FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM
-    GROUP BY l_returnflag
     """
 
-    _FAN_OUT = 60
+    _FAN_OUT = 80
 
     def execute(
         self,
