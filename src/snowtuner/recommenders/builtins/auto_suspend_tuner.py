@@ -4,8 +4,9 @@ Heuristic v1 (deliberately simple + explainable):
 
   For each warehouse:
     1. Training: collect observed idle-gap durations from features.warehouse_idle_gaps
-       AND warehouse re-activation gaps (gap between SUSPEND_WAREHOUSE and the next
-       RESUME_WAREHOUSE).  We treat re-activation gaps as the "true cost" of waking
+       AND warehouse re-activation gaps (gap between a suspend event and the next
+       resume event; names vary by account version - see ingestion/event_vocab.py).
+       We treat re-activation gaps as the "true cost" of waking
        up, and observed idle-gaps as the opportunity to suspend sooner.
     2. Inference: choose AUTO_SUSPEND = p25(re_activation_gaps), clamped to
        [60, 600] seconds.  Rationale: if a quarter of suspend→resume cycles
@@ -34,6 +35,11 @@ from snowtuner.recommendations.model import (
     Impact,
     Recommendation,
 )
+from snowtuner.ingestion.event_vocab import (
+    SUSPEND_EVENT_NAMES,
+    SUSPEND_RESUME_EVENT_NAMES,
+    sql_in_list,
+)
 from snowtuner.recommenders.base import (
     ReadinessReport,
     Recommender,
@@ -50,10 +56,10 @@ MIN_DELTA_SECONDS = 30
 class AutoSuspendReadinessGate(TrainingGate):
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
         row = conn.execute(
-            """
+            f"""
             SELECT warehouse_name, COUNT(*) AS cycle_count
             FROM raw.warehouse_events_history
-            WHERE event_name IN ('SUSPEND_WAREHOUSE', 'RESUME_WAREHOUSE')
+            WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
             GROUP BY warehouse_name
             """
         ).fetchall()
@@ -89,20 +95,29 @@ class AutoSuspendTuner(Recommender):
 
     def fit(self, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         """Cache per-warehouse distributions of re-activation gaps."""
+        # Normalize both event vocabularies (see ingestion/event_vocab.py)
+        # to SUSPEND/RESUME kinds before pairing; consecutive same-kind
+        # rows collapse into a single gap.
         rows = conn.execute(
-            """
+            f"""
             WITH evts AS (
-                SELECT warehouse_name, event_name, timestamp,
-                       LEAD(event_name) OVER (PARTITION BY warehouse_name ORDER BY timestamp) AS next_name,
-                       LEAD(timestamp) OVER (PARTITION BY warehouse_name ORDER BY timestamp) AS next_ts
+                SELECT warehouse_name,
+                       CASE WHEN event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
+                            THEN 'SUSPEND' ELSE 'RESUME' END AS kind,
+                       timestamp
                 FROM raw.warehouse_events_history
-                WHERE event_name IN ('SUSPEND_WAREHOUSE', 'RESUME_WAREHOUSE')
+                WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
+            ), seq AS (
+                SELECT warehouse_name, kind, timestamp,
+                       LEAD(kind) OVER (PARTITION BY warehouse_name ORDER BY timestamp) AS next_kind,
+                       LEAD(timestamp) OVER (PARTITION BY warehouse_name ORDER BY timestamp) AS next_ts
+                FROM evts
             )
             SELECT warehouse_name,
                    date_diff('second', timestamp, next_ts) AS reactivation_seconds
-            FROM evts
-            WHERE event_name = 'SUSPEND_WAREHOUSE'
-              AND next_name = 'RESUME_WAREHOUSE'
+            FROM seq
+            WHERE kind = 'SUSPEND'
+              AND next_kind = 'RESUME'
               AND next_ts IS NOT NULL
             """
         ).fetchall()
@@ -215,11 +230,12 @@ def _estimate_cycles_per_day(
     conn: duckdb.DuckDBPyConnection, warehouse_name: str,
 ) -> float:
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS cycles,
                date_diff('day', MIN(timestamp), MAX(timestamp)) AS days
         FROM raw.warehouse_events_history
-        WHERE warehouse_name = ? AND event_name = 'SUSPEND_WAREHOUSE'
+        WHERE warehouse_name = ?
+          AND event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
         """,
         [warehouse_name],
     ).fetchone()

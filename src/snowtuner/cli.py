@@ -468,13 +468,16 @@ def status() -> None:
     console.print(data_tbl)
 
     # ── Per-warehouse activity ────────────────────────────────────
+    from snowtuner.ingestion.event_vocab import (
+        SUSPEND_RESUME_EVENT_NAMES, sql_in_list,
+    )
     wh_rows = conn.execute(
-        """
+        f"""
         SELECT w.name, w.size, w.auto_suspend_seconds,
                (SELECT COUNT(*) FROM raw.query_history q WHERE q.warehouse_name = w.name) AS q_cnt,
                (SELECT COUNT(*) FROM raw.warehouse_events_history e
                   WHERE e.warehouse_name = w.name
-                    AND e.event_name IN ('SUSPEND_WAREHOUSE','RESUME_WAREHOUSE')) AS cycle_cnt
+                    AND e.event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})) AS cycle_cnt
         FROM raw.warehouses w
         ORDER BY q_cnt DESC
         """

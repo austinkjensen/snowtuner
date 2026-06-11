@@ -732,11 +732,18 @@ def _verify_bursty(
     and pass at >=10 (MIN_CYCLES_PER_WAREHOUSE in
     auto_suspend_survival.py).
     """
+    from snowtuner.ingestion.event_vocab import (
+        RESUME_EVENT_NAMES, SUSPEND_EVENT_NAMES, sql_in_list,
+    )
     try:
+        # Both event vocabularies (dogfood 2026-06-11: fresh accounts emit
+        # only the *_CLUSTER variants; see ingestion/event_vocab.py).
         rows = client.execute(f"""
         SELECT
-            SUM(CASE WHEN event_name = 'SUSPEND_WAREHOUSE' THEN 1 ELSE 0 END) AS n_suspends,
-            SUM(CASE WHEN event_name = 'RESUME_WAREHOUSE'  THEN 1 ELSE 0 END) AS n_resumes
+            SUM(CASE WHEN event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
+                     THEN 1 ELSE 0 END) AS n_suspends,
+            SUM(CASE WHEN event_name IN ({sql_in_list(RESUME_EVENT_NAMES)})
+                     THEN 1 ELSE 0 END) AS n_resumes
         FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY
         WHERE warehouse_name = '{spec.warehouse_name}'
           AND timestamp >= {since_expr}

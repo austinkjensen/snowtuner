@@ -70,7 +70,8 @@ _DDL = [
         warehouse_id     VARCHAR,
         warehouse_name   VARCHAR,
         cluster_number   INTEGER,  -- nullable; NULL for warehouse-level events
-        event_name       VARCHAR,  -- RESUME_WAREHOUSE, SUSPEND_WAREHOUSE, RESIZE_WAREHOUSE, etc.
+        event_name       VARCHAR,  -- RESUME_/SUSPEND_ + WAREHOUSE|CLUSTER (vocabulary varies
+                                   -- by account version; see ingestion/event_vocab.py), RESIZE_WAREHOUSE, etc.
         event_reason     VARCHAR,
         event_state      VARCHAR,
         user_name        VARCHAR,

@@ -753,6 +753,11 @@ class TestVerifyBursty:
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         br = next(r for r in results if r.workload_key == "bursty")
         assert br.is_pass
+        # Pin the vocabulary widening: fresh accounts emit only *_CLUSTER
+        # events (dogfood 2026-06-11), so the verify SQL must accept both.
+        events_sql = next(c for c in client.calls if "WAREHOUSE_EVENTS_HISTORY" in c)
+        assert "SUSPEND_CLUSTER" in events_sql
+        assert "SUSPEND_WAREHOUSE" in events_sql
 
     def test_fail_with_no_events_calls_out_lag(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo

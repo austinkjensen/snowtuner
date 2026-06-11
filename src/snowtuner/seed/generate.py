@@ -135,6 +135,10 @@ def _seed_suspend_pattern(
     query_counter: int,
 ) -> tuple[int, int]:
     """Generate suspend/resume cycles + simple queries for the auto_suspend recommender."""
+    # Synthetic events use the LEGACY vocabulary (RESUME_/SUSPEND_WAREHOUSE).
+    # Real accounts may emit *_CLUSTER variants instead; all consumers accept
+    # both via ingestion/event_vocab.py.  Keeping the seed on the legacy names
+    # intentionally exercises that compatibility path.
     t = now - timedelta(days=days)
     end = now
     while t < end:

@@ -540,15 +540,18 @@ def create_app() -> FastAPI:
     @router.get("/warehouses", response_model=list[WarehouseSummaryOut])
     def list_warehouses() -> list[WarehouseSummaryOut]:
         conn = get_connection()
+        from snowtuner.ingestion.event_vocab import (
+            SUSPEND_RESUME_EVENT_NAMES, sql_in_list,
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT w.name, w.size, w.auto_suspend_seconds, w.auto_resume,
                    w.generation, w.qas_state, w.qas_max_scale_factor,
                    (SELECT COUNT(*) FROM raw.query_history q
                     WHERE q.warehouse_name = w.name) AS q_cnt,
                    (SELECT COUNT(*) FROM raw.warehouse_events_history e
                     WHERE e.warehouse_name = w.name
-                      AND e.event_name IN ('SUSPEND_WAREHOUSE','RESUME_WAREHOUSE')
+                      AND e.event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
                    ) AS cycle_cnt
             FROM raw.warehouses w
             ORDER BY q_cnt DESC

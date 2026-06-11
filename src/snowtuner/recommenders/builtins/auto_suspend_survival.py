@@ -2,8 +2,9 @@
 
 Model
 =====
-Let T = reactivation gap = seconds from SUSPEND_WAREHOUSE to the next
-RESUME_WAREHOUSE on the same warehouse.  Its survival function is
+Let T = reactivation gap = seconds from a suspend event to the next
+resume event on the same warehouse (event names vary by account version;
+see ingestion/event_vocab.py).  Its survival function is
 ``S(t) = P(T > t)``.  Let C = cold-start cost (in seconds of equivalent
 billed time).
 
@@ -42,6 +43,11 @@ from snowtuner.recommendations.model import (
     EvidenceRef,
     Impact,
     Recommendation,
+)
+from snowtuner.ingestion.event_vocab import (
+    SUSPEND_EVENT_NAMES,
+    SUSPEND_RESUME_EVENT_NAMES,
+    sql_in_list,
 )
 from snowtuner.recommenders.base import (
     ReadinessReport,
@@ -85,10 +91,10 @@ class SurvivalReadinessGate(TrainingGate):
 
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
         rows = conn.execute(
-            """
+            f"""
             SELECT warehouse_name, COUNT(*) AS cycles
             FROM raw.warehouse_events_history
-            WHERE event_name IN ('SUSPEND_WAREHOUSE', 'RESUME_WAREHOUSE')
+            WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
             GROUP BY warehouse_name
             """
         ).fetchall()
@@ -124,24 +130,35 @@ class AutoSuspendSurvivalTuner(Recommender):
 
     def fit(self, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
         """Fit the empirical survival curve and optimal-cost curve per warehouse."""
+        # Normalize both event vocabularies to a SUSPEND/RESUME 'kind' before
+        # pairing.  Consecutive same-kind rows (STARTED+COMPLETED duplicates,
+        # or per-cluster rows on multi-cluster warehouses) collapse naturally:
+        # only the last suspend-kind row before a resume-kind row produces a
+        # gap, which is the reactivation gap we want.
         rows = conn.execute(
-            """
+            f"""
             WITH evts AS (
-                SELECT warehouse_name, event_name, timestamp,
-                       LEAD(event_name) OVER (
+                SELECT warehouse_name,
+                       CASE WHEN event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
+                            THEN 'SUSPEND' ELSE 'RESUME' END AS kind,
+                       timestamp
+                FROM raw.warehouse_events_history
+                WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
+            ), seq AS (
+                SELECT warehouse_name, kind, timestamp,
+                       LEAD(kind) OVER (
                            PARTITION BY warehouse_name ORDER BY timestamp
-                       ) AS next_name,
+                       ) AS next_kind,
                        LEAD(timestamp) OVER (
                            PARTITION BY warehouse_name ORDER BY timestamp
                        ) AS next_ts
-                FROM raw.warehouse_events_history
-                WHERE event_name IN ('SUSPEND_WAREHOUSE', 'RESUME_WAREHOUSE')
+                FROM evts
             )
             SELECT warehouse_name,
                    date_diff('second', timestamp, next_ts) AS reactivation_seconds
-            FROM evts
-            WHERE event_name = 'SUSPEND_WAREHOUSE'
-              AND next_name = 'RESUME_WAREHOUSE'
+            FROM seq
+            WHERE kind = 'SUSPEND'
+              AND next_kind = 'RESUME'
               AND next_ts IS NOT NULL
             """
         ).fetchall()
@@ -350,12 +367,16 @@ def _lookup_cost(fit: dict[str, Any], as_value: float | None) -> float | None:
 def _estimate_cycles_per_day(
     conn: duckdb.DuckDBPyConnection, warehouse_name: str,
 ) -> float:
+    # Counts suspend-kind ROWS, not strict cycles - STARTED/COMPLETED pairs
+    # or per-cluster rows can multiply the count.  This only scales the
+    # impact estimate (credits/day), never the recommend/skip decision.
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS cycles,
                date_diff('day', MIN(timestamp), MAX(timestamp)) AS days
         FROM raw.warehouse_events_history
-        WHERE warehouse_name = ? AND event_name = 'SUSPEND_WAREHOUSE'
+        WHERE warehouse_name = ?
+          AND event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
         """,
         [warehouse_name],
     ).fetchone()

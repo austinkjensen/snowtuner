@@ -41,11 +41,13 @@ Key shape:
 ```python
 class AutoSuspendReadinessGate(TrainingGate):
     def evaluate(self, conn) -> ReadinessReport:
-        # Need ≥ N suspend/resume cycles per warehouse.
-        rows = conn.execute("""
+        # Need >= N suspend/resume cycles per warehouse.  Event names vary
+        # by account version (SUSPEND_WAREHOUSE vs SUSPEND_CLUSTER, etc.) -
+        # the IN-list comes from ingestion/event_vocab.py, which accepts both.
+        rows = conn.execute(f"""
             SELECT warehouse_name, COUNT(*) AS c
             FROM raw.warehouse_events_history
-            WHERE event_name IN ('SUSPEND_WAREHOUSE', 'RESUME_WAREHOUSE')
+            WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
             GROUP BY warehouse_name
         """).fetchall()
         ready = [w for w, c in rows if c >= MIN_CYCLES * 2]

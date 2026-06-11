@@ -553,8 +553,12 @@ class BurstyWorkload(DemoWorkload):
                 executor.execute(f"ALTER WAREHOUSE {warehouse_name} SUSPEND")
             except Exception as e:
                 # "Already suspended" or transient - auto-suspend at 120s
-                # into the 180s gap remains the fallback path.
-                logger.debug(
+                # into the 180s gap remains the fallback path.  WARNING, not
+                # debug, and recorded on the result: zero suspend events
+                # downstream is exactly how the *_CLUSTER vocabulary bug
+                # stayed invisible, so suspend failures must be loud.
+                result.notes.append(f"cycle {cycle}: explicit suspend failed: {e}")
+                logger.warning(
                     "bursty cycle %d: explicit suspend failed (auto-suspend "
                     "fallback applies): %s", cycle, e,
                 )
