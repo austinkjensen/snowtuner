@@ -342,19 +342,21 @@ class SaturatedWorkload(DemoWorkload):
     more than 8 of them concurrently - max queue landed at 4.76s, just
     under the 5s threshold.
 
-    Exact COUNT(DISTINCT c_custkey) over SF1000's 150M-row CUSTOMER is
-    CPU-bound: 150M distinct keys must be hashed and deduped regardless
-    of cache state, so per-query cost stays ~15-30s AND each query holds
-    real (but in-memory: ~2-3 GB) state, which keeps effective
-    concurrency near the nominal 8.  80 queries deep, the tail waits
-    through ~9 batches: avg queue 60-100s, far past the rule-3 threshold
-    (avg >=5s, n>=30).
+    Round-4 lesson (dogfood cf35ac2): the warehouse-level average the
+    right-sizer computes is DILUTED by session-setup statements.  Every
+    thread emits USE WAREHOUSE + 2x ALTER SESSION (queue=0) that land in
+    QUERY_HISTORY attributed to this warehouse - roughly 3 statements per
+    real query - so the raw per-query queue must be ~3x the apparent
+    target.  Aim for raw avg ~200s -> diluted ~65s, a 13x margin over the
+    5s threshold.  The previous CUSTOMER distinct (~15s/query) diluted to
+    under 5s and never fired.
 
-    Deliberately NOT one of the billion-row tables: per-query cost must
-    stay ~tens of seconds or 80 queries deep becomes an hours-long crawl,
-    and the state must FIT in memory so this warehouse queues without
-    spilling - spill here would make Rule 2 fire instead of Rule 3 and
-    muddy the demo story.
+    Exact COUNT(DISTINCT o_custkey) over SF1000's 1.5B-row ORDERS is
+    CPU-bound: 1.5B values hashed into ~100M distinct keys regardless of
+    cache state, ~30-60s per query on SMALL, with ~1-2 GB of state that
+    FITS in memory - this warehouse must queue without spilling, or
+    Rule 2 fires instead of Rule 3 and muddies the story.  80 queries
+    deep at ~8 effective concurrency, the tail waits through ~10 batches.
 
     Memory note: 80 concurrent Python threads each holding a Snowflake
     connection costs ~3-4 GB on the client host.  Fits t3.medium's 4 GB
@@ -362,14 +364,14 @@ class SaturatedWorkload(DemoWorkload):
     handful of connections.
     """
     key = "saturated"
-    description = "80 concurrent CPU-bound distincts on SMALL -> 60s+ queueing"
-    estimated_minutes = 10.0
+    description = "80 concurrent 1.5B-value distincts on SMALL -> sustained queue"
+    estimated_minutes = 14.0
 
-    # Cache-resistant: the cost is hashing 150M values, not reading bytes.
-    # Output is 1 row; state ~2-3 GB fits SMALL memory (no spill wanted).
+    # Cache-resistant: the cost is hashing 1.5B values, not reading bytes.
+    # Output is 1 row; state ~1-2 GB fits SMALL memory (no spill wanted).
     _CONCURRENT_SQL = """
-    SELECT COUNT(DISTINCT c_custkey) AS n_customers
-    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.CUSTOMER
+    SELECT COUNT(DISTINCT o_custkey) AS n_customers
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1000.ORDERS
     """
 
     _FAN_OUT = 80
@@ -464,26 +466,52 @@ class OverkillWorkload(DemoWorkload):
 
 
 class BurstyWorkload(DemoWorkload):
-    """10 cycles of (5-query burst + 150s idle).
+    """12 cycles of (5-query burst + explicit suspend + 180s idle).
 
-    AUTO_SUSPEND=120 means the warehouse suspends ~30s into each idle gap.
-    Each cycle: burst (~25s) + idle (~150s) = ~3 min.  10 cycles produces
-    >=10 reactivation gaps - enough for the survival recommender's
-    MIN_CYCLES_PER_WAREHOUSE=10 threshold.
+    Round-4 lessons (dogfood cf35ac2) - read before "simplifying":
 
-    The recommender then proposes lowering AUTO_SUSPEND from 120 to ~60
-    (delta of 60s, safely past MIN_DELTA_SECONDS=30).
+    1. Relying on AUTO_SUSPEND=120 to fire inside a 150s idle gap produced
+       ZERO suspend/resume events in WAREHOUSE_EVENTS_HISTORY: Snowflake's
+       auto-suspend check is approximate, and the 30s margin was routinely
+       missed - the warehouse just stayed up across the "idle" gaps, so the
+       survival tuner had nothing to model.  Fix: issue an explicit
+       ALTER WAREHOUSE ... SUSPEND at the end of each burst.  We own the
+       warehouse (demo provisions it), the SUSPEND event lands in
+       WAREHOUSE_EVENTS_HISTORY exactly like an auto-suspend would, and
+       AUTO_RESUME records the matching RESUME on the next burst's first
+       query.  The reactivation-gap telemetry is identical; auto-suspend
+       at 120s remains the fallback if the explicit suspend ever fails.
+
+    2. The burst query must NOT be sub-second: trivial COUNT(*) queries
+       gave this warehouse p99 <= 1s, and once runs accumulated past
+       n >= 100 in the 14-day window, the right-sizer's Rule 4 fired a
+       legitimate-but-unwanted WAREHOUSE_SIZE downsize rec here.  An SF10
+       aggregate (~2-8s on SMALL) keeps p99 well above 1s, immunizing
+       BURSTY against Rule 4 while producing no spill and no queueing.
+
+    3. 12 cycles, not 10: the survival readiness gate needs >=10 complete
+       suspend/resume cycles; 12 leaves margin for a missed or merged one.
+
+    With AUTO_SUSPEND=120 configured and observed reactivation gaps of
+    ~3 min, the survival tuner proposes a much lower AUTO_SUSPEND
+    (delta safely past MIN_DELTA_SECONDS=30).
     """
     key = "bursty"
     description = (
-        "10 burst-then-idle cycles, AUTO_SUSPEND=120 -> recommend lower"
+        "12 burst+suspend+idle cycles, AUTO_SUSPEND=120 -> recommend lower"
     )
-    estimated_minutes = 32.0  # 10 cycles * 3.2 min
+    estimated_minutes = 45.0  # 12 cycles * ~3.5 min
 
-    _SQL = "SELECT COUNT(*) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS"
+    # SF10 aggregate: ~2-8s on SMALL.  Heavy enough that p99 > 1s (kills
+    # Rule 4), light enough to add no spill or queueing.
+    _SQL = """
+    SELECT l_returnflag, COUNT(*) AS n, AVG(l_extendedprice) AS avg_price
+    FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM
+    GROUP BY l_returnflag
+    """
     _QUERIES_PER_BURST = 5
-    _N_CYCLES = 10
-    _IDLE_SECONDS = 150.0  # > AUTO_SUSPEND=120 so warehouse actually suspends
+    _N_CYCLES = 12
+    _IDLE_SECONDS = 180.0
 
     def execute(
         self,
@@ -510,7 +538,7 @@ class BurstyWorkload(DemoWorkload):
                     break
                 result.queries_attempted += 1
                 try:
-                    executor.execute(self._SQL)
+                    executor.execute(self._SQL.strip())
                     result.queries_succeeded += 1
                 except Exception as e:
                     result.queries_failed += 1
@@ -518,6 +546,18 @@ class BurstyWorkload(DemoWorkload):
                     logger.warning(
                         "bursty cycle %d: query failed: %s", cycle, e,
                     )
+            # End-of-burst explicit suspend - see docstring point 1.  The
+            # SUSPEND event is what the survival tuner models; relying on
+            # auto-suspend jitter inside the gap proved unreliable.
+            try:
+                executor.execute(f"ALTER WAREHOUSE {warehouse_name} SUSPEND")
+            except Exception as e:
+                # "Already suspended" or transient - auto-suspend at 120s
+                # into the 180s gap remains the fallback path.
+                logger.debug(
+                    "bursty cycle %d: explicit suspend failed (auto-suspend "
+                    "fallback applies): %s", cycle, e,
+                )
             # Sleep through the idle gap, but in small slices so stop_event
             # can interrupt promptly.
             slept = 0.0
@@ -532,17 +572,25 @@ class BurstyWorkload(DemoWorkload):
 
 
 class HealthyWorkload(DemoWorkload):
-    """Steady SF1 workload sized appropriately for SMALL.  No expected finding.
+    """Steady mixed workload sized appropriately for SMALL.  No expected finding.
 
     The control case.  Proves the optimizer doesn't fabricate a
     recommendation when the warehouse is sized right.
+
+    The first query is deliberately SF10-scale (~2-5s): with everything
+    sub-second, accumulated runs would eventually satisfy the right-sizer's
+    Rule 4 (p99 <= 1s, n >= 100, no spill/queue -> downsize) and the
+    "control" would start recommending - same trap BURSTY fell into on
+    dogfood cf35ac2.  A realistic healthy warehouse runs queries that
+    take a couple of seconds; p99 > 1s keeps Rule 4 permanently quiet.
     """
     key = "healthy"
-    description = "Steady SF1 queries, SMALL sized appropriately - no rec"
-    estimated_minutes = 3.0
+    description = "Steady mixed queries, SMALL sized appropriately - no rec"
+    estimated_minutes = 4.0
 
     _SQLS = [
-        "SELECT l_returnflag, COUNT(*) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.LINEITEM "
+        "SELECT l_returnflag, COUNT(*), AVG(l_extendedprice) "
+        "FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.LINEITEM "
         "GROUP BY l_returnflag",
         "SELECT n_regionkey, COUNT(*) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.NATION "
         "GROUP BY n_regionkey",

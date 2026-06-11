@@ -2047,7 +2047,7 @@ def demo_verify() -> None:
     Run 45+ min after demo seed completes.  WAREHOUSE_EVENTS_HISTORY
     (used by the BURSTY check) can lag hours.
     """
-    from snowtuner.demo.runner import verify_demo
+    from snowtuner.demo.runner import latest_status, verify_demo
 
     conn = get_connection()
     try:
@@ -2056,15 +2056,20 @@ def demo_verify() -> None:
         console.print(f"[red]{e}[/red]")
         raise SystemExit(1)
 
+    # The run row lives in the local DuckDB; a seed that ran on another
+    # host (or against another DB file) leaves nothing here.  verify_demo
+    # falls back to a 24h ACCOUNT_USAGE window in that case - tell the
+    # user which mode they're getting.
+    if latest_status(conn) is None:
+        console.print(
+            "[yellow]No local demo-run record found[/yellow] (seed may have "
+            "run on a different host).  Verifying all demo warehouses over "
+            "the last 24 hours of ACCOUNT_USAGE instead.\n"
+        )
+
     results = verify_demo(client=client, conn=conn)
     client.close()
 
-    if results is None:
-        console.print(
-            "[yellow]No demo runs found.[/yellow]  "
-            "Run [cyan]snowtuner demo seed[/cyan] first."
-        )
-        return
     if not results:
         console.print(
             "[yellow]Latest demo run has no warehouses to verify.[/yellow]"

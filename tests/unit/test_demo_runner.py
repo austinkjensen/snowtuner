@@ -472,10 +472,79 @@ def _seed_demo_run(
     return _insert_run(duck, warehouse_names)
 
 
-class TestVerifyNoRun:
-    def test_no_runs_returns_none(self, duck: duckdb.DuckDBPyConnection):
+class TestVerifyFallback:
+    """No local run row -> verify falls back to a 24h ACCOUNT_USAGE window
+    over ALL demo warehouses instead of bailing.  app.demo_runs lives in
+    the local DuckDB, so a seed that ran on another host leaves nothing
+    here - but the telemetry is in Snowflake regardless (dogfood hit
+    exactly this: verify said "No demo runs found" while the data sat in
+    ACCOUNT_USAGE)."""
+
+    def test_no_run_row_verifies_all_specs_via_24h_window(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        from snowtuner.demo import DEMO_SPECS
         from snowtuner.demo.runner import verify_demo
-        assert verify_demo(client=FakeClient(), conn=duck) is None  # type: ignore[arg-type]
+        client = FakeClient()
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        assert results is not None
+        assert len(results) == len(DEMO_SPECS)
+        # Window must be the relative fallback, not a run-row timestamp.
+        assert any("DATEADD" in c for c in client.calls)
+        assert not any("TO_TIMESTAMP_NTZ" in c for c in client.calls)
+
+    def test_run_row_present_uses_run_timestamp(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_HEALTHY_WH"])
+        client = FakeClient()
+        results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        assert len(results) == 1  # only the run's warehouse, not all 6
+        assert any("TO_TIMESTAMP_NTZ" in c for c in client.calls)
+
+
+class TestBurstyExplicitSuspend:
+    """The suspend/resume cycles are the whole point of BURSTY.  Dogfood
+    cf35ac2 showed auto-suspend jitter produced ZERO events, so the
+    workload now suspends explicitly after each burst - pin that."""
+
+    def test_suspend_issued_once_per_cycle(self, monkeypatch):
+        import threading as _threading
+        from snowtuner.demo import workloads as wl_module
+        from snowtuner.demo.workloads import BurstyWorkload
+
+        class _RecordingExecutor:
+            def __init__(self):
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: list | None = None):
+                self.calls.append(sql)
+                return []
+
+        recorder = _RecordingExecutor()
+        monkeypatch.setattr(
+            wl_module, "_new_executor", lambda client, wh: recorder,
+        )
+        monkeypatch.setattr(BurstyWorkload, "_N_CYCLES", 2)
+        monkeypatch.setattr(BurstyWorkload, "_QUERIES_PER_BURST", 2)
+        monkeypatch.setattr(BurstyWorkload, "_IDLE_SECONDS", 0.05)
+
+        w = BurstyWorkload()
+        result = w.execute(
+            FakeClient(),  # type: ignore[arg-type]
+            "SNOWTUNER_DEMO_BURSTY_WH",
+            stop_event=_threading.Event(),
+        )
+
+        suspends = [c for c in recorder.calls if "SUSPEND" in c.upper()]
+        bursts = [c for c in recorder.calls if "TPCH_SF10" in c.upper()]
+        assert len(suspends) == 2, "one explicit suspend per cycle"
+        assert "ALTER WAREHOUSE SNOWTUNER_DEMO_BURSTY_WH SUSPEND" in suspends[0]
+        assert len(bursts) == 4  # 2 cycles x 2 queries
+        # Suspends don't count as workload queries.
+        assert result.queries_attempted == 4
+        assert result.queries_succeeded == 4
 
 
 class TestVerifyMemoryHog:

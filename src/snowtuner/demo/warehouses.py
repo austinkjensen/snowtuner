@@ -73,11 +73,12 @@ class DemoWarehouseSpec:
 # missed this: 11 queries of perfect spill would still produce no rec.
 #
 # Auto-suspend recommender:
-#   BURSTY uses AUTO_SUSPEND=120 with deliberate 150s idle gaps between
-#   bursts so the warehouse actually suspends each cycle.  Ten cycles
-#   produces enough survival data to satisfy MIN_CYCLES_PER_WAREHOUSE=10.
-#   The recommended new value will land near 60s, well past the
-#   MIN_DELTA_SECONDS=30 threshold.
+#   BURSTY uses AUTO_SUSPEND=120 with 12 cycles of burst + explicit
+#   ALTER WAREHOUSE SUSPEND + 180s idle.  The explicit suspend exists
+#   because Snowflake's auto-suspend timing is approximate - dogfood
+#   showed AS=120 inside a 150s gap produced ZERO suspend events.  Twelve
+#   cycles clears MIN_CYCLES_PER_WAREHOUSE=10 with margin; the proposed
+#   AUTO_SUSPEND lands well below 120, past MIN_DELTA_SECONDS=30.
 #
 # Control:
 #   HEALTHY is sized appropriately for its workload - no recommendation
@@ -128,7 +129,8 @@ DEMO_SPECS: tuple[DemoWarehouseSpec, ...] = (
         auto_suspend_seconds=120,
         workload_key="bursty",
         expected_finding=(
-            "Auto-suspend survival: idle gap << AUTO_SUSPEND -> lower to ~60s"
+            "Auto-suspend survival: ~3 min reactivation gaps with "
+            "AUTO_SUSPEND=120 -> propose lower AUTO_SUSPEND"
         ),
     ),
     DemoWarehouseSpec(

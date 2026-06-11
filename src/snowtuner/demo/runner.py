@@ -516,16 +516,21 @@ def verify_demo(
     *,
     client: SnowflakeClient,
     conn: duckdb.DuckDBPyConnection,
-) -> list[VerifyResult] | None:
+) -> list[VerifyResult]:
     """Query ACCOUNT_USAGE for the last demo run and check each workload.
 
     For each demo warehouse from the latest ``app.demo_runs`` row, runs
     the appropriate ACCOUNT_USAGE query and compares the observed
     spill / queue / elapsed signals against what the workload was
-    designed to produce.
+    designed to produce.  Returns one ``VerifyResult`` per warehouse.
 
-    Returns one ``VerifyResult`` per warehouse.  Returns None if there's
-    no demo run to verify.
+    Headless-gap fallback: ``app.demo_runs`` lives in the LOCAL DuckDB,
+    so a seed run from a different host / user / DB file leaves this
+    process with no run row (dogfood hit exactly this - verify said "No
+    demo runs found" while the warehouses' telemetry sat in Snowflake).
+    The telemetry is in ACCOUNT_USAGE regardless of where seed ran, so
+    when no local run row exists we verify ALL demo warehouses over a
+    24-hour window instead of bailing.
 
     ACCOUNT_USAGE lag: QUERY_HISTORY lags ~45 min historically (less in
     modern accounts), WAREHOUSE_EVENTS_HISTORY can lag hours.  A FAIL
@@ -533,28 +538,38 @@ def verify_demo(
     "retry later" - not necessarily a bug.
     """
     last = latest_status(conn)
-    if last is None:
-        return None
+    if last is not None:
+        # Single-quoted timestamp literal; started_at comes from our own
+        # DuckDB row, not user input.
+        since_expr = f"TO_TIMESTAMP_NTZ('{last.started_at}')"
+        run_warehouses = set(last.warehouses)
+        specs = [s for s in DEMO_SPECS if s.warehouse_name in run_warehouses]
+    else:
+        since_expr = "DATEADD('hour', -24, CURRENT_TIMESTAMP())"
+        specs = list(DEMO_SPECS)
 
     results: list[VerifyResult] = []
-    for spec in DEMO_SPECS:
-        if spec.warehouse_name not in last.warehouses:
-            continue
+    for spec in specs:
         if spec.workload_key == "bursty":
-            results.append(_verify_bursty(client, spec, last))
+            results.append(_verify_bursty(client, spec, since_expr))
         else:
-            results.append(_verify_via_query_history(client, spec, last))
+            results.append(_verify_via_query_history(client, spec, since_expr))
     return results
 
 
 def _verify_via_query_history(
-    client: SnowflakeClient, spec: DemoWarehouseSpec, last: "RunStatus",
+    client: SnowflakeClient, spec: DemoWarehouseSpec, since_expr: str,
 ) -> VerifyResult:
-    """Aggregate ACCOUNT_USAGE.QUERY_HISTORY for one warehouse and judge."""
+    """Aggregate ACCOUNT_USAGE.QUERY_HISTORY for one warehouse and judge.
+
+    ``since_expr`` is a SQL expression for the window start - either a
+    TO_TIMESTAMP_NTZ literal from the local run row, or the DATEADD
+    24-hour fallback when no run row exists.
+    """
     try:
         # Identifier interpolation is safe here - warehouse_name comes from
-        # DEMO_SPECS (compile-time constant), not user input.  start_time
-        # likewise comes from our own DB.
+        # DEMO_SPECS (compile-time constant) and since_expr is built by
+        # verify_demo from our own DB or a constant, not user input.
         rows = client.execute(f"""
         SELECT
             COUNT(*) AS n,
@@ -565,7 +580,7 @@ def _verify_via_query_history(
             COALESCE(MAX(queued_overload_time), 0) AS max_queue_ms
         FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
         WHERE warehouse_name = '{spec.warehouse_name}'
-          AND start_time >= TO_TIMESTAMP_NTZ('{last.started_at}')
+          AND start_time >= {since_expr}
           AND execution_status = 'SUCCESS'
         """)
     except Exception as e:
@@ -708,7 +723,7 @@ def _verify_via_query_history(
 
 
 def _verify_bursty(
-    client: SnowflakeClient, spec: DemoWarehouseSpec, last: "RunStatus",
+    client: SnowflakeClient, spec: DemoWarehouseSpec, since_expr: str,
 ) -> VerifyResult:
     """The auto-suspend recommender needs WAREHOUSE_EVENTS_HISTORY.
 
@@ -724,7 +739,7 @@ def _verify_bursty(
             SUM(CASE WHEN event_name = 'RESUME_WAREHOUSE'  THEN 1 ELSE 0 END) AS n_resumes
         FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY
         WHERE warehouse_name = '{spec.warehouse_name}'
-          AND timestamp >= TO_TIMESTAMP_NTZ('{last.started_at}')
+          AND timestamp >= {since_expr}
         """)
     except Exception as e:
         return VerifyResult(
