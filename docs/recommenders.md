@@ -39,37 +39,43 @@ The reference implementation lives at
 Key shape:
 
 ```python
-class AutoSuspendReadinessGate(TrainingGate):
+class SurvivalReadinessGate(TrainingGate):
     def evaluate(self, conn) -> ReadinessReport:
-        # Need >= N suspend/resume cycles per warehouse.  Event names vary
-        # by account version (SUSPEND_WAREHOUSE vs SUSPEND_CLUSTER, etc.) -
-        # the IN-list comes from ingestion/event_vocab.py, which accepts both.
+        # Need >= N modelable idle gaps per warehouse.  Gaps come from
+        # features.warehouse_idle_gaps (query-history derived) - NOT from
+        # suspend/resume events.  A warehouse that never suspends still
+        # has gaps, and those are the warehouses most in need of tuning.
         rows = conn.execute(f"""
             SELECT warehouse_name, COUNT(*) AS c
-            FROM raw.warehouse_events_history
-            WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
+            FROM features.warehouse_idle_gaps
+            WHERE idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
             GROUP BY warehouse_name
         """).fetchall()
-        ready = [w for w, c in rows if c >= MIN_CYCLES * 2]
+        ready = [w for w, c in rows if c >= MIN_CYCLES_PER_WAREHOUSE]
         return ReadinessReport(
             is_ready=bool(ready),
-            reason=f"{len(ready)} warehouses ready" if ready else "not enough cycles",
+            reason=f"{len(ready)} warehouses ready" if ready else "not enough gaps",
             signals={"ready_warehouses": ready},
         )
 
 class AutoSuspendSurvivalTuner(Recommender):
     name = "auto_suspend_survival_tuner"
     action_type = ActionType.ALTER_WAREHOUSE
-    training_gate = AutoSuspendReadinessGate()
+    required_feature_tables = {"features.warehouse_idle_gaps"}
+    training_gate = SurvivalReadinessGate()
 
     def fit(self, conn) -> dict:
-        # Pull reactivation-gap samples per warehouse, fit empirical curves.
-        # Return the per-warehouse stats the predictor will need.
+        # Pull idle-gap samples per warehouse, fit empirical curves.
+        # Cold-start cost C is measured from resume STARTED->COMPLETED
+        # event durations when available (event names vary by account
+        # version - see ingestion/event_vocab.py), per-size default
+        # otherwise.  Return the per-warehouse stats predict() needs.
         return {"per_warehouse": ...}
 
     def predict(self, conn, state) -> list[Recommendation]:
-        # For each warehouse, find the AS that minimizes E[min(T,AS) + C·1{T>AS}].
-        # Build AlterWarehouse actions, wrap in Recommendation, return.
+        # For each warehouse, find the AS that minimizes E[min(G,AS) + C·1{G>AS}]
+        # over the observed gap distribution G.  Build AlterWarehouse
+        # actions, wrap in Recommendation, return.
         ...
 ```
 
@@ -103,7 +109,7 @@ rec = Recommendation(
     action=action,
     rationale="Plain-English explanation the user reads in the UI.",
     evidence=[
-        EvidenceRef(kind="warehouse_events", description="...", metric="...", value=...),
+        EvidenceRef(kind="warehouse_idle_gaps", description="...", metric="...", value=...),
     ],
     expected_impact=Impact(
         credits_delta_daily=-1.23,            # negative = savings

@@ -741,29 +741,45 @@ class TestVerifyHealthy:
 
 
 class TestVerifyBursty:
-    """bursty checks WAREHOUSE_EVENTS_HISTORY, not QUERY_HISTORY."""
+    """Since the gap-based rework, bursty verifies idle gaps from
+    QUERY_HISTORY (~45 min lag) - NOT suspend/resume events (hours of
+    lag, and no longer load-bearing for the recommendation)."""
 
-    def test_pass_with_ten_cycles(self, duck: duckdb.DuckDBPyConnection):
+    def test_pass_with_enough_gaps(self, duck: duckdb.DuckDBPyConnection):
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_BURSTY_WH"])
-        # 10 suspends, 10 resumes = 10 complete cycles
+        # (n_gaps, median_gap_seconds) from the gap aggregate.
         client = FakeClient(rows_for_substring={
-            "WAREHOUSE_EVENTS_HISTORY": [(10, 10)],
+            "SNOWTUNER_DEMO_BURSTY_WH": [(12, 178.0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         br = next(r for r in results if r.workload_key == "bursty")
         assert br.is_pass
-        # Pin the vocabulary widening: fresh accounts emit only *_CLUSTER
-        # events (dogfood 2026-06-11), so the verify SQL must accept both.
-        events_sql = next(c for c in client.calls if "WAREHOUSE_EVENTS_HISTORY" in c)
-        assert "SUSPEND_CLUSTER" in events_sql
-        assert "SUSPEND_WAREHOUSE" in events_sql
+        assert "gap" in br.verdict.lower()
 
-    def test_fail_with_no_events_calls_out_lag(self, duck: duckdb.DuckDBPyConnection):
+    def test_queries_query_history_not_events(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        """The point of the rework: the verdict comes from QUERY_HISTORY,
+        so a passing demo no longer waits hours on the events view."""
         from snowtuner.demo.runner import verify_demo
         _seed_demo_run(duck, ["SNOWTUNER_DEMO_BURSTY_WH"])
         client = FakeClient(rows_for_substring={
-            "WAREHOUSE_EVENTS_HISTORY": [(0, 0)],
+            "SNOWTUNER_DEMO_BURSTY_WH": [(12, 178.0)],
+        })
+        verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
+        bursty_sql = [c for c in client.calls if "BURSTY" in c]
+        assert bursty_sql, "no SQL issued for the bursty warehouse"
+        assert all("QUERY_HISTORY" in c for c in bursty_sql)
+        assert not any("WAREHOUSE_EVENTS_HISTORY" in c for c in bursty_sql)
+
+    def test_fail_with_no_gaps_calls_out_lag(
+        self, duck: duckdb.DuckDBPyConnection,
+    ):
+        from snowtuner.demo.runner import verify_demo
+        _seed_demo_run(duck, ["SNOWTUNER_DEMO_BURSTY_WH"])
+        client = FakeClient(rows_for_substring={
+            "SNOWTUNER_DEMO_BURSTY_WH": [(0, 0)],
         })
         results = verify_demo(client=client, conn=duck)  # type: ignore[arg-type]
         br = next(r for r in results if r.workload_key == "bursty")

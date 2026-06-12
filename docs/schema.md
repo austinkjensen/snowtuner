@@ -200,8 +200,10 @@ signed BIGINT) of the natural key `(timestamp, warehouse_id, event_name,
 cluster_number)`. This gives idempotent re-syncs at the watermark boundary
 without a NULL-sentinel hack on `cluster_number`.
 
-What we use it for: suspend/resume cycle counting (auto_suspend recommender
-training-gate check), reactivation-gap distribution.
+What we use it for: measured cold-start cost for the auto_suspend
+recommender (resume STARTED→COMPLETED durations), plus suspend/resume
+counters in the UI and `snowtuner status`. No longer the source of the
+gap distribution - see `features.warehouse_idle_gaps`.
 
 ### `raw.warehouses`
 
@@ -217,14 +219,30 @@ get a canonical form.
 
 ### `features.warehouse_idle_gaps`
 
-Per-suspend record of how long the warehouse was idle before Snowflake
-suspended it. Computed from `raw.query_history` (last query end) and
-`raw.warehouse_events_history` (suspend timestamp). Window-restricted to
-≤ 1 hour to keep the gaps interpretable.
+True idle gaps per warehouse: the space between consecutive busy periods,
+computed purely from `raw.query_history`. Compute-bearing statements
+(`COALESCE(execution_ms, total_elapsed_ms, 0) > 0` - excludes USE/SHOW and
+other metadata-only rows that wouldn't resume a suspended warehouse) are
+merged into busy islands via a running-max interval sweep; the gaps between
+islands land here. The trailing gap after the last island is right-censored
+and not emitted.
 
-What it feeds: `auto_suspend_survival_tuner` reactivation-gap analysis (in
-combination with the suspend → next-resume gap computed inline by the
-recommender).
+Deliberately NOT event-anchored. The earlier event-based definition (last
+query end to suspend event) had two structural flaws: it only observed gaps
+that exceeded the configured AUTO_SUSPEND (censoring - warehouses that never
+suspend were invisible, despite being the best tuning candidates), and the
+measured value approximated the configured setting itself rather than the
+workload's gap structure.
+
+What it feeds: `auto_suspend_survival_tuner` - the gap distribution is its
+primary input.
+
+### `features.warehouse_active_intervals`
+
+Merged busy islands per warehouse - the intermediate for the gap
+computation above. Also feeds the cold-start cost's billing-floor term:
+`max(0, 60s - median busy duration)` estimates the per-resume waste from
+Snowflake's minimum billing increment.
 
 ### `features.query_families`
 

@@ -489,12 +489,19 @@ class BurstyWorkload(DemoWorkload):
        aggregate (~2-8s on SMALL) keeps p99 well above 1s, immunizing
        BURSTY against Rule 4 while producing no spill and no queueing.
 
-    3. 12 cycles, not 10: the survival readiness gate needs >=10 complete
-       suspend/resume cycles; 12 leaves margin for a missed or merged one.
+    3. 12 cycles, not 10: the survival readiness gate needs >=10 idle
+       gaps; 12 leaves margin for a missed or merged one.
 
-    With AUTO_SUSPEND=120 configured and observed reactivation gaps of
-    ~3 min, the survival tuner proposes a much lower AUTO_SUSPEND
-    (delta safely past MIN_DELTA_SECONDS=30).
+    4. Since the gap-based rework, the RECOMMENDATION depends only on the
+       idle gaps visible in QUERY_HISTORY - it fires whether or not the
+       warehouse ever suspends.  The explicit suspends remain because
+       they (a) stop the warehouse billing through the 180s idle gaps
+       (real money saved per demo run), and (b) produce the RESUME
+       events the cold-start-cost enrichment measures.
+
+    With AUTO_SUSPEND=120 configured and observed idle gaps of ~3 min,
+    the survival tuner proposes a much lower AUTO_SUSPEND (delta safely
+    past MIN_DELTA_SECONDS=30).
     """
     key = "bursty"
     description = (

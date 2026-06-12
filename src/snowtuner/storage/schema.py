@@ -120,7 +120,9 @@ _DDL = [
         updated_at         TIMESTAMP DEFAULT current_timestamp
     )
     """,
-    # Per-warehouse active intervals — contiguous runs between RESUME and SUSPEND events.
+    # Per-warehouse busy intervals — overlapping compute-bearing queries
+    # merged into contiguous islands (populated by the warehouse_idle_gaps
+    # transform; also feeds the cold-start billing-floor estimate).
     """
     CREATE TABLE IF NOT EXISTS features.warehouse_active_intervals (
         warehouse_name  VARCHAR,
@@ -130,15 +132,20 @@ _DDL = [
         PRIMARY KEY (warehouse_name, start_time)
     )
     """,
-    # Per-warehouse idle gaps — the time between the last query on a warehouse
-    # and the subsequent SUSPEND event.  Core input to auto_suspend tuning.
+    # Per-warehouse idle gaps — the space between consecutive busy islands,
+    # derived purely from raw.query_history.  Core input to auto_suspend
+    # tuning: billed idle is min(gap, AUTO_SUSPEND) and a cold start is
+    # paid iff gap > AUTO_SUSPEND.  Deliberately NOT event-anchored: gaps
+    # exist whether or not the warehouse actually suspended, so warehouses
+    # that never suspend (over-provisioned AUTO_SUSPEND - the best
+    # tuning candidates) are fully visible.
     """
     CREATE TABLE IF NOT EXISTS features.warehouse_idle_gaps (
-        warehouse_name        VARCHAR,
-        last_query_end_time   TIMESTAMP,
-        suspend_time          TIMESTAMP,
-        idle_seconds          DOUBLE,
-        PRIMARY KEY (warehouse_name, last_query_end_time)
+        warehouse_name  VARCHAR,
+        gap_start       TIMESTAMP,   -- end of the preceding busy island
+        gap_end         TIMESTAMP,   -- start of the next busy island
+        idle_seconds    DOUBLE,
+        PRIMARY KEY (warehouse_name, gap_start)
     )
     """,
 
@@ -440,6 +447,33 @@ _DDL = [
 ]
 
 
+def _forward_migrations(conn: duckdb.DuckDBPyConnection) -> None:
+    """Targeted forward-only fixes for derived tables whose shape changed.
+
+    Pre-release policy is still "no general migration framework" (see
+    ``init_schema``), but ``features.*`` tables are rebuilt from ``raw.*``
+    by every pipeline run, so dropping an old-shape derived table is
+    loss-free and spares the user a full ``snowtuner reset``.  Keep this
+    function limited to derived tables - anything under ``app.*`` carries
+    user state and gets the reset treatment instead.
+    """
+    # 2026-06: warehouse_idle_gaps moved from event-anchored columns
+    # (last_query_end_time, suspend_time) to query-history busy-island
+    # gaps (gap_start, gap_end).  The old shape is detected by its
+    # suspend_time column; CREATE IF NOT EXISTS would otherwise leave the
+    # stale shape in place and the transform's INSERT would fail.
+    row = conn.execute(
+        """
+        SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_schema = 'features'
+          AND table_name = 'warehouse_idle_gaps'
+          AND column_name = 'suspend_time'
+        """
+    ).fetchone()
+    if row and row[0]:
+        conn.execute("DROP TABLE features.warehouse_idle_gaps")
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create all schemas and tables if they don't exist. Safe to call repeatedly.
 
@@ -447,6 +481,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     shape; if a user's on-disk database has an older schema, the right move is
     ``snowtuner reset`` (which wipes the local DuckDB file and re-initializes
     from these DDLs) followed by ``snowtuner sync`` to repopulate ``raw.*``.
+    (Derived ``features.*`` tables are the one exception - see
+    ``_forward_migrations``.)
 
     This keeps the codebase honest while we're still iterating on shapes
     weekly.  Once we cut v1.0 we'll add a real migration framework; until
@@ -456,5 +492,6 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """
     for s in _SCHEMAS:
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
+    _forward_migrations(conn)
     for stmt in _DDL:
         conn.execute(stmt)

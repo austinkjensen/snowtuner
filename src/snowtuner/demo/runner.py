@@ -725,55 +725,67 @@ def _verify_via_query_history(
 def _verify_bursty(
     client: SnowflakeClient, spec: DemoWarehouseSpec, since_expr: str,
 ) -> VerifyResult:
-    """The auto-suspend recommender needs WAREHOUSE_EVENTS_HISTORY.
+    """The auto-suspend survival tuner models idle gaps from QUERY_HISTORY.
 
-    That view lags hours, sometimes a full day on busy accounts - much
-    longer than QUERY_HISTORY's ~45 min.  We count suspend/resume cycles
-    and pass at >=10 (MIN_CYCLES_PER_WAREHOUSE in
-    auto_suspend_survival.py).
+    Since the gap-based rework, the recommendation needs >=10 idle gaps
+    >= 60s between busy periods - whether or not the warehouse actually
+    suspended.  So that's what we verify, from QUERY_HISTORY (~45 min lag)
+    instead of WAREHOUSE_EVENTS_HISTORY (hours).  Suspend/resume events
+    are only an enrichment for the cold-start cost now.
+
+    Gap detection mirrors the warehouse_idle_gaps feature transform:
+    compute-bearing statements only, overlapping intervals merged via a
+    running MAX(end_time), a gap wherever the next start_time clears it.
     """
-    from snowtuner.ingestion.event_vocab import (
-        RESUME_EVENT_NAMES, SUSPEND_EVENT_NAMES, sql_in_list,
-    )
     try:
-        # Both event vocabularies (dogfood 2026-06-11: fresh accounts emit
-        # only the *_CLUSTER variants; see ingestion/event_vocab.py).
         rows = client.execute(f"""
-        SELECT
-            SUM(CASE WHEN event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
-                     THEN 1 ELSE 0 END) AS n_suspends,
-            SUM(CASE WHEN event_name IN ({sql_in_list(RESUME_EVENT_NAMES)})
-                     THEN 1 ELSE 0 END) AS n_resumes
-        FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY
-        WHERE warehouse_name = '{spec.warehouse_name}'
-          AND timestamp >= {since_expr}
+        WITH q AS (
+            SELECT start_time,
+                   MAX(end_time) OVER (
+                       ORDER BY start_time, end_time
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                   ) AS prev_max_end
+            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+            WHERE warehouse_name = '{spec.warehouse_name}'
+              AND start_time >= {since_expr}
+              AND execution_status = 'SUCCESS'
+              AND COALESCE(execution_time, 0) > 0
+        )
+        SELECT COUNT(*) AS n_gaps,
+               COALESCE(MEDIAN(DATEDIFF('second', prev_max_end, start_time)), 0)
+                   AS median_gap_s
+        FROM q
+        WHERE prev_max_end IS NOT NULL
+          AND start_time > prev_max_end
+          AND DATEDIFF('second', prev_max_end, start_time) >= 60
         """)
     except Exception as e:
         return VerifyResult(
             workload_key=spec.workload_key,
             warehouse_name=spec.warehouse_name,
             expected=spec.expected_finding,
-            observed=f"events query failed: {e}",
-            verdict="FAIL: WAREHOUSE_EVENTS_HISTORY query errored",
+            observed=f"gap query failed: {e}",
+            verdict="FAIL: QUERY_HISTORY gap query errored",
         )
 
-    n_suspends, n_resumes = (rows[0] if rows else (0, 0))
-    n_suspends = int(n_suspends or 0)
-    n_resumes = int(n_resumes or 0)
-    n_cycles = min(n_suspends, n_resumes)
-    observed = f"{n_suspends} suspends, {n_resumes} resumes, {n_cycles} complete cycles"
+    n_gaps, median_gap_s = (rows[0] if rows else (0, 0))
+    n_gaps = int(n_gaps or 0)
+    median_gap_s = float(median_gap_s or 0)
+    observed = f"{n_gaps} idle gaps >= 60s, median {median_gap_s:.0f}s"
 
-    if n_cycles >= 10:
-        verdict = f"PASS: {n_cycles} cycles - auto-suspend tuner will fire"
-    elif n_cycles == 0:
+    if n_gaps >= 10:
         verdict = (
-            "FAIL: 0 cycles - either workload's idle gaps didn't trigger "
-            "AUTO_SUSPEND, or WAREHOUSE_EVENTS_HISTORY hasn't caught up "
-            "(lag can be hours on this view)"
+            f"PASS: {n_gaps} idle gaps (median {median_gap_s:.0f}s) - "
+            f"auto-suspend survival tuner will fire"
+        )
+    elif n_gaps == 0:
+        verdict = (
+            "FAIL: 0 idle gaps - either the workload's burst/idle cycles "
+            "didn't run, or QUERY_HISTORY hasn't caught up (~45 min lag)"
         )
     else:
         verdict = (
-            f"FAIL: {n_cycles} cycles (need >=10; may be lag - retry later)"
+            f"FAIL: only {n_gaps} gaps (need >=10; may be lag - retry later)"
         )
 
     return VerifyResult(

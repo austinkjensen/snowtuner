@@ -2,15 +2,15 @@
 
 Model
 =====
-Let T = reactivation gap = seconds from a suspend event to the next
-resume event on the same warehouse (event names vary by account version;
-see ingestion/event_vocab.py).  Its survival function is
-``S(t) = P(T > t)``.  Let C = cold-start cost (in seconds of equivalent
-billed time).
+Let G = idle gap = seconds between one busy period ending and the next
+compute-bearing query arriving on the warehouse (from
+``features.warehouse_idle_gaps``, derived purely from query history).
+Its survival function is ``S(t) = P(G > t)``.  Let C = cold-start cost
+(in seconds of equivalent billed time).
 
-If AUTO_SUSPEND is set to ``AS``, the per-cycle cost after the last query is:
+If AUTO_SUSPEND is set to ``AS``, the per-gap cost after the last query is:
 
-    cost(AS) = min(T, AS) + C · 1{T > AS}
+    cost(AS) = min(G, AS) + C · 1{G > AS}
                └ billed idle ┘   └ cold-start penalty if we suspended ┘
 
 Taking expectation and differentiating gives the classic result that the
@@ -22,6 +22,24 @@ Rather than estimate densities, we compute E[cost(AS)] directly from the
 empirical sample over a grid of AS candidates (vectorized).  This is
 identically what the hazard condition gives, but does not require a parametric
 or smoothed density.
+
+Why query-history gaps, not suspend→resume events
+=================================================
+An earlier version measured T = suspend-event → next-resume-event from
+WAREHOUSE_EVENTS_HISTORY.  That observable is T = G − AS₀ (shifted by
+whatever AUTO_SUSPEND was in effect during observation) and exists only
+for gaps that exceeded AS₀ (censoring): a warehouse whose AUTO_SUSPEND
+sits far above its real gaps never suspends, produces zero events, and
+was invisible — precisely the warehouses that most need this
+recommendation.  Both distortions bias the proposal downward.
+Query-history gaps are the uncensored, unshifted quantity the cost model
+is actually written in, and QUERY_HISTORY lags ~45 minutes vs the events
+view's hours.
+
+Events remain as **C-enrichment**: when resume STARTED→COMPLETED pairs
+are available, C is measured (p95 resume duration plus the
+60s-minimum-bill floor) instead of assumed from per-size defaults.  See
+``_estimate_cold_start_cost``.
 
 Compared to the p25 heuristic, this:
   * uses the full distribution, not one percentile
@@ -45,8 +63,7 @@ from snowtuner.recommendations.model import (
     Recommendation,
 )
 from snowtuner.ingestion.event_vocab import (
-    SUSPEND_EVENT_NAMES,
-    SUSPEND_RESUME_EVENT_NAMES,
+    RESUME_EVENT_NAMES,
     sql_in_list,
 )
 from snowtuner.recommenders.base import (
@@ -56,21 +73,32 @@ from snowtuner.recommenders.base import (
 )
 
 
-# Minimum suspend/resume cycles per warehouse before we start recommending.
-# 10 is enough to get a coarse p25 estimate; the confidence score already
-# down-weights small samples (see _confidence below).  Real-world small
-# Snowflake accounts can take weeks to accumulate the originally-defaulted 30.
+# Minimum modelable idle gaps per warehouse before we start recommending.
+# 10 is enough for a coarse fit; the confidence score already down-weights
+# small samples (see _confidence below).  Name kept from the events era
+# for API stability - the unit is now gaps, not suspend/resume pairs.
 MIN_CYCLES_PER_WAREHOUSE = 10
 AUTO_SUSPEND_MIN = 60
 AUTO_SUSPEND_MAX = 600
 AUTO_SUSPEND_STEP = 5  # grid resolution in seconds
 MIN_DELTA_SECONDS = 30
 
+# Gaps shorter than the grid floor can never influence the optimum: for any
+# candidate AS >= AUTO_SUSPEND_MIN > G the per-gap cost is the constant G
+# (no suspend under any candidate).  Including them would only inflate n
+# (and therefore confidence) and drag the displayed quantiles toward zero,
+# so both the gate and the fit exclude them.
+IDLE_GAP_FLOOR_SECONDS = AUTO_SUSPEND_MIN
+
+# Resume STARTED->COMPLETED pairs required before a measured cold-start
+# cost is trusted over the per-size default.
+_MIN_RESUME_SAMPLES = 3
+
 
 # Approximate cold-start cost per warehouse size (seconds of equivalent billed
 # time).  Larger warehouses take meaningfully longer to resume.  These are
-# conservative defaults; the value really ought to come from an observed p95
-# of resume durations in warehouse_events_history, which is a later refinement.
+# the FALLBACK values - ``_estimate_cold_start_cost`` measures C from resume
+# durations + the billing floor whenever the events data supports it.
 COLD_START_COST_BY_SIZE: dict[str, float] = {
     "XSMALL":   8,
     "SMALL":    10,
@@ -87,32 +115,41 @@ DEFAULT_COLD_START_COST = 15.0
 
 
 class SurvivalReadinessGate(TrainingGate):
-    """Require enough suspend/resume cycles to get a stable survival curve."""
+    """Require enough modelable idle gaps for a stable survival curve.
+
+    Reads ``features.warehouse_idle_gaps`` (query-history derived; run the
+    feature pipeline after sync).  Suspend/resume events are deliberately
+    NOT consulted here: a warehouse that never suspends still has gaps,
+    and those are exactly the warehouses most in need of tuning.
+    """
 
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
         rows = conn.execute(
             f"""
-            SELECT warehouse_name, COUNT(*) AS cycles
-            FROM raw.warehouse_events_history
-            WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
+            SELECT warehouse_name, COUNT(*) AS n_gaps
+            FROM features.warehouse_idle_gaps
+            WHERE idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
             GROUP BY warehouse_name
             """
         ).fetchall()
         if not rows:
             return ReadinessReport(
                 is_ready=False,
-                reason="no warehouse events ingested yet",
-                signals={"warehouses_with_events": 0},
+                reason=(
+                    "no idle gaps computed yet - run a sync and the "
+                    "feature pipeline first"
+                ),
+                signals={"warehouses_with_gaps": 0},
             )
-        ready = [w for w, c in rows if c >= MIN_CYCLES_PER_WAREHOUSE * 2]
+        ready = [w for w, c in rows if c >= MIN_CYCLES_PER_WAREHOUSE]
         if not ready:
             return ReadinessReport(
                 is_ready=False,
                 reason=(
-                    f"no warehouse has ≥{MIN_CYCLES_PER_WAREHOUSE} suspend/resume cycles yet; "
-                    f"observed: {dict(rows)}"
+                    f"no warehouse has >={MIN_CYCLES_PER_WAREHOUSE} idle gaps "
+                    f">= {IDLE_GAP_FLOOR_SECONDS}s yet; observed: {dict(rows)}"
                 ),
-                signals={"warehouses_with_events": len(rows)},
+                signals={"warehouses_with_gaps": len(rows)},
             )
         return ReadinessReport(
             is_ready=True,
@@ -129,37 +166,18 @@ class AutoSuspendSurvivalTuner(Recommender):
     training_gate = SurvivalReadinessGate()
 
     def fit(self, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-        """Fit the empirical survival curve and optimal-cost curve per warehouse."""
-        # Normalize both event vocabularies to a SUSPEND/RESUME 'kind' before
-        # pairing.  Consecutive same-kind rows (STARTED+COMPLETED duplicates,
-        # or per-cluster rows on multi-cluster warehouses) collapse naturally:
-        # only the last suspend-kind row before a resume-kind row produces a
-        # gap, which is the reactivation gap we want.
+        """Fit the empirical survival curve and optimal-cost curve per warehouse.
+
+        Gaps come from ``features.warehouse_idle_gaps`` (query-history
+        derived - see the module docstring for why events are not the
+        source).  Gaps below the grid floor are optimization-inert and
+        excluded so they don't inflate n or distort the quantiles.
+        """
         rows = conn.execute(
             f"""
-            WITH evts AS (
-                SELECT warehouse_name,
-                       CASE WHEN event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
-                            THEN 'SUSPEND' ELSE 'RESUME' END AS kind,
-                       timestamp
-                FROM raw.warehouse_events_history
-                WHERE event_name IN ({sql_in_list(SUSPEND_RESUME_EVENT_NAMES)})
-            ), seq AS (
-                SELECT warehouse_name, kind, timestamp,
-                       LEAD(kind) OVER (
-                           PARTITION BY warehouse_name ORDER BY timestamp
-                       ) AS next_kind,
-                       LEAD(timestamp) OVER (
-                           PARTITION BY warehouse_name ORDER BY timestamp
-                       ) AS next_ts
-                FROM evts
-            )
-            SELECT warehouse_name,
-                   date_diff('second', timestamp, next_ts) AS reactivation_seconds
-            FROM seq
-            WHERE kind = 'SUSPEND'
-              AND next_kind = 'RESUME'
-              AND next_ts IS NOT NULL
+            SELECT warehouse_name, idle_seconds
+            FROM features.warehouse_idle_gaps
+            WHERE idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
             """
         ).fetchall()
 
@@ -179,9 +197,11 @@ class AutoSuspendSurvivalTuner(Recommender):
             if len(gaps) < MIN_CYCLES_PER_WAREHOUSE:
                 continue
             size_key = sizes.get(wh.upper(), "")
-            C = COLD_START_COST_BY_SIZE.get(size_key, DEFAULT_COLD_START_COST)
+            C, c_source, c_detail = _estimate_cold_start_cost(conn, wh, size_key)
             fit = _fit_survival(gaps, cold_start_cost=C)
             fit["cold_start_cost_seconds"] = C
+            fit["cold_start_cost_source"] = c_source
+            fit["cold_start_cost_detail"] = c_detail
             state[wh] = fit
         return {"per_warehouse": state}
 
@@ -224,35 +244,41 @@ class AutoSuspendSurvivalTuner(Recommender):
             # Describe distribution succinctly for the rationale
             q = fit["quantiles"]
             n = fit["n"]
+            c_verb = (
+                "measured at"
+                if fit.get("cold_start_cost_source") == "measured"
+                else "assumed"
+            )
             rationale = (
-                f"Survival-based fit on {n} suspend→resume cycles for {wh}. "
-                f"Reactivation-gap quantiles: p25={q['p25']:.0f}s, p50={q['p50']:.0f}s, "
-                f"p75={q['p75']:.0f}s.  Cold-start cost assumed {fit['cold_start_cost_seconds']:.0f}s. "
-                f"Expected per-cycle cost minimized at AUTO_SUSPEND={proposed}s "
+                f"Survival-based fit on {n} idle gaps between busy periods on {wh}. "
+                f"Idle-gap quantiles: p25={q['p25']:.0f}s, p50={q['p50']:.0f}s, "
+                f"p75={q['p75']:.0f}s.  Cold-start cost {c_verb} "
+                f"{fit['cold_start_cost_seconds']:.0f}s. "
+                f"Expected per-gap cost minimized at AUTO_SUSPEND={proposed}s "
                 f"(cost={fit['optimal_cost']:.1f}s)."
             )
             if cur_as is not None and cost_at_current is not None:
                 rationale += (
-                    f"  Current AUTO_SUSPEND={int(cur_as)}s has expected per-cycle cost "
-                    f"{cost_at_current:.1f}s → saving ~{cost_saved_per_cycle:.1f}s per cycle."
+                    f"  Current AUTO_SUSPEND={int(cur_as)}s has expected per-gap cost "
+                    f"{cost_at_current:.1f}s → saving ~{cost_saved_per_cycle:.1f}s per gap."
                 )
 
             evidence = [
                 EvidenceRef(
-                    kind="warehouse_events",
-                    description=f"{n} suspend→resume cycles observed",
-                    metric="n_cycles",
+                    kind="warehouse_idle_gaps",
+                    description=f"{n} idle gaps observed between busy periods",
+                    metric="n_gaps",
                     value=float(n),
                 ),
                 EvidenceRef(
                     kind="survival_curve",
-                    description="Reactivation survival curve (empirical)",
+                    description="Idle-gap survival curve (empirical)",
                     metric="p50_seconds",
                     value=q["p50"],
                 ),
                 EvidenceRef(
                     kind="cost_curve",
-                    description="Expected per-cycle cost minimum",
+                    description="Expected per-gap cost minimum",
                     metric="optimal_cost_seconds",
                     value=fit["optimal_cost"],
                 ),
@@ -275,8 +301,9 @@ class AutoSuspendSurvivalTuner(Recommender):
                     credits_delta_daily=credits_delta_daily,
                     confidence=_confidence(n, fit["optimal_cost_margin"]),
                     notes=(
-                        f"based on {n} observed cycles; cold-start cost "
-                        f"{fit['cold_start_cost_seconds']:.0f}s"
+                        f"based on {n} observed idle gaps; cold-start cost "
+                        f"{fit['cold_start_cost_seconds']:.0f}s "
+                        f"({fit.get('cold_start_cost_source', 'default')})"
                     ),
                 ),
             ))
@@ -367,22 +394,102 @@ def _lookup_cost(fit: dict[str, Any], as_value: float | None) -> float | None:
 def _estimate_cycles_per_day(
     conn: duckdb.DuckDBPyConnection, warehouse_name: str,
 ) -> float:
-    # Counts suspend-kind ROWS, not strict cycles - STARTED/COMPLETED pairs
-    # or per-cluster rows can multiply the count.  This only scales the
-    # impact estimate (credits/day), never the recommend/skip decision.
+    """Modelable idle gaps per day - scales the credits/day impact estimate.
+
+    Counts the same gap population the fit uses (>= floor), over the span
+    of observed history.  Only affects the impact figure, never the
+    recommend/skip decision.
+    """
     row = conn.execute(
         f"""
-        SELECT COUNT(*) AS cycles,
-               date_diff('day', MIN(timestamp), MAX(timestamp)) AS days
-        FROM raw.warehouse_events_history
+        SELECT COUNT(*) AS n_gaps,
+               date_diff('day', MIN(gap_start), MAX(gap_end)) AS days
+        FROM features.warehouse_idle_gaps
         WHERE warehouse_name = ?
-          AND event_name IN ({sql_in_list(SUSPEND_EVENT_NAMES)})
+          AND idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
         """,
         [warehouse_name],
     ).fetchone()
-    if not row or not row[0] or not row[1]:
+    if not row or not row[0]:
         return 0.0
-    return row[0] / max(row[1], 1)
+    return row[0] / max(row[1] or 0, 1)
+
+
+def _estimate_cold_start_cost(
+    conn: duckdb.DuckDBPyConnection, warehouse_name: str, size_key: str,
+) -> tuple[float, str, dict[str, Any]]:
+    """C-enrichment: measure the cold-start cost from events when possible.
+
+        C = p95(resume provisioning seconds)          [RESUME STARTED->COMPLETED]
+          + max(0, 60 - median busy-interval seconds) [60s minimum bill per resume]
+
+    The first term is the resume latency the user actually experiences on
+    this account; the second is the expected billing-floor waste when
+    bursts run shorter than Snowflake's minimum billing increment.
+    Cache-warmup cost is real but unmeasured here (later refinement).
+
+    Falls back to the per-size defaults when fewer than
+    ``_MIN_RESUME_SAMPLES`` measurable resume pairs exist - events still
+    lagging, a warehouse that never suspends, or a vocabulary this module
+    hasn't met yet.  The recommendation fires either way; only C's
+    fidelity changes.
+
+    Returns ``(C, source, detail)`` where source is 'measured' | 'default'.
+    """
+    default_c = COLD_START_COST_BY_SIZE.get(size_key, DEFAULT_COLD_START_COST)
+    try:
+        pairs = conn.execute(
+            f"""
+            WITH resumes AS (
+                SELECT timestamp, event_state,
+                       LEAD(event_state) OVER (ORDER BY timestamp) AS next_state,
+                       LEAD(timestamp)   OVER (ORDER BY timestamp) AS next_ts
+                FROM raw.warehouse_events_history
+                WHERE warehouse_name = ?
+                  AND event_name IN ({sql_in_list(RESUME_EVENT_NAMES)})
+            )
+            SELECT date_diff('second', timestamp, next_ts) AS resume_seconds
+            FROM resumes
+            WHERE event_state = 'STARTED'
+              AND next_state = 'COMPLETED'
+              AND next_ts IS NOT NULL
+            """,
+            [warehouse_name],
+        ).fetchall()
+    except Exception:
+        pairs = []
+    durations = [
+        float(r[0]) for r in pairs
+        if r[0] is not None and 0 <= float(r[0]) <= 600
+    ]
+    if len(durations) < _MIN_RESUME_SAMPLES:
+        return default_c, "default", {"resume_samples": len(durations)}
+
+    p95_resume = float(np.percentile(np.asarray(durations), 95))
+    row = conn.execute(
+        """
+        SELECT median(duration_sec)
+        FROM features.warehouse_active_intervals
+        WHERE warehouse_name = ?
+        """,
+        [warehouse_name],
+    ).fetchone()
+    median_busy = float(row[0]) if row and row[0] is not None else None
+    billing_floor = (
+        max(0.0, 60.0 - median_busy) if median_busy is not None else 0.0
+    )
+    # Clamp to a sane band: sub-2s C makes the optimizer hyper-aggressive
+    # on noise; >300s means something upstream is mismeasured.
+    c = float(min(max(p95_resume + billing_floor, 2.0), 300.0))
+    detail = {
+        "resume_samples": len(durations),
+        "p95_resume_seconds": round(p95_resume, 1),
+        "billing_floor_seconds": round(billing_floor, 1),
+        "median_busy_seconds": (
+            round(median_busy, 1) if median_busy is not None else None
+        ),
+    }
+    return c, "measured", detail
 
 
 def _credit_rate_for_size(size: str | None) -> float:
