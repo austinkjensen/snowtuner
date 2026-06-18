@@ -736,7 +736,16 @@ def reject(rec_id: int, note: str | None) -> None:
 
 @cli.command()
 def recommenders() -> None:
-    """List the built-in recommenders."""
+    """List the built-in recommenders and their consideration windows.
+
+    The Window column shows how far back each recommender reads when
+    aggregating history, and where that value came from (built-in
+    default, the global SNOWTUNER_WINDOW_DAYS, or a per-recommender
+    SNOWTUNER_WINDOW_DAYS__<NAME> override).  See
+    docs/configuration.md for the full knob reference.
+    """
+    from snowtuner.recommenders.windows import resolve_window_days
+
     reg = default_registry()
     if not reg.all():
         console.print("[yellow]No recommenders registered.[/yellow]")
@@ -745,11 +754,14 @@ def recommenders() -> None:
     tbl.add_column("Name")
     tbl.add_column("Version")
     tbl.add_column("Action type")
-    tbl.add_column("Class")
+    tbl.add_column("Window")
+    tbl.add_column("Window source")
     for r in reg.all():
+        win = resolve_window_days(r.name)
         tbl.add_row(
             r.name, r.version, r.action_type.value,
-            f"{r.__class__.__module__}.{r.__class__.__name__}",
+            "unbounded" if win.is_unbounded else f"{win.days}d",
+            win.source,
         )
     console.print(tbl)
 

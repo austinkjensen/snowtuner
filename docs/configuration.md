@@ -42,6 +42,33 @@ The background runner that fires the full pipeline (`sync → features → recom
 
 A tick that fails on the sync stage aborts the rest of the pipeline ("fail-fast") and retries next interval. While an experiment is in `RUNNING` state, the autonomous stage defers automatically to avoid corrupting in-flight measurements. Inspect tick history via `GET /automation/status` or the freshness pill in the nav bar.
 
+### Recommender consideration windows
+
+How far back each recommender reads when aggregating history. Read-side only: these do not change what `snowtuner sync` ingests or retains - a window larger than the ingested history just degrades to "everything we have". Inspect the resolved values anytime with `snowtuner recommenders`.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SNOWTUNER_WINDOW_DAYS` | (unset) | Global override: every recommender uses this many days. `0` means unbounded (all ingested history). |
+| `SNOWTUNER_WINDOW_DAYS__<RECOMMENDER>` | (unset) | Per-recommender override; beats the global. Name is the recommender's registry name uppercased, e.g. `SNOWTUNER_WINDOW_DAYS__RULE_BASED_RIGHT_SIZER=30`. |
+
+Built-in defaults when nothing is set:
+
+| Recommender | Default window |
+|---|---|
+| `rule_based_right_sizer` | 14 days |
+| `multi_cluster_reducer` | 14 days |
+| `qas_candidate_finder` | 14 days |
+| `gen2_candidate_finder` | 14 days |
+| `auto_suspend_survival_tuner` | 30 days |
+
+Notes on semantics:
+
+- Within a window every observation weighs the same; there is no recency decay (yet). Shrinking the window is the lever for "react faster to workload changes"; growing it is the lever for "smooth over noisy weeks".
+- The auto-suspend tuner defaults to 30 days (not 14) because low-traffic warehouses need more runway to accumulate the 10 idle gaps its model requires. Its pre-window behavior - unbounded history, with proposals drifting as data accumulated - is restorable with `SNOWTUNER_WINDOW_DAYS__AUTO_SUSPEND_SURVIVAL_TUNER=0`.
+- Credits-per-week figures are extrapolated as `total x 7/window`; under an unbounded window they normalize by the observed span of the data instead.
+- Recommendation rationales state the window they were computed over, and readiness-gate output includes `window_days` + `window_source`, so a surprising recommendation is always traceable to its window.
+- **Reserved:** `SNOWTUNER_WINDOW_DAYS__<RECOMMENDER>__<WAREHOUSE>` is the planned shape for per-warehouse windows. Setting one today logs a warning and is ignored - per-(warehouse, recommender) windows need per-warehouse query passes and are a future release.
+
 ### API server
 
 | Variable | Default | Notes |

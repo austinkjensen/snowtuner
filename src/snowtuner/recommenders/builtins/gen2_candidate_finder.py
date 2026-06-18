@@ -57,11 +57,12 @@ from snowtuner.experiments.model import ProposedExperiment
 from snowtuner.experiments.recipes import gen1_to_gen2
 from snowtuner.recommendations.model import Recommendation
 from snowtuner.recommenders.base import AlwaysReadyGate, Recommender
+from snowtuner.recommenders.windows import WindowResolution, resolve_window_days
 
 
 # Tunables.  Each gate is conservative; relax if your account is small
-# enough that nothing currently passes.
-_LOOKBACK_DAYS = 14
+# enough that nothing currently passes.  The consideration window is
+# env-configurable; see recommenders/windows.py.
 _MIN_CREDITS_PER_WEEK = 20.0       # below this, experiment overhead > savings
 _MIN_COMPUTE_BOUND_RATIO = 0.7     # queries spend ≥70% in actual compute
 _MIN_REAL_QUERY_MASS = 0.3         # ≥30% of queries take > 1s (vs sub-second)
@@ -160,6 +161,7 @@ class _Candidate:
         local_spill_query_count: int,
         real_query_mass: float,
         total_queries: int,
+        window: WindowResolution,
     ) -> None:
         self.warehouse_name = warehouse_name
         self.credits_per_week = credits_per_week
@@ -167,6 +169,7 @@ class _Candidate:
         self.local_spill_query_count = local_spill_query_count
         self.real_query_mass = real_query_mass
         self.total_queries = total_queries
+        self.window = window
 
     @property
     def rationale(self) -> str:
@@ -177,8 +180,8 @@ class _Candidate:
         signals match a workload that's likely to win on Gen2.
         """
         return (
-            f"Gen1 candidate for Gen2 experiment.  Over the last "
-            f"{_LOOKBACK_DAYS} days, warehouse {self.warehouse_name} ran "
+            f"Gen1 candidate for Gen2 experiment.  Over "
+            f"{self.window.describe()}, warehouse {self.warehouse_name} ran "
             f"{self.total_queries} queries with these signals:\n"
             f"  • sustained ~{self.credits_per_week:.1f} credits/week\n"
             f"  • {self.compute_bound_ratio:.0%} of wall-clock spent in "
@@ -194,6 +197,7 @@ class _Candidate:
 
 def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
     """Compute the four signals for every Gen1 warehouse in raw.warehouses."""
+    win = resolve_window_days("gen2_candidate_finder")
     # Pull Gen1 warehouses.  When generation is unknown (None — older
     # Snowflake or fetch error), exclude rather than guess: better to
     # silently skip than to propose an experiment on a warehouse that's
@@ -223,7 +227,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
                     bytes_spilled_to_local
                 FROM raw.query_history
                 WHERE upper(warehouse_name) = upper(?)
-                  AND start_time >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+                  AND {win.sql_filter('start_time')}
                   AND execution_status = 'SUCCESS'
             )
             SELECT
@@ -254,15 +258,17 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
         # than counting up per-query credits, which we don't store).
         credit_row = conn.execute(
             f"""
-            SELECT COALESCE(SUM(credits_used), 0)
+            SELECT COALESCE(SUM(credits_used), 0) AS total,
+                   date_diff('day', MIN(start_time), MAX(start_time)) AS span_days
             FROM raw.warehouse_metering_history
             WHERE upper(warehouse_name) = upper(?)
-              AND start_time >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+              AND {win.sql_filter('start_time')}
             """,
             [name],
         ).fetchone()
         total_credits = float(credit_row[0] or 0) if credit_row else 0.0
-        credits_per_week = total_credits * (7.0 / _LOOKBACK_DAYS)
+        span_days = float(credit_row[1] or 0) if credit_row else 0.0
+        credits_per_week = total_credits * win.weekly_factor(span_days)
 
         out.append(_Candidate(
             warehouse_name=name,
@@ -271,6 +277,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
             local_spill_query_count=int(spill_count or 0),
             real_query_mass=real_mass,
             total_queries=total_queries,
+            window=win,
         ))
     return out
 

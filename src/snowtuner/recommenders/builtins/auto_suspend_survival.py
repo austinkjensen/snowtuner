@@ -71,6 +71,7 @@ from snowtuner.recommenders.base import (
     Recommender,
     TrainingGate,
 )
+from snowtuner.recommenders.windows import WindowResolution, resolve_window_days
 
 
 # Minimum modelable idle gaps per warehouse before we start recommending.
@@ -124,11 +125,13 @@ class SurvivalReadinessGate(TrainingGate):
     """
 
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
+        win = resolve_window_days("auto_suspend_survival_tuner")
         rows = conn.execute(
             f"""
             SELECT warehouse_name, COUNT(*) AS n_gaps
             FROM features.warehouse_idle_gaps
             WHERE idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
+              AND {win.sql_filter('gap_start')}
             GROUP BY warehouse_name
             """
         ).fetchall()
@@ -136,10 +139,14 @@ class SurvivalReadinessGate(TrainingGate):
             return ReadinessReport(
                 is_ready=False,
                 reason=(
-                    "no idle gaps computed yet - run a sync and the "
-                    "feature pipeline first"
+                    f"no idle gaps over {win.describe()} - run a sync and "
+                    f"the feature pipeline first"
                 ),
-                signals={"warehouses_with_gaps": 0},
+                signals={
+                    "warehouses_with_gaps": 0,
+                    "window_days": win.days,
+                    "window_source": win.source,
+                },
             )
         ready = [w for w, c in rows if c >= MIN_CYCLES_PER_WAREHOUSE]
         if not ready:
@@ -147,14 +154,23 @@ class SurvivalReadinessGate(TrainingGate):
                 is_ready=False,
                 reason=(
                     f"no warehouse has >={MIN_CYCLES_PER_WAREHOUSE} idle gaps "
-                    f">= {IDLE_GAP_FLOOR_SECONDS}s yet; observed: {dict(rows)}"
+                    f">= {IDLE_GAP_FLOOR_SECONDS}s over {win.describe()}; "
+                    f"observed: {dict(rows)}"
                 ),
-                signals={"warehouses_with_gaps": len(rows)},
+                signals={
+                    "warehouses_with_gaps": len(rows),
+                    "window_days": win.days,
+                    "window_source": win.source,
+                },
             )
         return ReadinessReport(
             is_ready=True,
             reason=f"{len(ready)} warehouse(s) have enough history",
-            signals={"ready_warehouses": ready},
+            signals={
+                "ready_warehouses": ready,
+                "window_days": win.days,
+                "window_source": win.source,
+            },
         )
 
 
@@ -171,13 +187,17 @@ class AutoSuspendSurvivalTuner(Recommender):
         Gaps come from ``features.warehouse_idle_gaps`` (query-history
         derived - see the module docstring for why events are not the
         source).  Gaps below the grid floor are optimization-inert and
-        excluded so they don't inflate n or distort the quantiles.
+        excluded so they don't inflate n or distort the quantiles.  The
+        consideration window is env-configurable (recommenders/windows.py);
+        0 restores the unbounded pre-2026-06 behavior.
         """
+        win = resolve_window_days(self.name)
         rows = conn.execute(
             f"""
             SELECT warehouse_name, idle_seconds
             FROM features.warehouse_idle_gaps
             WHERE idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
+              AND {win.sql_filter('gap_start')}
             """
         ).fetchall()
 
@@ -197,13 +217,19 @@ class AutoSuspendSurvivalTuner(Recommender):
             if len(gaps) < MIN_CYCLES_PER_WAREHOUSE:
                 continue
             size_key = sizes.get(wh.upper(), "")
-            C, c_source, c_detail = _estimate_cold_start_cost(conn, wh, size_key)
+            C, c_source, c_detail = _estimate_cold_start_cost(
+                conn, wh, size_key, win,
+            )
             fit = _fit_survival(gaps, cold_start_cost=C)
             fit["cold_start_cost_seconds"] = C
             fit["cold_start_cost_source"] = c_source
             fit["cold_start_cost_detail"] = c_detail
             state[wh] = fit
-        return {"per_warehouse": state}
+        return {
+            "per_warehouse": state,
+            "window_days": win.days,
+            "window_source": win.source,
+        }
 
     def predict(
         self,
@@ -213,6 +239,18 @@ class AutoSuspendSurvivalTuner(Recommender):
         per_wh = (model_state or {}).get("per_warehouse") or {}
         if not per_wh:
             return []
+
+        # The fit's aggregates were computed under a specific window; reuse
+        # it for the impact estimate and the rationale.  Fall back to a
+        # fresh resolution for model_state written before windows existed.
+        stored_days = (model_state or {}).get("window_days")
+        if stored_days is not None:
+            win = WindowResolution(
+                days=int(stored_days),
+                source=str((model_state or {}).get("window_source", "model_state")),
+            )
+        else:
+            win = resolve_window_days(self.name)
 
         current = {
             row[0]: {"auto_suspend_seconds": row[1], "size": row[2]}
@@ -232,7 +270,7 @@ class AutoSuspendSurvivalTuner(Recommender):
 
             # Expected savings: per-cycle cost at current setting minus per-cycle
             # cost at optimum, times cycles/day, converted to credits.
-            cycles_per_day = _estimate_cycles_per_day(conn, wh)
+            cycles_per_day = _estimate_cycles_per_day(conn, wh, win)
             cost_at_current = _lookup_cost(fit, cur_as) if cur_as is not None else None
             cost_saved_per_cycle = (
                 (cost_at_current - fit["optimal_cost"]) if cost_at_current is not None else 0.0
@@ -250,7 +288,8 @@ class AutoSuspendSurvivalTuner(Recommender):
                 else "assumed"
             )
             rationale = (
-                f"Survival-based fit on {n} idle gaps between busy periods on {wh}. "
+                f"Survival-based fit on {n} idle gaps between busy periods on {wh} "
+                f"over {win.describe()}. "
                 f"Idle-gap quantiles: p25={q['p25']:.0f}s, p50={q['p50']:.0f}s, "
                 f"p75={q['p75']:.0f}s.  Cold-start cost {c_verb} "
                 f"{fit['cold_start_cost_seconds']:.0f}s. "
@@ -392,13 +431,15 @@ def _lookup_cost(fit: dict[str, Any], as_value: float | None) -> float | None:
 
 
 def _estimate_cycles_per_day(
-    conn: duckdb.DuckDBPyConnection, warehouse_name: str,
+    conn: duckdb.DuckDBPyConnection,
+    warehouse_name: str,
+    win: WindowResolution,
 ) -> float:
     """Modelable idle gaps per day - scales the credits/day impact estimate.
 
-    Counts the same gap population the fit uses (>= floor), over the span
-    of observed history.  Only affects the impact figure, never the
-    recommend/skip decision.
+    Counts the same gap population the fit uses (>= floor, same window),
+    over the span of observed history.  Only affects the impact figure,
+    never the recommend/skip decision.
     """
     row = conn.execute(
         f"""
@@ -407,6 +448,7 @@ def _estimate_cycles_per_day(
         FROM features.warehouse_idle_gaps
         WHERE warehouse_name = ?
           AND idle_seconds >= {IDLE_GAP_FLOOR_SECONDS}
+          AND {win.sql_filter('gap_start')}
         """,
         [warehouse_name],
     ).fetchone()
@@ -416,7 +458,10 @@ def _estimate_cycles_per_day(
 
 
 def _estimate_cold_start_cost(
-    conn: duckdb.DuckDBPyConnection, warehouse_name: str, size_key: str,
+    conn: duckdb.DuckDBPyConnection,
+    warehouse_name: str,
+    size_key: str,
+    win: WindowResolution,
 ) -> tuple[float, str, dict[str, Any]]:
     """C-enrichment: measure the cold-start cost from events when possible.
 
@@ -447,6 +492,7 @@ def _estimate_cold_start_cost(
                 FROM raw.warehouse_events_history
                 WHERE warehouse_name = ?
                   AND event_name IN ({sql_in_list(RESUME_EVENT_NAMES)})
+                  AND {win.sql_filter('timestamp')}
             )
             SELECT date_diff('second', timestamp, next_ts) AS resume_seconds
             FROM resumes

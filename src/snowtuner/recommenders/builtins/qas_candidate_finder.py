@@ -54,11 +54,12 @@ from snowtuner.experiments.model import ProposedExperiment
 from snowtuner.experiments.recipes import qas_on_off
 from snowtuner.recommendations.model import Recommendation
 from snowtuner.recommenders.base import AlwaysReadyGate, Recommender
+from snowtuner.recommenders.windows import WindowResolution, resolve_window_days
 
 
 # Tunables — kept aligned with the Gen2 finder where the meaning carries
-# over (credit-consumption gate, sample size for cost estimator).
-_LOOKBACK_DAYS = 14
+# over (credit-consumption gate, sample size for cost estimator).  The
+# consideration window is env-configurable; see recommenders/windows.py.
 _MIN_CREDITS_PER_WEEK = 20.0
 
 # "Heavy scan" — average bytes_scanned per query.  100 MB is the
@@ -71,8 +72,8 @@ _MIN_AVG_SCAN_BYTES_FOR_QAS_ON = 100 * 1024 * 1024     # 100 MB
 _LOW_AVG_SCAN_BYTES_FOR_QAS_OFF = 10 * 1024 * 1024     # 10 MB
 
 # Queue-overload time over the window that suggests the warehouse is
-# concurrency-bound.  60 seconds total over 14 days is a low bar; tune
-# upward if false-positives are noisy.
+# concurrency-bound.  60 seconds total over the (default 14-day) window
+# is a low bar; tune upward if false-positives are noisy.
 _MIN_TOTAL_QUEUE_OVERLOAD_MS = 60_000
 
 _MAX_PROPOSALS_PER_RUN = 3
@@ -157,6 +158,7 @@ class _Candidate:
         remote_spill_query_count: int,
         total_queue_overload_ms: int,
         total_queries: int,
+        window: WindowResolution,
     ) -> None:
         self.warehouse_name = warehouse_name
         self.qas_state = qas_state
@@ -165,6 +167,7 @@ class _Candidate:
         self.remote_spill_query_count = remote_spill_query_count
         self.total_queue_overload_ms = total_queue_overload_ms
         self.total_queries = total_queries
+        self.window = window
 
     @property
     def has_positive_signal(self) -> bool:
@@ -192,8 +195,8 @@ class _Candidate:
         queue_min = self.total_queue_overload_ms / 60_000
         common = (
             f"QAS candidate for warehouse {self.warehouse_name} (currently "
-            f"{self.qas_state or 'unknown'}).  Over the last {_LOOKBACK_DAYS} "
-            f"days: {self.total_queries} queries, sustained "
+            f"{self.qas_state or 'unknown'}).  Over {self.window.describe()}: "
+            f"{self.total_queries} queries, sustained "
             f"~{self.credits_per_week:.1f} credits/week, avg scan "
             f"{gb:.2f} GB/query, {self.remote_spill_query_count} queries spilled "
             f"to remote storage, total queue overload {queue_min:.1f} minutes."
@@ -225,6 +228,7 @@ class _Candidate:
 
 def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
     """Compute signals for every warehouse whose QAS state we know."""
+    win = resolve_window_days("qas_candidate_finder")
     rows = conn.execute(
         """
         SELECT name, qas_state FROM raw.warehouses
@@ -247,7 +251,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
                 COALESCE(SUM(queued_overload_ms), 0) AS total_queue_ms
             FROM raw.query_history
             WHERE upper(warehouse_name) = upper(?)
-              AND start_time >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+              AND {win.sql_filter('start_time')}
               AND execution_status = 'SUCCESS'
             """,
             [name],
@@ -261,15 +265,17 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
 
         credit_row = conn.execute(
             f"""
-            SELECT COALESCE(SUM(credits_used), 0)
+            SELECT COALESCE(SUM(credits_used), 0) AS total,
+                   date_diff('day', MIN(start_time), MAX(start_time)) AS span_days
             FROM raw.warehouse_metering_history
             WHERE upper(warehouse_name) = upper(?)
-              AND start_time >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+              AND {win.sql_filter('start_time')}
             """,
             [name],
         ).fetchone()
         total_credits = float(credit_row[0] or 0) if credit_row else 0.0
-        credits_per_week = total_credits * (7.0 / _LOOKBACK_DAYS)
+        span_days = float(credit_row[1] or 0) if credit_row else 0.0
+        credits_per_week = total_credits * win.weekly_factor(span_days)
 
         out.append(_Candidate(
             warehouse_name=name,
@@ -279,6 +285,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
             remote_spill_query_count=int(remote_spill or 0),
             total_queue_overload_ms=int(queue_ms or 0),
             total_queries=total_queries,
+            window=win,
         ))
     return out
 

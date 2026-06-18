@@ -18,7 +18,8 @@ Rules (evaluated top-down, first match wins per warehouse):
 
 If no rule fires, no recommendation is emitted.
 
-Window: last 14 days.  Only SUCCESS queries are considered.
+Window: 14 days by default, env-configurable (see recommenders/windows.py
+and docs/configuration.md).  Only SUCCESS queries are considered.
 """
 from __future__ import annotations
 
@@ -40,10 +41,11 @@ from snowtuner.recommenders.base import (
     TrainingGate,
 )
 from snowtuner.recommenders.sizes import credit_rate, normalize, step
-
-WINDOW_DAYS = 14
+from snowtuner.recommenders.windows import WindowResolution, resolve_window_days
 
 # Thresholds.  Module-level so they're easy to tune from one place.
+# (The consideration window is NOT here - it's env-configurable; see
+# recommenders/windows.py.)
 LOCAL_SPILL_FRAC_TO_UPSIZE = 0.20
 MIN_QUERIES_FOR_QUEUEING_RULE = 30
 QUEUE_OVERLOAD_MS_TO_UPSIZE = 5_000
@@ -54,11 +56,12 @@ MIN_QUERIES_FOR_READINESS = 30
 
 class RuleBasedRightSizerGate(TrainingGate):
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
+        win = resolve_window_days("rule_based_right_sizer")
         rows = conn.execute(
             f"""
             SELECT warehouse_name, COUNT(*) AS n
             FROM raw.query_history
-            WHERE start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+            WHERE {win.sql_filter('start_time')}
               AND warehouse_name IS NOT NULL
               AND execution_status = 'SUCCESS'
             GROUP BY warehouse_name
@@ -67,24 +70,35 @@ class RuleBasedRightSizerGate(TrainingGate):
         if not rows:
             return ReadinessReport(
                 is_ready=False,
-                reason="no warehouse activity in the last "
-                       f"{WINDOW_DAYS} days",
-                signals={"warehouses_with_activity": 0},
+                reason=f"no warehouse activity over {win.describe()}",
+                signals={
+                    "warehouses_with_activity": 0,
+                    "window_days": win.days,
+                    "window_source": win.source,
+                },
             )
         ready = [w for w, n in rows if n >= MIN_QUERIES_FOR_READINESS]
         if not ready:
             return ReadinessReport(
                 is_ready=False,
                 reason=(
-                    f"no warehouse has ≥{MIN_QUERIES_FOR_READINESS} queries in the "
-                    f"last {WINDOW_DAYS} days; observed: {dict(rows)}"
+                    f"no warehouse has >={MIN_QUERIES_FOR_READINESS} queries "
+                    f"over {win.describe()}; observed: {dict(rows)}"
                 ),
-                signals={"warehouses_with_activity": len(rows)},
+                signals={
+                    "warehouses_with_activity": len(rows),
+                    "window_days": win.days,
+                    "window_source": win.source,
+                },
             )
         return ReadinessReport(
             is_ready=True,
             reason=f"{len(ready)} warehouse(s) have enough queries to evaluate",
-            signals={"ready_warehouses": ready},
+            signals={
+                "ready_warehouses": ready,
+                "window_days": win.days,
+                "window_source": win.source,
+            },
         )
 
 
@@ -99,7 +113,8 @@ class RuleBasedRightSizer(Recommender):
         # No learned state; the rules are constants.  We still record the
         # current per-warehouse summary so the UI/CLI can show "what was the
         # most-recently-observed picture this recommender saw."
-        rows = conn.execute(_AGG_SQL).fetchall()
+        win = resolve_window_days(self.name)
+        rows = conn.execute(_agg_sql(win)).fetchall()
         per_wh: dict[str, dict[str, Any]] = {}
         for r in rows:
             (
@@ -116,7 +131,11 @@ class RuleBasedRightSizer(Recommender):
                 "total_remote_spill_bytes": int(total_remote_bytes or 0),
                 "total_local_spill_bytes": int(total_local_bytes or 0),
             }
-        return {"per_warehouse": per_wh, "window_days": WINDOW_DAYS}
+        return {
+            "per_warehouse": per_wh,
+            "window_days": win.days,
+            "window_source": win.source,
+        }
 
     def predict(
         self,
@@ -124,6 +143,19 @@ class RuleBasedRightSizer(Recommender):
         model_state: dict[str, Any] | None,
     ) -> list[Recommendation]:
         per_wh = (model_state or {}).get("per_warehouse") or {}
+        # Window for narrative + the metering lookup.  The aggregates in
+        # model_state were computed by fit() under a specific window, so
+        # that one wins when present; fall back to resolving fresh (same
+        # env -> same answer within a pipeline tick).
+        stored_days = (model_state or {}).get("window_days")
+        if stored_days is not None:
+            win = WindowResolution(
+                days=int(stored_days),
+                source=str((model_state or {}).get("window_source", "model_state")),
+            )
+        else:
+            win = resolve_window_days(self.name)
+        window_desc = win.describe()
         out: list[Recommendation] = []
         for wh, m in per_wh.items():
             current_size = normalize(m.get("current_size"))
@@ -133,7 +165,7 @@ class RuleBasedRightSizer(Recommender):
             if n < MIN_QUERIES_FOR_READINESS:
                 continue
 
-            decision = _decide(m)
+            decision = _decide(m, window_desc)
             if decision is None:
                 continue
             new_size = step(current_size, decision.delta)
@@ -143,13 +175,13 @@ class RuleBasedRightSizer(Recommender):
                 continue  # shouldn't happen, but guard
 
             credits_delta_daily = _estimate_credits_delta_daily(
-                conn, wh, current_size, new_size,
+                conn, wh, current_size, new_size, win,
             )
 
             evidence = [
                 EvidenceRef(
                     kind="query_history",
-                    description=f"{n:,} queries observed in last {WINDOW_DAYS} days",
+                    description=f"{n:,} queries observed over {window_desc}",
                     metric="n_queries",
                     value=float(n),
                 ),
@@ -206,7 +238,7 @@ class _Decision:
         self.impact_notes = impact_notes
 
 
-def _decide(m: dict[str, Any]) -> _Decision | None:
+def _decide(m: dict[str, Any], window_desc: str) -> _Decision | None:
     n = int(m["n_queries"])
     n_remote = int(m["n_remote_spill"])
     n_local = int(m["n_local_spill"])
@@ -218,8 +250,8 @@ def _decide(m: dict[str, Any]) -> _Decision | None:
         return _Decision(
             delta=+1,
             rationale=(
-                f"{n_remote} of {n} queries spilled to remote storage in the last "
-                f"{WINDOW_DAYS} days.  Remote spill is much slower than running on "
+                f"{n_remote} of {n} queries spilled to remote storage over "
+                f"{window_desc}.  Remote spill is much slower than running on "
                 f"a warehouse with adequate memory; upsizing typically eliminates "
                 f"the spill and recovers the latency."
             ),
@@ -237,7 +269,7 @@ def _decide(m: dict[str, Any]) -> _Decision | None:
             delta=+1,
             rationale=(
                 f"{n_local / n:.0%} of queries ({n_local}/{n}) spilled to local storage "
-                f"over the last {WINDOW_DAYS} days, suggesting the warehouse is routinely "
+                f"over {window_desc}, suggesting the warehouse is routinely "
                 f"running out of memory.  Upsizing should eliminate the spill and improve "
                 f"latency."
             ),
@@ -277,8 +309,8 @@ def _decide(m: dict[str, Any]) -> _Decision | None:
         return _Decision(
             delta=-1,
             rationale=(
-                f"99% of queries finished within {p99_ms:.0f}ms over the last {WINDOW_DAYS} "
-                f"days, with no spills and no queueing.  The current size is overkill "
+                f"99% of queries finished within {p99_ms:.0f}ms over {window_desc}, "
+                f"with no spills and no queueing.  The current size is overkill "
                 f"for the observed workload; downsizing roughly halves the credit rate."
             ),
             evidence_description=f"p99 elapsed = {p99_ms:.0f}ms with no spills/queueing",
@@ -295,6 +327,7 @@ def _estimate_credits_delta_daily(
     warehouse_name: str,
     current_size: str,
     new_size: str,
+    win: WindowResolution,
 ) -> float:
     """Project credit/day delta if the warehouse had been at *new_size* over the window.
 
@@ -308,7 +341,7 @@ def _estimate_credits_delta_daily(
                                               MAX(start_time))) AS credits_per_day
         FROM raw.warehouse_metering_history
         WHERE warehouse_name = ?
-          AND start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+          AND {win.sql_filter('start_time')}
         """,
         [warehouse_name],
     ).fetchone()
@@ -335,7 +368,13 @@ def _confidence(n: int, delta: int) -> float:
     return min(1.0, base)
 
 
-_AGG_SQL = f"""
+def _agg_sql(win: WindowResolution) -> str:
+    """Per-warehouse aggregate over the resolved consideration window.
+
+    A function rather than a module constant so the window resolves at
+    fit() time, not import time.
+    """
+    return f"""
 SELECT
     qh.warehouse_name,
     w.size AS current_size,
@@ -348,7 +387,7 @@ SELECT
     SUM(qh.bytes_spilled_to_local)  AS total_local_spill_bytes
 FROM raw.query_history qh
 LEFT JOIN raw.warehouses w ON UPPER(w.name) = UPPER(qh.warehouse_name)
-WHERE qh.start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+WHERE {win.sql_filter('qh.start_time')}
   AND qh.warehouse_name IS NOT NULL
   AND qh.execution_status = 'SUCCESS'
 GROUP BY qh.warehouse_name, w.size

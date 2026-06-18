@@ -55,9 +55,9 @@ from snowtuner.actions.alter_warehouse import AlterWarehouse, KnobChange, Wareho
 from snowtuner.actions.base import ActionType
 from snowtuner.recommendations.model import EvidenceRef, Impact, Recommendation
 from snowtuner.recommenders.base import AlwaysReadyGate, Recommender
+from snowtuner.recommenders.windows import WindowResolution, resolve_window_days
 
 
-_LOOKBACK_DAYS = 14
 _MIN_CREDITS_PER_WEEK = 20.0     # same cost gate as the other v0.2 finders
 
 
@@ -102,12 +102,14 @@ class _Candidate:
         current_max: int,
         peak_observed_cluster: int,
         credits_per_week: float,
+        window: WindowResolution,
     ) -> None:
         self.warehouse_name = warehouse_name
         self.current_min = current_min
         self.current_max = current_max
         self.peak_observed_cluster = peak_observed_cluster
         self.credits_per_week = credits_per_week
+        self.window = window
 
     @property
     def recommended_min(self) -> int:
@@ -146,6 +148,7 @@ class _Candidate:
 
 def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
     """Compute the peak-observed cluster for every multi-cluster warehouse."""
+    win = resolve_window_days("multi_cluster_reducer")
     rows = conn.execute(
         """
         SELECT name, min_cluster_count, max_cluster_count
@@ -167,7 +170,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
             SELECT COALESCE(MAX(cluster_number), 0) AS peak
             FROM raw.warehouse_events_history
             WHERE upper(warehouse_name) = upper(?)
-              AND timestamp >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+              AND {win.sql_filter('timestamp')}
               AND cluster_number IS NOT NULL
             """,
             [name],
@@ -181,15 +184,17 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
 
         credit_row = conn.execute(
             f"""
-            SELECT COALESCE(SUM(credits_used), 0)
+            SELECT COALESCE(SUM(credits_used), 0) AS total,
+                   date_diff('day', MIN(start_time), MAX(start_time)) AS span_days
             FROM raw.warehouse_metering_history
             WHERE upper(warehouse_name) = upper(?)
-              AND start_time >= now() - INTERVAL {_LOOKBACK_DAYS} DAYS
+              AND {win.sql_filter('start_time')}
             """,
             [name],
         ).fetchone()
         total_credits = float(credit_row[0] or 0) if credit_row else 0.0
-        credits_per_week = total_credits * (7.0 / _LOOKBACK_DAYS)
+        span_days = float(credit_row[1] or 0) if credit_row else 0.0
+        credits_per_week = total_credits * win.weekly_factor(span_days)
         if credits_per_week < _MIN_CREDITS_PER_WEEK:
             continue
 
@@ -199,6 +204,7 @@ def _score_candidates(conn: duckdb.DuckDBPyConnection) -> list[_Candidate]:
             current_max=int(current_max),
             peak_observed_cluster=peak,
             credits_per_week=credits_per_week,
+            window=win,
         ))
     return out
 
@@ -225,7 +231,7 @@ def _build_recommendation(c: _Candidate) -> Recommendation | None:
         ))
 
     rationale_parts = [
-        f"Over the last {_LOOKBACK_DAYS} days, {c.warehouse_name} provisioned at "
+        f"Over {c.window.describe()}, {c.warehouse_name} provisioned at "
         f"most cluster #{c.peak_observed_cluster} (out of "
         f"MIN={c.current_min}, MAX={c.current_max}).",
     ]
@@ -269,11 +275,11 @@ def _build_recommendation(c: _Candidate) -> Recommendation | None:
                 kind="warehouse_events",
                 description=(
                     f"peak cluster_number observed for {c.warehouse_name} "
-                    f"over {_LOOKBACK_DAYS}d"
+                    f"over {c.window.describe()}"
                 ),
                 filters={
                     "warehouse_name": c.warehouse_name,
-                    "lookback_days": _LOOKBACK_DAYS,
+                    "lookback_days": c.window.days,
                 },
                 metric="peak_cluster_number",
                 value=float(c.peak_observed_cluster),
@@ -285,7 +291,7 @@ def _build_recommendation(c: _Candidate) -> Recommendation | None:
                 ),
                 filters={
                     "warehouse_name": c.warehouse_name,
-                    "lookback_days": _LOOKBACK_DAYS,
+                    "lookback_days": c.window.days,
                 },
                 metric="credits_per_week",
                 value=c.credits_per_week,

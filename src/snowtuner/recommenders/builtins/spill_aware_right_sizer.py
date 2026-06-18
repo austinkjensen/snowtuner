@@ -61,8 +61,8 @@ from snowtuner.recommenders.sizes import (
     memory_gb,
     normalize,
 )
+from snowtuner.recommenders.windows import resolve_window_days
 
-WINDOW_DAYS = 14
 MIN_QUERIES_FOR_READINESS = 50
 TARGET_PERCENTILE = 95
 MIN_DELTA_GB = 0.0  # always honor the model output if it picks a different size
@@ -70,11 +70,12 @@ MIN_DELTA_GB = 0.0  # always honor the model output if it picks a different size
 
 class SpillAwareReadinessGate(TrainingGate):
     def evaluate(self, conn: duckdb.DuckDBPyConnection) -> ReadinessReport:
+        win = resolve_window_days("spill_aware_right_sizer")
         rows = conn.execute(
             f"""
             SELECT warehouse_name, COUNT(*) AS n
             FROM raw.query_history
-            WHERE start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+            WHERE {win.sql_filter('start_time')}
               AND warehouse_name IS NOT NULL
               AND execution_status = 'SUCCESS'
             GROUP BY warehouse_name
@@ -108,6 +109,7 @@ class SpillAwareRightSizer(Recommender):
     training_gate = SpillAwareReadinessGate()
 
     def fit(self, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
+        win = resolve_window_days(self.name)
         rows = conn.execute(
             f"""
             SELECT
@@ -119,7 +121,7 @@ class SpillAwareRightSizer(Recommender):
                 qh.queued_overload_ms
             FROM raw.query_history qh
             LEFT JOIN raw.warehouses w ON UPPER(w.name) = UPPER(qh.warehouse_name)
-            WHERE qh.start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+            WHERE {win.sql_filter('qh.start_time')}
               AND qh.warehouse_name IS NOT NULL
               AND qh.execution_status = 'SUCCESS'
             """
@@ -147,13 +149,18 @@ class SpillAwareRightSizer(Recommender):
             if queued and queued > 0:
                 entry["queued_total_ms"] += float(queued)
                 entry["n_with_queue"] += 1
-        return {"per_warehouse": per_wh, "window_days": WINDOW_DAYS}
+        return {
+            "per_warehouse": per_wh,
+            "window_days": win.days,
+            "window_source": win.source,
+        }
 
     def predict(
         self, conn: duckdb.DuckDBPyConnection,
         model_state: dict[str, Any] | None,
     ) -> list[Recommendation]:
         per_wh = (model_state or {}).get("per_warehouse") or {}
+        win = resolve_window_days(self.name)
         out: list[Recommendation] = []
         for wh, m in per_wh.items():
             current_size = normalize(m.get("current_size"))
@@ -180,14 +187,14 @@ class SpillAwareRightSizer(Recommender):
                 continue
 
             credits_delta_daily = _estimate_credits_delta_daily(
-                conn, wh, current_size, new_size,
+                conn, wh, current_size, new_size, win,
             )
 
             evidence = [
                 EvidenceRef(
                     kind="query_history",
                     description=(
-                        f"{n_spilled} of {n} queries spilled in last {WINDOW_DAYS} days"
+                        f"{n_spilled} of {n} queries spilled over {win.describe()}"
                     ),
                     metric="n_spilled",
                     value=float(n_spilled),
@@ -254,6 +261,7 @@ def _estimate_credits_delta_daily(
     warehouse_name: str,
     current_size: str,
     new_size: str,
+    win,
 ) -> float:
     row = conn.execute(
         f"""
@@ -261,7 +269,7 @@ def _estimate_credits_delta_daily(
                                               MAX(start_time))) AS credits_per_day
         FROM raw.warehouse_metering_history
         WHERE warehouse_name = ?
-          AND start_time >= now() - INTERVAL {WINDOW_DAYS} DAY
+          AND {win.sql_filter('start_time')}
         """,
         [warehouse_name],
     ).fetchone()
