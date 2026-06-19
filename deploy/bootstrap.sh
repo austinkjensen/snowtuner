@@ -35,6 +35,33 @@ require_root() {
     fi
 }
 
+# ── 0. Pre-flight: API port must be free ─────────────────────────
+# Refuse to run if something foreign already holds :8770.  A previous
+# snowtuner.service holding it is fine (systemctl restart reclaims it);
+# anything else is a squatter we'd otherwise install over and then
+# smoke-test against by mistake.  Checked first so we fail before the
+# multi-minute package install + SPA build.
+preflight_port() {
+    local port=8770
+    log "Checking API port ${port} is available"
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "ss not available; skipping port pre-flight." >&2
+        return
+    fi
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then
+        if systemctl is-active --quiet snowtuner 2>/dev/null; then
+            echo "Port ${port} is held by the running snowtuner.service — restart will reclaim it."
+        else
+            echo "✗ Port ${port} is already in use by a non-snowtuner process." >&2
+            echo "  Identify and stop it, then re-run bootstrap:" >&2
+            echo "    sudo ss -ltnp 'sport = :${port}'" >&2
+            exit 1
+        fi
+    else
+        echo "Port ${port} is free."
+    fi
+}
+
 # ── 1. Prepare the data volume ───────────────────────────────────
 mount_data_volume() {
     log "Preparing data volume at ${DATA_DIR}"
@@ -113,10 +140,40 @@ install_system_packages() {
 create_user() {
     log "Creating snowtuner system user"
     if ! id snowtuner >/dev/null 2>&1; then
-        useradd --system --home-dir "${DATA_DIR}" --shell /sbin/nologin snowtuner
+        # Interactive shell (NOT /sbin/nologin): this is a single-tenant box
+        # running snowtuner and nothing else, so the security cost of a login
+        # shell is negligible, and operators need `sudo -u snowtuner -i` to
+        # run `snowtuner sync` / `demo seed` / `verify` by hand.
+        useradd --system --home-dir "${DATA_DIR}" --shell /bin/bash snowtuner
+    else
+        # Upgrade path: an older bootstrap created this user with
+        # /sbin/nologin, which makes `sudo -u snowtuner -i` fail with "This
+        # account is currently not available".  Repair it in place.
+        usermod --shell /bin/bash snowtuner
     fi
     chown -R snowtuner:snowtuner "${DATA_DIR}"
     chmod 0750 "${DATA_DIR}"
+    write_user_profile
+}
+
+# Interactive-shell profile for the snowtuner user: put the venv on PATH and
+# export the Snowflake creds (written by fetch-secrets.sh as a systemd
+# EnvironmentFile) so plain `snowtuner ...` works inside `sudo -u snowtuner
+# -i`.  Without this an interactive shell has neither the CLI on PATH nor the
+# env-var credential tier, so `snowtuner sync` fails with "no credentials".
+# The env file may not exist yet at create_user time (fetch_secrets runs
+# later) — the [[ -r ]] guard defers that to shell-open time.
+write_user_profile() {
+    local bashrc="${DATA_DIR}/.bashrc"
+    cat > "${bashrc}" <<'PROFILE'
+# Managed by snowtuner bootstrap.sh — regenerated on every run; edits are lost.
+export PATH="/opt/snowtuner/.venv/bin:${PATH}"
+if [[ -r /var/lib/snowtuner/env ]]; then
+    set -a; . /var/lib/snowtuner/env; set +a
+fi
+PROFILE
+    chown snowtuner:snowtuner "${bashrc}"
+    chmod 0644 "${bashrc}"
 }
 
 # ── 4. Clone (or update) the repo ────────────────────────────────
@@ -140,6 +197,34 @@ install_python() {
     sudo -u snowtuner .venv/bin/python -m ensurepip --upgrade
     sudo -u snowtuner uv pip install --python .venv/bin/python -e '.[snowflake]'
     echo "snowtuner $( .venv/bin/snowtuner --version 2>/dev/null || echo 'installed' )"
+}
+
+# ── 5b. Operator CLI wrapper ─────────────────────────────────────
+# /usr/local/bin/snowtuner lets you run `sudo snowtuner <cmd>` from any SSM
+# session: it drops to the snowtuner service user and loads the Snowflake
+# creds (the systemd EnvironmentFile) so sync / demo / verify Just Work
+# without switching users or sourcing env by hand.
+install_cli_wrapper() {
+    log "Installing /usr/local/bin/snowtuner wrapper"
+    cat > /usr/local/bin/snowtuner <<'WRAPPER'
+#!/usr/bin/env bash
+# Operator convenience wrapper — managed by snowtuner bootstrap.sh.
+# Runs the snowtuner CLI as the 'snowtuner' service user with the Snowflake
+# credentials loaded.  Usage:  sudo snowtuner <command> [args...]
+set -euo pipefail
+ENV_FILE=/var/lib/snowtuner/env
+SNOWTUNER_BIN=/opt/snowtuner/.venv/bin/snowtuner
+
+if [[ "$(id -un)" == "snowtuner" ]]; then
+    if [[ -r "${ENV_FILE}" ]]; then set -a; . "${ENV_FILE}"; set +a; fi
+    exec "${SNOWTUNER_BIN}" "$@"
+fi
+
+# Not the service user yet — re-exec self as snowtuner (password-less from
+# root or a sudo-capable operator); the branch above then loads creds.
+exec sudo -u snowtuner -- "$0" "$@"
+WRAPPER
+    chmod 0755 /usr/local/bin/snowtuner
 }
 
 # ── 6. Build the SPA ────────────────────────────────────────────
@@ -188,17 +273,22 @@ smoke_test() {
 
 main() {
     require_root
+    preflight_port
     mount_data_volume
     install_system_packages
     create_user
     clone_repo
     install_python
+    install_cli_wrapper
     build_spa
     fetch_secrets
     install_service
     smoke_test
 
     log "Done"
+    echo "Run snowtuner CLI commands on the box with:  sudo snowtuner <cmd>"
+    echo "  e.g.  sudo snowtuner verify   /   sudo snowtuner demo seed"
+    echo
     echo "Next: from your laptop,"
     echo "  aws ssm start-session --target <instance-id> \\"
     echo "    --document-name AWS-StartPortForwardingSession \\"

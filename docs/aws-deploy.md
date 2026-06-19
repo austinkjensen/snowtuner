@@ -221,14 +221,78 @@ alias snowtuner-up='aws ssm start-session --target i-0abc...  --document-name AW
 
 ---
 
-## 4. First sync
+## 4. Allowlist the instance in your Snowflake network policy
+
+**Skip this section if your Snowflake account has no network policy** - most
+accounts don't, and `snowtuner verify` will just work. But if you (or your
+security team) restrict logins by IP, every sync from the instance is blocked
+until you allowlist its outbound IP, and the failure looks like a generic
+connection error rather than "you forgot the allowlist". This is the most
+common first-sync snag.
+
+The CloudFormation stack attaches an **Elastic IP** so the instance's outbound
+address is stable across reboots and stack updates - you allowlist it once.
+Grab it from the stack outputs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name snowtuner --region us-west-2 \
+  --query 'Stacks[0].Outputs[?OutputKey==`PublicIp`].OutputValue' \
+  --output text
+```
+
+Check whether a policy is even attached (in Snowsight, as a role that can see
+account/user parameters):
+
+```sql
+SHOW PARAMETERS LIKE 'network_policy' IN ACCOUNT;
+SHOW PARAMETERS LIKE 'network_policy' IN USER SNOWTUNER_SVC;
+```
+
+Empty `value` columns → no policy, skip the rest of this section. A non-empty
+value names the policy you need to edit, as `ACCOUNTADMIN`.
+
+**If the policy holds the IPs inline** (the classic form):
+
+```sql
+DESC NETWORK POLICY <policy_name>;   -- read the current ALLOWED_IP_LIST first
+
+-- ALTER ... SET REPLACES the whole list, so include the existing entries:
+ALTER NETWORK POLICY <policy_name>
+  SET ALLOWED_IP_LIST = ('<existing-ip>/32', '<PublicIp-from-above>/32');
+```
+
+**If the policy references a network rule** (the newer pattern): the IPs live
+on a `NETWORK RULE`, not the policy, and the property is `VALUE_LIST`, not
+`ALLOWED_IP_LIST`. If you try `ALTER NETWORK POLICY ... SET ALLOWED_IP_LIST` on
+this setup you'll get `invalid property ALLOWED_IP_LIST for NETWORK_RULE` -
+that error means you're on this path:
+
+```sql
+-- Find the rule the policy uses, then add the IP to the rule:
+DESC NETWORK POLICY <policy_name>;   -- lists the ALLOWED_NETWORK_RULE_LIST
+ALTER NETWORK RULE <rule_name>
+  SET VALUE_LIST = ('<existing-ip>', '<PublicIp-from-above>');
+```
+
+`snowtuner demo seed` runs from this same instance, so it uses the same IP -
+no separate allowlisting needed once this is done.
+
+---
+
+## 5. First sync
 
 Still in your SSM shell session on the instance:
 
 ```bash
-sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner verify
-sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner sync
+sudo snowtuner verify
+sudo snowtuner sync
 ```
+
+(`sudo snowtuner` is a thin wrapper bootstrap.sh installs at
+`/usr/local/bin/snowtuner`; it runs the CLI as the `snowtuner` service user
+with the Snowflake credentials loaded. The longhand
+`sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner ...` still works too.)
 
 After 1–10 minutes (depending on your Snowflake account size), refresh the
 UI - the freshness pill turns green, warehouses populate, recommenders fire
@@ -243,7 +307,8 @@ on the next automation tick (default 1 hour after boot).
 | Tail logs | `journalctl -u snowtuner -f` |
 | Restart | `sudo systemctl restart snowtuner` |
 | Upgrade snowtuner | re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` - pulls latest, rebuilds, restarts |
-| Rotate API token | `sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner auth rotate`, then update Settings page |
+| Rotate API token | `sudo snowtuner auth rotate`, then update Settings page |
+| Run any CLI command | `sudo snowtuner <cmd>` (e.g. `sudo snowtuner status`, `sudo snowtuner demo seed`) |
 | Rotate Snowflake creds | update the secret value in Secrets Manager, then `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh && sudo systemctl restart snowtuner` |
 
 ## Tearing it down
@@ -318,3 +383,5 @@ surface.
 | UI returns 401 on every request | Token mismatch. Re-grab `sudo cat /var/lib/snowtuner/api_token` and paste into Settings. |
 | `snowtuner verify` fails: "no Snowflake credentials" | env file missing. `sudo cat /var/lib/snowtuner/env` should list `SNOWTUNER_SNOWFLAKE_ACCOUNT=...`. Re-run `sudo bash /opt/snowtuner/deploy/fetch-secrets.sh`. |
 | `snowtuner sync` fails: "JWT token is invalid" | Snowflake hasn't seen your public key yet. Extract the public half from your local `.p8` and `ALTER USER ... SET RSA_PUBLIC_KEY = '...'` in Snowflake. |
+| `snowtuner verify` fails: IP / connection blocked | A Snowflake network policy is rejecting the instance's IP. Allowlist the stack's `PublicIp` output - see [section 4](#4-allowlist-the-instance-in-your-snowflake-network-policy). |
+| `sudo -u snowtuner -i` → "This account is currently not available" | Old bootstrap left the user with a `/sbin/nologin` shell. Re-run `sudo bash /opt/snowtuner/deploy/bootstrap.sh` (repairs the shell), or just use `sudo snowtuner <cmd>` instead. |
