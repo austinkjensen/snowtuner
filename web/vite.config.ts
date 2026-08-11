@@ -24,11 +24,17 @@ export default defineConfig({
     port: 5173,
     // Proxy API to FastAPI in dev so the browser sees same-origin requests
     // and we don't have to deal with CORS in the dev loop.
+    //
+    // No rewrite: the backend serves under the /api prefix (APIRouter), and
+    // the frontend client uses BASE='/api', so /api/* passes through
+    // unchanged to http://127.0.0.1:8770/api/*.  (An earlier rewrite stripped
+    // /api here — correct when routes lived at root, but after the /api
+    // refactor it made every proxied call 404, so the UI reported the API
+    // as down.)
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8770',
         changeOrigin: true,
-        rewrite: (p) => p.replace(/^\/api/, ''),
       },
     },
   },
