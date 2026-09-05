@@ -6,19 +6,19 @@ Every environment variable and config file snowtuner reads, in one place.
 
 ### Credentials
 
-These mirror the Snowflake connector's standard names. `snowtuner init` writes them to your OS keyring by default; you only need to set them as env vars in headless / containerized environments.
+snowtuner resolves credentials from the environment first, then the OS keyring, then a plaintext-TOML file at `$SNOWTUNER_DATA_DIR/creds.toml` (mode 0600). `snowtuner init` writes to the keyring; set the environment variables directly for headless or containerized deployments. Every variable carries the `SNOWTUNER_SNOWFLAKE_` prefix so it stays clear of the Snowflake connector's own `SNOWFLAKE_*` variables.
 
-| Variable | Default | Notes |
-|---|---|---|
-| `SNOWFLAKE_ACCOUNT` | - | Account identifier (e.g. `xyz12345.us-east-1`). |
-| `SNOWFLAKE_USER` | `SNOWTUNER_SVC` | Service user created by `snowtuner bootstrap-sql`. |
-| `SNOWFLAKE_ROLE` | `SNOWTUNER_ROLE` | Role granted ACCOUNT_USAGE access. |
-| `SNOWFLAKE_WAREHOUSE` | `SNOWTUNER_WH` | Warehouse used for snowtuner's own metadata queries. |
-| `SNOWFLAKE_PRIVATE_KEY_PATH` | `~/.snowtuner/snowtuner_rsa_key.p8` | RSA key for key-pair auth (mode 0600). |
-| `SNOWTUNER_EXP_USER` | `SNOWTUNER_EXP_SVC` | Separate user for the experiments engine (provisions test warehouses). |
-| `SNOWTUNER_EXP_PRIVATE_KEY_PATH` | `~/.snowtuner/snowtuner_exp_rsa_key.p8` | Experiments-user RSA key. |
+| Variable | Notes |
+|---|---|
+| `SNOWTUNER_SNOWFLAKE_ACCOUNT` | Account identifier, e.g. `xyz12345.us-east-1`. Required. |
+| `SNOWTUNER_SNOWFLAKE_USER` | Service user. `bootstrap-sql` creates `SNOWTUNER_SVC`. Required. |
+| `SNOWTUNER_SNOWFLAKE_AUTHENTICATOR` | `key_pair` or `password`. Defaults to `password`; `keypair`, `key-pair`, and `rsa` are accepted spellings of `key_pair`. |
+| `SNOWTUNER_SNOWFLAKE_PRIVATE_KEY_PATH` | RSA private key for key-pair auth. `snowtuner init` writes `$SNOWTUNER_DATA_DIR/snowtuner_rsa_key.p8` (mode 0600). |
+| `SNOWTUNER_SNOWFLAKE_PASSWORD` | Password, read only when `AUTHENTICATOR=password`. |
+| `SNOWTUNER_SNOWFLAKE_ROLE` | Advisory-mode role. `bootstrap-sql` creates `SNOWTUNER_ROLE`. |
+| `SNOWTUNER_SNOWFLAKE_WAREHOUSE` | Warehouse for snowtuner's own metadata queries. `bootstrap-sql` creates `SNOWTUNER_WH`. |
 
-The credential resolver tries env vars first, then the OS keyring, then a plaintext-TOML fallback at `~/.snowtuner/creds.toml` (mode 0600). See `snowtuner.credentials.resolver`.
+`ACCOUNT` and `USER` are the only required fields. If either is missing the resolver skips the environment entirely and falls through to the keyring, then the file. The remaining fields have no built-in defaults, so an environment-only setup has to supply the auth material itself.
 
 ### API auth
 
@@ -29,7 +29,7 @@ The credential resolver tries env vars first, then the OS keyring, then a plaint
 
 The MCP server uses the same token automatically. The web UI stores the token in `localStorage` after you paste it once via the Settings page.
 
-A handful of paths bypass auth even in `token` mode: `/health`, `/openapi.json`, `/docs`, `/redoc`. Useful for load-balancer probes and the OpenAPI viewer.
+A handful of paths bypass auth even in `token` mode: `/health`, `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, `/redoc`. Useful for load-balancer probes and the OpenAPI viewer.
 
 ### AutomationLoop
 
@@ -75,6 +75,15 @@ Notes on semantics:
 |---|---|---|
 | `SNOWTUNER_API_URL` | `http://127.0.0.1:8770` | Where the MCP server expects to find the HTTP API. Set this in `claude_desktop_config.json` when wiring up MCP. |
 
+### Storage and runtime
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SNOWTUNER_DATA_DIR` | `~/.snowtuner` | Base directory for every path in the "Files snowtuner reads/writes" table below. Point it at a mounted volume for containerized deployments. |
+| `SNOWTUNER_STATIC_DIR` | (unset) | Path to the built SPA (`web/dist`). When set, the API serves the web UI at `/`. The AWS deploy sets this. For local development it stays unset and the Vite dev server serves the UI. |
+| `SNOWTUNER_DUCKDB_MEMORY_LIMIT` | `3GB` | Caps DuckDB's working memory. Raise it on larger hosts (e.g. `12GB` on an `m6i.xlarge`); lower it when snowtuner shares a box with memory-hungry neighbors. |
+| `SNOWTUNER_QUERY_HISTORY_CHUNK_DAYS` | `1` | Day-window size for the chunked `QUERY_HISTORY` pull. Smaller chunks bound peak memory during sync on dense accounts. |
+
 ## CLI flags worth knowing
 
 These aren't env vars but are referenced enough to belong in the reference:
@@ -88,7 +97,27 @@ These aren't env vars but are referenced enough to belong in the reference:
 | `snowtuner reset` | `--include-user-config` | Also wipe `app.query_groups` and `app.autonomous_config` (default: preserved across reset). |
 | `snowtuner api` | `--host`, `--port` | Bind address. `--host` other than `127.0.0.1` requires `SNOWTUNER_AUTH_MODE=token`. |
 
+## Demo mode
+
+`snowtuner demo` provisions six throwaway warehouses (prefixed `SNOWTUNER_DEMO_*`), runs cooked TPC-H workloads engineered to trigger each recommender, then tears the warehouses down. It is the quickest way to see end-to-end output on a real account before pointing snowtuner at production history.
+
+| Command | Purpose |
+|---|---|
+| `snowtuner demo seed` | Provision the warehouses and run the workloads. Prompts for confirmation on the estimated cost first. |
+| `snowtuner demo status` | Show the most recent run's per-workload progress. |
+| `snowtuner demo verify` | Query ACCOUNT_USAGE and report, per warehouse, whether the intended signal (spill, queueing, suspend cycles) actually landed. |
+| `snowtuner demo teardown` | Drop every `SNOWTUNER_DEMO_*` warehouse. |
+
+A run costs roughly 3.5 credits (about $10 at standard $3/credit pricing) and takes 45 to 70 minutes of wall time. It needs two grants beyond advisory mode, which `snowtuner bootstrap-sql` prints in a commented block:
+
+```sql
+GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE SNOWTUNER_ROLE;
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA TO ROLE SNOWTUNER_ROLE;
+```
+
 ## Files snowtuner reads/writes
+
+All paths are relative to `$SNOWTUNER_DATA_DIR` (default `~/.snowtuner`).
 
 | Path | Mode | Contents |
 |---|---|---|
@@ -96,6 +125,5 @@ These aren't env vars but are referenced enough to belong in the reference:
 | `~/.snowtuner/snowtuner.duckdb.wal` | 0600 | DuckDB write-ahead log. Cleaned up by `reset`. |
 | `~/.snowtuner/creds.toml` | 0600 | Plaintext credential fallback. Only written if you opt out of the keyring backend. |
 | `~/.snowtuner/snowtuner_rsa_key.p8` | 0600 | Service-user RSA private key. |
-| `~/.snowtuner/snowtuner_exp_rsa_key.p8` | 0600 | Experiments-user RSA private key (only present if you ran `bootstrap-sql --enable-experiments`). |
 | `~/.snowtuner/api_token` | 0600 | Auto-generated API bearer token (only present once `SNOWTUNER_AUTH_MODE=token` has been used). |
 | `~/.snowtuner/audit-archive/autonomous-applications-*.json` | 0644 | Archived audit trail snapshots, written automatically before every `snowtuner reset`. |

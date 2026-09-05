@@ -8,8 +8,9 @@ Three logical schemas:
   `ingestion/sources/*`. Treat as append-only telemetry.
 - **`features.*`** - derived tables computed by `features/library/*` transforms.
   Recomputed each run; idempotent.
-- **`app.*`** - application state. Recommendations, training state, sync
-  watermarks, routing rules, autonomous config, autonomous applications.
+- **`app.*`** - application state: recommendations, training state, sync
+  watermarks, autonomous config and applications, experiments and their runs,
+  saved query groups, the audit event stream, and demo-run tracking.
 
 ## Entity-relationship diagram
 
@@ -26,6 +27,9 @@ erDiagram
         VARCHAR scaling_policy
         VARCHAR state
         VARCHAR comment
+        VARCHAR generation "'1' or '2'; NULL if unavailable"
+        VARCHAR qas_state "QAS 'on'/'off'"
+        INTEGER qas_max_scale_factor
         TIMESTAMP snapshot_at
     }
 
@@ -40,6 +44,7 @@ erDiagram
         TIMESTAMP start_time
         TIMESTAMP end_time
         BIGINT total_elapsed_ms
+        BIGINT execution_ms
         BIGINT queued_overload_ms
         BIGINT bytes_scanned
         BIGINT bytes_spilled_to_local
@@ -70,10 +75,17 @@ erDiagram
     }
 
     %% ── features.* (derived) ────────────────────────────────────
+    FEATURES_WAREHOUSE_ACTIVE_INTERVALS {
+        VARCHAR warehouse_name PK,FK
+        TIMESTAMP start_time PK
+        TIMESTAMP end_time
+        DOUBLE duration_sec
+    }
+
     FEATURES_WAREHOUSE_IDLE_GAPS {
         VARCHAR warehouse_name PK,FK
-        TIMESTAMP last_query_end_time PK
-        TIMESTAMP suspend_time
+        TIMESTAMP gap_start PK "end of previous busy island"
+        TIMESTAMP gap_end "start of next busy island"
         DOUBLE idle_seconds
     }
 
@@ -82,6 +94,27 @@ erDiagram
         VARCHAR family_id
         VARCHAR representative_sql
         TIMESTAMP updated_at
+    }
+
+    FEATURES_QUERY_SQL_FEATURES {
+        VARCHAR query_id PK,FK
+        INTEGER joins_count
+        INTEGER tables_referenced_count
+        INTEGER ctes_count
+        INTEGER subqueries_count
+        INTEGER where_block_count
+        INTEGER where_predicate_count
+        VARCHAR parse_error
+    }
+
+    FEATURES_QUERY_REFERENCED_TABLES {
+        VARCHAR query_id PK,FK
+        VARCHAR table_ref PK
+    }
+
+    FEATURES_QUERY_WHERE_COLUMNS {
+        VARCHAR query_id PK,FK
+        VARCHAR column_ref PK
     }
 
     %% ── app.* (state) ───────────────────────────────────────────
@@ -95,15 +128,20 @@ erDiagram
         JSON evidence
         JSON expected_impact
         VARCHAR status
+        JSON apply_plan "preview + rollback"
+        VARCHAR applied_sql
         VARCHAR rollback_sql
         TIMESTAMP created_at
+        TIMESTAMP updated_at
         TIMESTAMP applied_at
         BIGINT superseded_by "self-FK"
+        VARCHAR notes
     }
 
     APP_AUTONOMOUS_CONFIG {
         VARCHAR action_type PK
         VARCHAR warehouse_name PK "'*' = catch-all"
+        VARCHAR knob PK "'*' = every knob"
         BOOLEAN enabled
         DOUBLE confidence_threshold
         INTEGER cooldown_hours
@@ -142,34 +180,86 @@ erDiagram
         BIGINT rows_last_sync
     }
 
-    APP_ROUTING_RULES {
+    APP_EXPERIMENTS {
         BIGINT id PK
-        VARCHAR match_type
-        VARCHAR match_value
-        VARCHAR target_warehouse FK
-        INTEGER priority
-        BOOLEAN enabled
-        BIGINT source_recommendation_id FK
+        VARCHAR kind "tuning | benchmark"
+        VARCHAR recipe_name
+        VARCHAR target_warehouse
+        VARCHAR workload_warehouse
+        VARCHAR status
+        JSON spec
+        JSON cost_estimate
+        JSON report
+        BIGINT derived_recommendation_id "FK"
+        JSON test_warehouses
+    }
+
+    APP_EXPERIMENT_RUNS {
+        BIGINT experiment_id PK,FK
+        VARCHAR arm_name PK
+        INTEGER rep_index PK
+        VARCHAR sampled_query_id PK
+        BIGINT elapsed_ms
+        BIGINT bytes_scanned
+        DOUBLE credits_used_estimate
+        VARCHAR status "success | failed | excluded"
+    }
+
+    APP_QUERY_GROUPS {
+        BIGINT id PK
+        VARCHAR name
+        VARCHAR kind "static | dynamic"
+        JSON filter_spec
+        JSON snapshot_query_ids "static only"
+        TIMESTAMP snapshot_at
         TIMESTAMP created_at
+        VARCHAR created_by
+    }
+
+    APP_EVENTS {
+        BIGINT id PK
+        TIMESTAMP timestamp
+        VARCHAR actor
+        VARCHAR action "dotted-namespace verb"
+        VARCHAR subject
+        VARCHAR outcome
+        JSON payload
+        VARCHAR error
+    }
+
+    APP_DEMO_RUNS {
+        BIGINT id PK
+        TIMESTAMP started_at
+        TIMESTAMP completed_at
+        TIMESTAMP torn_down_at
+        VARCHAR status
+        JSON warehouses "SNOWTUNER_DEMO_* names"
+        JSON per_workload
+        VARCHAR notes
     }
 
     %% ── relationships ───────────────────────────────────────────
     RAW_WAREHOUSES ||--o{ RAW_QUERY_HISTORY : "queries run on"
     RAW_WAREHOUSES ||--o{ RAW_WAREHOUSE_METERING_HISTORY : "billed for"
     RAW_WAREHOUSES ||--o{ RAW_WAREHOUSE_EVENTS_HISTORY : "events about"
-    RAW_QUERY_HISTORY ||--o{ FEATURES_WAREHOUSE_IDLE_GAPS : "feeds (last query end)"
-    RAW_WAREHOUSE_EVENTS_HISTORY ||--o{ FEATURES_WAREHOUSE_IDLE_GAPS : "feeds (suspend events)"
+    RAW_QUERY_HISTORY ||--o{ FEATURES_WAREHOUSE_ACTIVE_INTERVALS : "merged into busy islands"
+    FEATURES_WAREHOUSE_ACTIVE_INTERVALS ||--o{ FEATURES_WAREHOUSE_IDLE_GAPS : "gaps between islands"
     RAW_QUERY_HISTORY ||--o{ FEATURES_QUERY_FAMILIES : "feeds"
+    RAW_QUERY_HISTORY ||--o| FEATURES_QUERY_SQL_FEATURES : "parsed into"
+    RAW_QUERY_HISTORY ||--o{ FEATURES_QUERY_REFERENCED_TABLES : "tables read"
+    RAW_QUERY_HISTORY ||--o{ FEATURES_QUERY_WHERE_COLUMNS : "columns filtered on"
     APP_RECOMMENDATIONS ||--o{ APP_AUTONOMOUS_APPLICATIONS : "recorded in audit"
     APP_RECOMMENDATIONS ||--o| APP_RECOMMENDATIONS : "superseded by"
-    APP_RECOMMENDATIONS ||--o{ APP_ROUTING_RULES : "spawned"
-    RAW_WAREHOUSES ||--o{ APP_ROUTING_RULES : "routes to"
+    APP_EXPERIMENTS ||--o{ APP_EXPERIMENT_RUNS : "replay observations"
+    APP_EXPERIMENTS ||--o| APP_RECOMMENDATIONS : "derives on completion"
 ```
 
-> **Note:** DuckDB-level FOREIGN KEY constraints are not declared. The arrows
-> above are *logical* relationships used by joins. We accept the occasional
-> orphan row (e.g. an `app.autonomous_applications` whose `recommendation_id`
-> got purged) and clean up in migrations as needed.
+> **Note:** the diagram shows primary keys, the columns consumers query most,
+> and logical relationships; `storage/schema.py` carries the full column list
+> for every table. DuckDB-level FOREIGN KEY constraints are not declared, so
+> the arrows above are *logical* relationships used by joins. We accept the
+> occasional orphan row (e.g. an `app.autonomous_applications` whose
+> `recommendation_id` got purged) and clean up in migrations as needed.
 
 ## Table notes
 
@@ -263,10 +353,12 @@ hydrate with `actions.registry.action_from_dict`.
 
 ### `app.autonomous_config`
 
-Per `(action_type, warehouse_name)` config controlling whether autonomous
-mode applies. Catch-all rows use the literal string `'*'` for `warehouse_name`
-(DuckDB primary keys disallow NULL). Per-warehouse rows override the
-catch-all.
+Per `(action_type, warehouse_name, knob)` config controlling whether
+autonomous mode applies. The `knob` column gates granularly inside an action
+type, so a warehouse can run autonomous AUTO_SUSPEND tuning while keeping
+WAREHOUSE_SIZE changes advisory. Catch-all rows use the literal string `'*'`
+for `warehouse_name` and `knob` (DuckDB primary keys disallow NULL); more
+specific rows override the catch-all.
 
 When `circuit_open_until` is non-NULL and in the future, autonomous skips
 this `(action_type, warehouse_name)` until the timestamp passes - set by the
@@ -291,12 +383,57 @@ training-gate evaluation. `model_state` is opaque per-recommender JSON
 Per ingestion source: highest watermark column value seen, last sync
 timestamp, row count from last sync. Drives incremental ingestion.
 
+### `app.events`
+
+Append-only audit stream: one chronological feed of state-changing operator
+actions, AutomationLoop tick transitions, per-source sync outcomes, experiment
+lifecycle, and autonomous applies. Read-only API calls are not logged. It
+answers "what changed between 9 and 10am?" without joining five tables.
+Indexed on `timestamp`, `(action, timestamp)`, and `(actor, timestamp)`.
+Archived to `~/.snowtuner/audit-archive/events-*.json` before a reset wipes it.
+
+### `app.experiments` and `app.experiment_runs`
+
+State for the replay-experiments framework. `experiments` holds one row per
+proposed experiment; the full `ProposedExperiment` lives in the `spec` JSON so
+the engine can reproduce a run from the row alone, and the statistical report
+lands in `report`. `experiment_runs` holds the per-`(arm, query, rep)`
+observations the aggregation step reads, keyed by `(experiment_id, arm_name,
+rep_index, sampled_query_id)`. A completed experiment sets
+`derived_recommendation_id`, linking back to the `app.recommendations` row it
+produced.
+
+### `app.query_groups`
+
+Saved sets of queries used as workload filters or experiment inputs. `static`
+groups snapshot their membership at creation (`snapshot_query_ids`); `dynamic`
+groups re-evaluate `filter_spec` against `raw.query_history` on every read.
+
+### `app.demo_runs`
+
+Tracks `snowtuner demo` runs: which `SNOWTUNER_DEMO_*` warehouses were
+provisioned, the per-workload results, and the run's lifecycle
+(`RUNNING → COMPLETED | FAILED → TORN_DOWN`).
+
+### `features.query_sql_features`, `query_referenced_tables`, `query_where_columns`
+
+AST-derived structure for each query, computed by `QuerySqlFeaturesTransform`
+in one parse pass. `query_sql_features` holds per-query counts (joins, CTEs,
+subqueries, WHERE predicates); the two side tables record which tables a query
+reads and which columns it filters on, list-valued so the explorer can answer
+"queries that touch table X but don't filter on column Y". Counts are NULL and
+`parse_error` is set when `query_text` was redacted or unparseable.
+
 ## Schema migrations
 
-Pre-1.0: **no migrations.**  [`storage/schema.py`](../src/snowtuner/storage/schema.py)
+Pre-1.0: **almost no migrations.**  [`storage/schema.py`](../src/snowtuner/storage/schema.py)
 holds the canonical DDL; when a table shape changes during development we
 ship `snowtuner reset` + `snowtuner sync` instead of carrying schema-evolution
-shims.  Acceptable because `raw.*` is fully repopulatable from Snowflake and
+shims.  The one exception is derived `features.*` tables: because they rebuild
+from `raw.*` on every pipeline run, `_forward_migrations` in `schema.py` drops
+an outdated shape in place rather than forcing a reset (it currently repairs
+the pre-rewrite `warehouse_idle_gaps`).  The reset path is acceptable because
+`raw.*` is fully repopulatable from Snowflake and
 `reset` preserves user-authored config (`app.query_groups`,
 `app.autonomous_config`) by default while archiving
 `app.autonomous_applications` to `~/.snowtuner/audit-archive/` before

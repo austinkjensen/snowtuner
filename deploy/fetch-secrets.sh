@@ -14,7 +14,7 @@
 #   {
 #     "account":          "abc-12345",
 #     "user":             "SNOWTUNER_SVC",
-#     "warehouse":        "COMPUTE_WH",
+#     "warehouse":        "SNOWTUNER_WH",
 #     "role":             "SNOWTUNER_ROLE",
 #     "private_key_pem":  "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
 #     "api_token":        "<32 url-safe bytes>"      # optional; omit to let snowtuner auto-gen

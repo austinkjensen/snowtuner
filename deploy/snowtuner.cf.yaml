@@ -6,12 +6,12 @@ AWSTemplateFormatVersion: '2010-09-09'
 # ║  Provisions:                                                           ║
 # ║    • IAM role + instance profile (SSM Session Manager + Secrets read)  ║
 # ║    • Security group (no inbound rules — access via SSM only)           ║
-# ║    • EC2 instance (AL2023, default t3.small, 30GB root volume)         ║
+# ║    • EC2 instance (AL2023, default t3.medium, 30GB root volume)        ║
 # ║                                                                        ║
 # ║  Prereq (NOT in this stack — you create it once before launching):     ║
 # ║    • Secrets Manager secret containing your Snowflake creds JSON       ║
 # ║                                                                        ║
-# ║  Cost: ~$18/month  (t3.small + 30GB gp3 + Secrets Manager)             ║
+# ║  Cost: ~$33/month  (t3.medium + 30GB gp3 + Secrets Manager)            ║
 # ╚════════════════════════════════════════════════════════════════════════╝
 
 Description: snowtuner — open-source Snowflake cost & performance advisor

@@ -1,73 +1,51 @@
-# React + TypeScript + Vite
+# snowtuner web UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite single-page app for snowtuner. It talks to the FastAPI backend
+over `/api/*` and renders recommendations, warehouses, the queries explorer,
+experiments, and autonomous-mode controls.
 
-Currently, two official plugins are available:
+## Running it in development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Start the backend first (`snowtuner api`, default `http://127.0.0.1:8770`).
+Then, from this directory:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev        # Vite dev server on http://localhost:5173
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The dev server proxies `/api/*` to `http://127.0.0.1:8770` (see
+`vite.config.ts`), so the browser makes same-origin requests and there is no
+CORS to configure. Open http://localhost:5173.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+In production the API serves the built assets itself at `/` when
+`SNOWTUNER_STATIC_DIR` points at `web/dist`, so there is no separate Vite
+server. See [docs/aws-deploy.md](../docs/aws-deploy.md).
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## Scripts
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | Vite dev server with HMR on :5173. |
+| `npm run build` | Type-check (`tsc -b`), then build to `dist/`. |
+| `npm run preview` | Serve the production build locally. |
+| `npm run lint` | ESLint over the project. |
+| `npm test` | Run the Vitest suite once. |
+| `npm run test:watch` | Vitest in watch mode. |
+| `npm run gen-types` | Regenerate `src/lib/api-types.ts` from the backend's `/openapi.json` (the API must be running). |
+
+## Layout
+
+- `src/lib/api.ts` - typed client over the FastAPI surface; requests use
+  `BASE = '/api'` and attach the bearer token from `localStorage` when the API
+  runs in `token` auth mode.
+- `src/lib/api-types.ts` - generated from the backend OpenAPI schema. Do not
+  edit by hand; run `npm run gen-types`.
+- `src/routes/` - file-based routes (TanStack Router): recommendations,
+  warehouses, queries, experiments, settings.
+- `src/components/` - UI components, including the freshness pill in the top nav.
+
+The stack is React, Vite, TanStack Router, and Tailwind with shadcn-style
+primitives. See the [main README](../README.md) for the product overview and
+[docs/architecture.md](../docs/architecture.md) for how the UI fits the rest of
+the system.

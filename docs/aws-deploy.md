@@ -2,7 +2,7 @@
 
 One CloudFormation stack + one Secrets Manager secret = snowtuner running
 in your AWS account, reachable from your laptop via SSM port-forward.
-Total cost: **~$17/month**. End-to-end deploy: **~10 minutes**.
+Total cost: **~$33/month**. End-to-end deploy: **~10 minutes**.
 
 If you've never deployed anything to AWS before and are evaluating
 snowtuner, **run it on your laptop first**. The local dev path (`snowtuner
@@ -21,7 +21,7 @@ running while your laptop is asleep, or when you want a team to share it.
 │         8770        │                                                │
 └─────────────────────┘                                                ▼
                                                        ┌────────────────────────┐
-                                                       │  EC2 t3.small          │
+                                                       │  EC2 t3.medium         │
                                                        │  (us-west-2, your VPC) │
                                                        │                        │
                                                        │  snowtuner :8770       │
@@ -78,7 +78,7 @@ fields are single-line. One command on your laptop:
 # Fill these in:
 SNOWFLAKE_ACCOUNT="xy12345.us-west-2"
 SNOWFLAKE_USER="SNOWTUNER_SVC"
-SNOWFLAKE_WAREHOUSE="COMPUTE_WH"
+SNOWFLAKE_WAREHOUSE="SNOWTUNER_WH"
 SNOWFLAKE_ROLE="SNOWTUNER_ROLE"
 PRIVATE_KEY_PATH="$HOME/.snowtuner/snowflake_rsa_key.p8"
 
@@ -119,7 +119,7 @@ Click it. The AWS console opens with the template pre-loaded. Fill in:
 |-------|---------------|
 | **Stack name** | `snowtuner` (already prefilled) |
 | **Snowflake credentials secret ARN** | Paste the ARN from step 1 |
-| **EC2 instance type** | Leave as `t3.small` |
+| **EC2 instance type** | Leave as `t3.medium` |
 | **Root volume size (GB)** | Leave as `30` |
 | **VPC** | Pick your default VPC (the only one shown unless you've created others) |
 | **Subnet** | Pick any subnet in that VPC |
@@ -291,8 +291,9 @@ sudo snowtuner sync
 
 (`sudo snowtuner` is a thin wrapper bootstrap.sh installs at
 `/usr/local/bin/snowtuner`; it runs the CLI as the `snowtuner` service user
-with the Snowflake credentials loaded. The longhand
-`sudo -u snowtuner /opt/snowtuner/.venv/bin/snowtuner ...` still works too.)
+with the Snowflake credentials loaded. To drop to the service user directly,
+use a login shell so the credentials get sourced: `sudo -u snowtuner -i`,
+then run `snowtuner ...`.)
 
 After 1–10 minutes (depending on your Snowflake account size), refresh the
 UI - the freshness pill turns green, warehouses populate, recommenders fire
@@ -317,10 +318,11 @@ on the next automation tick (default 1 hour after boot).
 aws cloudformation delete-stack --stack-name snowtuner --region us-west-2
 ```
 
-The CF stack deletes the EC2 instance, role, instance profile, SG.
-**The Snowflake secret survives** - it's intentionally outside the stack
-because credentials should outlive infrastructure. Delete it separately
-when you're sure you're done:
+The CF stack deletes the EC2 instance, role, instance profile, security
+group, and the Elastic IP (which is released back to AWS on stack delete).
+**The Snowflake secret survives** - it lives outside the stack because
+credentials should outlive infrastructure. Delete it separately when you're
+sure you're done:
 
 ```bash
 aws secretsmanager delete-secret \
@@ -338,13 +340,14 @@ really sure.)
 
 | Item | Monthly |
 |------|---------|
-| EC2 t3.small on-demand | ~$15 |
+| EC2 t3.medium on-demand | ~$30 |
 | EBS gp3 30GB (root) | $2.40 |
 | Secrets Manager (1 secret) | $0.40 |
+| Elastic IP (attached to running instance) | $0 |
 | Data transfer (negligible) | $0 |
-| **Total** | **~$18/mo** |
+| **Total** | **~$33/mo** |
 
-A 1-year reserved t3.small drops the compute portion ~30%.
+A 1-year reserved t3.medium drops the compute portion ~30%.
 
 ---
 

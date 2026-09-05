@@ -94,7 +94,7 @@ snowtuner/
 │   │   └── schema.py         # ALL DDL (single source of truth; pre-1.0 = no migrations)
 │   ├── credentials/
 │   │   ├── model.py          # SnowflakeCredentials + AuthMethod enum
-│   │   ├── env_backend.py    # SNOWFLAKE_* env-var loader
+│   │   ├── env_backend.py    # SNOWTUNER_SNOWFLAKE_* env-var loader
 │   │   ├── keyring_backend.py# OS keychain (macOS/Windows/desktop Linux)
 │   │   ├── file_backend.py   # ~/.snowtuner/creds.toml fallback (mode 0600)
 │   │   ├── keypair.py        # RSA keygen for the SNOWTUNER_SVC service user
@@ -104,6 +104,7 @@ snowtuner/
 │   │   ├── snowflake_client.py  # Lazy snowflake-connector wrapper
 │   │   ├── sync.py           # sync_all() + backfill(): watermarks + error isolation
 │   │   ├── drift.py          # Schema drift detection (warn-only) against ACCOUNT_USAGE
+│   │   ├── event_vocab.py    # Warehouse event-name vocab: *_WAREHOUSE + *_CLUSTER
 │   │   └── sources/
 │   │       ├── query_history.py
 │   │       ├── warehouse_metering.py
@@ -119,7 +120,7 @@ snowtuner/
 │   │                                  # semantic predicates (referenced_tables, where_columns)
 │   ├── actions/
 │   │   ├── base.py           # Action ABC: target_resource, to_sql, apply, etc.
-│   │   ├── alter_warehouse.py# The action type used by both built-in recommenders
+│   │   ├── alter_warehouse.py# Action emitted by the right-sizers, auto-suspend tuner, multi-cluster reducer
 │   │   ├── create_warehouse.py  # Stub (roadmap)
 │   │   ├── local_table.py    # Stub (roadmap - caching direction)
 │   │   └── registry.py       # Action subclass dispatch by ActionType
@@ -130,12 +131,16 @@ snowtuner/
 │   │   ├── base.py           # Recommender ABC + TrainingGate ABC + propose_experiments hook
 │   │   ├── registry.py       # In-process registration (no entry-points discovery)
 │   │   ├── sizes.py          # Snowflake size ladder + alias normalization + credits/memory
+│   │   ├── windows.py        # Configurable consideration windows (SNOWTUNER_WINDOW_DAYS)
 │   │   ├── training_state.py # CRUD over app.training_state (per-recommender)
-│   │   └── builtins/
+│   │   └── builtins/         # 5 registered: direct recommenders + experiment proposers
 │   │       ├── auto_suspend_survival.py   # Cost-minimizing AUTO_SUSPEND tuner (registered)
 │   │       ├── auto_suspend_tuner.py      # Earlier p25-heuristic version (kept for contrast)
 │   │       ├── rule_based_right_sizer.py  # WAREHOUSE_SIZE rule-based tuner (registered)
-│   │       └── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
+│   │       ├── spill_aware_right_sizer.py # WAREHOUSE_SIZE empirical-memory tuner (alt)
+│   │       ├── multi_cluster_reducer.py   # Lower MIN/MAX cluster count to observed peak (registered)
+│   │       ├── gen2_candidate_finder.py   # Flags Gen1 warehouses; proposes gen1_to_gen2 experiments (registered)
+│   │       └── qas_candidate_finder.py    # Flags QAS-toggle candidates; proposes qas_on_off experiments (registered)
 │   ├── experiments/           # v0.2 - replay-experiments framework
 │   │   ├── axes.py            # Generation / QASState enums
 │   │   ├── config_delta.py    # WarehouseConfigDelta + WarehouseConfig (merge, render)
@@ -170,9 +175,13 @@ snowtuner/
 │   │   ├── auth.py           # Pluggable middleware: none (loopback-only) vs token (bearer)
 │   │   └── automation.py     # AutomationLoop: background thread runs full pipeline per tick
 │   ├── mcp/
-│   │   └── admin.py          # 42 MCP tools over the FastAPI (auth-aware)
-│   └── seed/
-│       └── generate.py       # Synthetic data for demo + dev (6 warehouses)
+│   │   └── admin.py          # 43 MCP tools over the FastAPI (auth-aware)
+│   ├── seed/
+│   │   └── generate.py       # Synthetic local data for dev (6 fake warehouses, no Snowflake)
+│   └── demo/                  # Cooked workloads run against real Snowflake
+│       ├── warehouses.py     # 6 SNOWTUNER_DEMO_* specs
+│       ├── workloads.py      # Per-warehouse query patterns (TPC-H SF1000)
+│       └── runner.py         # Provision, run, verify, teardown; tracks app.demo_runs
 └── web/                       # React + Vite + TanStack Router web UI
     ├── src/
     │   ├── routes/            # File-based routing (recommendations, warehouses, queries, experiments, docs, settings)
@@ -216,8 +225,9 @@ stays composable without an orchestration framework.
 ```python
 class WarehouseIdleGapsTransform(FeatureTransform):
     name = "warehouse_idle_gaps"
-    inputs = {"raw.query_history", "raw.warehouse_events_history"}
-    outputs = {"features.warehouse_idle_gaps"}
+    inputs = {"raw.query_history"}
+    outputs = {"features.warehouse_active_intervals",
+               "features.warehouse_idle_gaps"}
     def run(self, conn): ...
 ```
 
@@ -231,10 +241,21 @@ A recommender encapsulates one inference strategy. Two pieces:
 - `Recommender.fit(conn) -> dict` - compute and return a JSON-serializable
   state dict. Persisted to `app.training_state`.
 - `Recommender.predict(conn, model_state) -> list[Recommendation]` - emit
-  recommendations.
+  direct recommendations.
+- `Recommender.propose_experiments(conn, model_state) -> list[ProposedExperiment]`
+  - emit experiment proposals instead of direct recommendations.
+
+Recommenders split into two kinds by which output they use. Direct
+recommenders (`auto_suspend_survival_tuner`, `rule_based_right_sizer`,
+`multi_cluster_reducer`) return recommendations from `predict`. Candidate
+finders (`gen2_candidate_finder`, `qas_candidate_finder`) return `[]` from
+`predict` and do their work in `propose_experiments`; the recommendation comes
+later from `experiments/derive.py`, once the proposed experiment completes.
+Each recommender also resolves a configurable consideration window
+(`SNOWTUNER_WINDOW_DAYS`) before it aggregates history.
 
 The orchestrator runs `fit` whether the gate is ready or not (so the model
-keeps refining), but only runs `predict` once it is.
+keeps refining), but only runs `predict` / `propose_experiments` once it is.
 
 See [docs/recommenders.md](recommenders.md) for the contributor walkthrough.
 

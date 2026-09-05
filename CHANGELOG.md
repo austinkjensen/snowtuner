@@ -5,6 +5,68 @@ All notable changes to snowtuner will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Work since 0.1.0. Advisory and autonomous modes are unchanged; the additions
+below are the v0.2 line plus the deployment and dogfooding fixes.
+
+### Added
+
+- **Replay-experiments framework** (`experiments/`): in-vitro A/B testing of
+  warehouse configs against sampled production queries, with paired t-tests,
+  Bonferroni correction, and 95% confidence intervals. Preset recipes
+  (`gen1_to_gen2`, `size_sweep_pm1`, `qas_on_off`, `factorial_gen_x_size`), a
+  variance-banded cost estimator, an `experiments` CLI group, and a separate
+  `SNOWTUNER_EXP_SVC` user provisioned by `bootstrap-sql --enable-experiments`.
+- **Queries explorer and saved query groups** (`query_groups/`): filter and
+  drill into ingested query history, a family rollup view, static and dynamic
+  groups that feed experiments, and AST-derived per-query features
+  (`features.query_sql_features` plus the referenced-tables and where-columns
+  side tables).
+- **Three recommenders**: `multi_cluster_reducer` lowers `MIN`/`MAX_CLUSTER_COUNT`
+  to the observed peak (direct recommendation); `gen2_candidate_finder` and
+  `qas_candidate_finder` propose replay experiments rather than direct changes.
+- **React + Vite web UI** (`web/`) served by the API at `/`, with Queries and
+  Experiments views alongside Recommendations and Autonomous mode.
+- **AWS CloudFormation deploy** (`deploy/`): a single instance reached over SSM
+  port-forward with no public URL, an Elastic IP for a stable outbound address,
+  a `sudo snowtuner` operator wrapper, and a port pre-flight in `bootstrap.sh`.
+- **Demo mode** (`demo/`): `snowtuner demo seed | status | verify | teardown`
+  provisions six cooked `SNOWTUNER_DEMO_*` warehouses whose TPC-H workloads
+  trigger each recommender, then tears them down.
+- **Configurable recommender windows**: `SNOWTUNER_WINDOW_DAYS` and
+  `SNOWTUNER_WINDOW_DAYS__<RECOMMENDER>` bound how far back each recommender
+  reads when aggregating history.
+- **Audit event stream** (`app.events`): one chronological feed of operator
+  actions, pipeline transitions, sync outcomes, and autonomous applies.
+- The Admin MCP server grew to **43 tools** (queries, experiments, query
+  groups, and orchestration additions).
+
+### Changed
+
+- **AUTO_SUSPEND tuner** now derives idle gaps from `QUERY_HISTORY` instead of
+  warehouse suspend/resume events. The events-based signal was censored (it
+  only saw gaps longer than the configured AUTO_SUSPEND, so warehouses that
+  never suspend were invisible) and shifted (the observed value approximated
+  the setting rather than the workload). Cold-start cost is now measured from
+  observed resume durations when the events are available.
+- **Replaced the Streamlit UI** (`snowtuner ui`) with the React + Vite SPA
+  served by the API.
+- **DuckDB memory tuning**: a `memory_limit` pragma and chunked `QUERY_HISTORY`
+  ingestion keep peak memory bounded during sync on dense accounts.
+
+### Fixed
+
+- Warehouse-event ingestion accepts both the `*_WAREHOUSE` and `*_CLUSTER`
+  event vocabularies. Fresh accounts emit only `*_CLUSTER`, which had left the
+  auto-suspend recommender with zero events and no recommendation.
+- Metering ingestion filters rows with a NULL `warehouse_name`
+  (cloud-services metering), which were failing the sync stage and suppressing
+  every downstream recommendation.
+- The Vite dev proxy stopped stripping the `/api` prefix, which had made the
+  local web UI report the API as unreachable after the routes moved under
+  `/api`.
+
 ## [0.1.0] - Initial release
 
 ### Added

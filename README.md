@@ -25,17 +25,17 @@ snowtuner exists to:
 | Capability | Status |
 |---|---|
 | Ingests `QUERY_HISTORY`, `WAREHOUSE_METERING_HISTORY`, `WAREHOUSE_EVENTS_HISTORY`, and `SHOW WAREHOUSES` into local DuckDB | v0.1 |
-| **AUTO_SUSPEND tuning** via cost-minimizing survival analysis on reactivation gaps | v0.1 |
+| **AUTO_SUSPEND tuning** via cost-minimizing survival analysis on idle gaps between busy periods (from `QUERY_HISTORY`) | v0.1 |
 | **Warehouse right-sizing** (`WAREHOUSE_SIZE` only) via transparent rules + alternative spill-aware model | v0.1 |
 | Per-(action_type, warehouse, knob) **autonomous-apply** with cooldown and circuit breaker | v0.1 |
 | One-click **rollback** of autonomous applications | v0.1 |
-| HTTP API (FastAPI) + React web UI + Admin MCP server (Claude Desktop, 42 tools) | v0.1+ |
+| HTTP API (FastAPI) + React web UI + Admin MCP server (Claude Desktop, 43 tools) | v0.1+ |
 | Service-user setup with RSA key-pair auth + `bootstrap-sql` generator | v0.1 |
 | **Queries explorer**: filter / drill into ingested query history; family rollup view | v0.2 |
 | **Replay experiments framework**: in-vitro A/B testing of warehouse configs with paired t-tests, Bonferroni correction, confidence intervals | v0.2 |
 | **Gen2 / QAS / size sweeps** as preset experiment recipes (`gen1_to_gen2`, `size_sweep_pm1`, `qas_on_off`, `factorial_gen_x_size`) | v0.2 |
 | **CloudFormation deploy** to AWS (single instance, SSM port-forward, no public URL) | v0.2 |
-| Multi-cluster tuning (`MIN_CLUSTER_COUNT`, `MAX_CLUSTER_COUNT`, `SCALING_POLICY`) | roadmap |
+| **Multi-cluster reduction**: lower `MIN_CLUSTER_COUNT` / `MAX_CLUSTER_COUNT` to the observed peak + margin (`multi_cluster_reducer`) | v0.2 |
 | Saved query groups (static + dynamic) for monitoring and experiment inputs | roadmap |
 | User-built experiment recipes; benchmark-style experiments | roadmap |
 | Snowflake-compatible proxy + caching layer; multi-platform (Snowflake + Databricks) | roadmap |
@@ -110,7 +110,7 @@ Then grant `SELECT` on whatever databases / tables you want experiments to repla
 If you want to watch snowtuner light up end-to-end before you commit time to figuring out what it'd say about your real workload:
 
 ```bash
-snowtuner demo seed       # ~30 min wall, asks y/n on cost first
+snowtuner demo seed       # ~45-70 min wall, asks y/n on cost first
 # (wait ~45 min for Snowflake ACCOUNT_USAGE to catch up)
 snowtuner sync && snowtuner run
 snowtuner demo teardown   # drops the 6 demo warehouses
@@ -187,23 +187,30 @@ snowtuner ships with an Admin MCP server. After running `snowtuner api` (the HTT
 
 Then ask Claude things like *"What recommendations are open?"*, *"What's the audit log say about POSIT_TEAM?"*, *"Roll back application #2."*
 
-Tools exposed (42 total):
+Tools exposed (43 total):
 
-- **Status / discovery**: `get_status`, `list_warehouses`, `list_recommenders`, `get_credentials_status`, `get_schema_drift`
+- **Status / discovery**: `get_status`, `list_warehouses`, `get_warehouse_summary`, `list_recommenders`, `get_credentials_status`, `get_schema_drift`, `list_events`
 - **Recommendations**: `list_recommendations`, `get_recommendation`, `accept_recommendation`, `reject_recommendation`
 - **Autonomous mode**: `list_autonomous_config`, `enable_autonomous`, `disable_autonomous`, `reset_autonomous_circuit`, `list_autonomous_applications`, `rollback_autonomous_application`
 - **Experiments**: `list_experiment_recipes`, `list_experiments`, `get_experiment`, `list_experiment_runs`, `propose_experiment`, `propose_benchmark_experiment`, `accept_experiment`, `reject_experiment`, `run_experiment`, `abort_experiment`, `remove_sampled_query_from_experiment`, `backfill_experiment_metrics`
-- **Query groups + queries**: `list_query_groups`, `get_query_group`, `get_query_group_members`, `delete_query_group`, `search_queries`, `get_query_detail`, `get_query_facets`
-- **Orchestration**: `run_orchestrator`, `run_sync`, `run_backfill`, `get_automation_status`, `run_automation_now`
+- **Query groups + queries**: `list_query_groups`, `create_query_group`, `get_query_group`, `get_query_group_members`, `delete_query_group`, `search_queries`, `get_query_detail`, `get_query_facets`
+- **Orchestration**: `run_orchestrator`, `run_sync`, `run_features`, `run_backfill`, `get_automation_status`, `run_automation_now`
 
 ## How recommenders decide
 
-Both built-in recommenders are **principled statistics, not learned ML models**. They compute distributions on your own data and pick decisions that minimize a cost function. No training data, no labels, no third-party hosted model.
+snowtuner's recommenders are **principled statistics, not learned ML models**. They compute distributions on your own data and either minimize a cost function or trip explicit, readable thresholds. No training data, no labels, no third-party hosted model. Five are registered by default, and the consideration window each reads is configurable (`SNOWTUNER_WINDOW_DAYS`; see [docs/configuration.md](docs/configuration.md)).
 
-- **`auto_suspend_survival_tuner`** finds the AUTO_SUSPEND value that minimizes the expected cost per cycle: `min(T, AS) + C*1{T > AS}`, where `T` is the observed reactivation gap and `C` is the cold-start cost (sized by warehouse class). Equivalent to setting AS where the hazard rate hits `1/C`.
+**Direct recommenders** (emit an `ALTER WAREHOUSE` recommendation straight away):
+
+- **`auto_suspend_survival_tuner`** finds the AUTO_SUSPEND value that minimizes the expected cost per idle gap: `min(G, AS) + C*1{G > AS}`, where `G` is the idle gap between one busy period ending and the next query arriving - derived from `QUERY_HISTORY`, not suspend events, so warehouses that never suspend (the most over-provisioned ones) are still visible. `C` is the cold-start cost, measured from observed resume durations when available and otherwise sized by warehouse class. Equivalent to setting AS where the hazard rate hits `1/C`.
 - **`rule_based_right_sizer`** applies four ordered rules: any remote spill -> +1 size, >= 20% local spill -> +1 size, average queue >= 5s with sample size >= 30 -> +1 size, p99 <= 1s on a quiet warehouse with >= 100 queries -> -1 size.
+- **`multi_cluster_reducer`** lowers `MIN_CLUSTER_COUNT` / `MAX_CLUSTER_COUNT` to the peak cluster count Snowflake actually provisioned over the window, plus a safety margin - no experiment needed, the observed peak is the answer.
 
-Both implementations are short single-file modules under `src/snowtuner/recommenders/builtins/`. See [docs/architecture.md](docs/architecture.md) for the design and [docs/recommenders.md](docs/recommenders.md) for how to add your own.
+**Candidate finders** (apply nothing; they flag warehouses worth *measuring* and propose a replay experiment whose result becomes the recommendation):
+
+- **`gen2_candidate_finder`** and **`qas_candidate_finder`** score Gen1 / QAS-toggle candidates on compute-bound ratio, spill, queueing, and sustained spend, then propose `gen1_to_gen2` / `qas_on_off` experiments.
+
+Each is a short single-file module under `src/snowtuner/recommenders/builtins/`. See [docs/architecture.md](docs/architecture.md) for the design and [docs/recommenders.md](docs/recommenders.md) for how to add your own.
 
 ## Roadmap
 
@@ -212,7 +219,7 @@ Both implementations are short single-file modules under `src/snowtuner/recommen
 - **Saved query groups**: static (snapshot) and dynamic (filter-defined, live) groups, feeding experiments and ad-hoc analysis.
 - **Benchmark-style experiments**: "compare N configurations against this workload" (no implicit production-warehouse control), distinct from the tuning-experiment flow.
 - **From-scratch recipe builder**: arm-by-arm UI for user-defined experiment templates.
-- **Multi-cluster tuning** (`MIN_CLUSTER_COUNT`, `MAX_CLUSTER_COUNT`, `SCALING_POLICY`).
+- **Multi-cluster tuning beyond reduction**: `SCALING_POLICY`, and raising cluster bounds for under-provisioned warehouses (`multi_cluster_reducer` only lowers them today).
 
 **v0.3+ (strategic direction):** the longer-term play is a **Snowflake-compatible proxy + caching layer**, multi-platform (Snowflake + Databricks), with BYOC deployment for regulated industries. The proxy unlocks in-vivo experiments on live traffic (with the experiments framework providing the statistical inference) and structurally larger savings via query routing / caching, rather than warehouse-config tuning alone.
 

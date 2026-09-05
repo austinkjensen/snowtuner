@@ -175,8 +175,8 @@ def create_app() -> FastAPI:
     # ── Routing structure ─────────────────────────────────────────
     # All API endpoints live under ``/api/*`` via this router, mounted at
     # the bottom of ``create_app()``.  The SPA's ``lib/api.ts`` uses
-    # ``BASE = '/api'`` and Vite's dev proxy strips that prefix for the
-    # backend in dev, so in production we just expose the prefix natively.
+    # ``BASE = '/api'``; Vite's dev proxy forwards ``/api/*`` to the backend
+    # unchanged, so the prefix is served natively in both dev and production.
     # Two endpoints stay at the bare root by ops convention:
     #
     #   * ``/health`` — load-balancer / probe target, must be public + cheap

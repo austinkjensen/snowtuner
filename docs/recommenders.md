@@ -4,9 +4,12 @@ A recommender is a self-contained module that:
 
 1. Declares when it has enough data to be useful (`TrainingGate`).
 2. Computes whatever stats it needs over `raw.*` and `features.*` tables (`fit`).
-3. Emits `Recommendation` objects wrapping typed `Action` instances (`predict`).
+3. Produces output one of two ways: `predict` emits `Recommendation` objects
+   wrapping typed `Action` instances, or `propose_experiments` emits
+   `ProposedExperiment` objects that become recommendations once the
+   experiment completes.
 
-Total scope of a typical built-in: ~150–250 lines, single file.
+Total scope of a typical built-in: ~300-560 lines, single file.
 
 ## The contract
 
@@ -29,8 +32,25 @@ class MyRecommender(Recommender):
         Persisted to app.training_state."""
 
     def predict(self, conn, model_state) -> list[Recommendation]:
-        """Emit recommendations from the persisted state."""
+        """Emit direct recommendations from the persisted state.
+        Return [] if this recommender only proposes experiments."""
+
+    def propose_experiments(self, conn, model_state) -> list[ProposedExperiment]:
+        """Optional: emit experiment proposals instead of direct
+        recommendations. The default returns []."""
 ```
+
+Recommenders come in two flavors. Most return recommendations from `predict`
+(the auto-suspend tuner, the right-sizers, the multi-cluster reducer). The
+candidate finders (`gen2_candidate_finder`, `qas_candidate_finder`) return `[]`
+from `predict` and emit `ProposedExperiment` objects from
+`propose_experiments`; `experiments/derive.py` turns the winning arm into a
+recommendation once the experiment finishes.
+
+Before aggregating history, resolve the consideration window with
+`resolve_window_days(self.name)` (from `recommenders/windows.py`) and apply it
+in the gate and `fit` queries. It honors `SNOWTUNER_WINDOW_DAYS` and the
+per-recommender override, so a hardcoded lookback would bypass operator config.
 
 ## Worked example: cost-minimizing AUTO_SUSPEND
 
@@ -135,11 +155,14 @@ def default_registry() -> RecommenderRegistry:
     reg = RecommenderRegistry()
     reg.register(AutoSuspendSurvivalTuner())
     reg.register(RuleBasedRightSizer())
+    reg.register(MultiClusterReducer())
+    reg.register(Gen2CandidateFinder())
+    reg.register(QASCandidateFinder())
     reg.register(MyRecommender())  # ← here
     return reg
 ```
 
-There is no third-party plugin discovery in v0.1 - registrations are explicit.
+There is no third-party plugin discovery - registrations are explicit.
 
 ## Things to avoid
 
