@@ -20,9 +20,11 @@ merging is exercised on every path.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import duckdb
+
+from snowtuner.storage.db import naive_utcnow
 
 from snowtuner.actions import WarehouseKnob
 from snowtuner.features.library.warehouse_idle_gaps import (
@@ -96,7 +98,9 @@ def _insert_bursts(
     Each burst is queries_per_burst overlapping-ish queries spanning
     busy_seconds total.  n_bursts bursts produce n_bursts - 1 idle gaps.
     """
-    t = datetime(2026, 6, 10, 8, 0, 0)
+    # Anchor recent so the seeded gaps stay inside the recommender's
+    # consideration window (30 days) regardless of when the suite runs.
+    t = naive_utcnow() - timedelta(days=2)
     per_q = busy_seconds / queries_per_burst
     for _ in range(n_bursts):
         for i in range(queries_per_burst):
@@ -117,7 +121,9 @@ def _insert_resume_pairs(
     warehouse: str = WH,
 ) -> None:
     """Write RESUME STARTED->COMPLETED event pairs for C-measurement."""
-    t = datetime(2026, 6, 10, 8, 0, 0)
+    # Anchor recent so the seeded gaps stay inside the recommender's
+    # consideration window (30 days) regardless of when the suite runs.
+    t = naive_utcnow() - timedelta(days=2)
     eid = hash(warehouse) % 10_000_000
     for _ in range(n_pairs):
         for state, offset in (("STARTED", 0.0), ("COMPLETED", duration_s)):
