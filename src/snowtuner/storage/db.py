@@ -39,6 +39,41 @@ def naive_utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def as_naive_utc(dt: datetime | None) -> datetime | None:
+    """Coerce a datetime to naive-UTC, the store / watermark convention.
+
+    Timezone-aware values are converted to UTC and stripped of tzinfo;
+    naive values are assumed to already be UTC and returned unchanged.
+    This is the representation every internal value (watermarks, the sync
+    ``since``) should carry, so it can be compared and written to DuckDB
+    without tz surprises.  See ``naive_utcnow`` for why DuckDB writes need
+    naive UTC.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def as_aware_utc(dt: datetime | None) -> datetime | None:
+    """Tag a datetime as UTC-aware, for an unambiguous Snowflake bind.
+
+    Internal datetimes are naive-UTC by convention, but the Snowflake
+    connector binds a naive datetime in the session ``TIMEZONE`` rather
+    than UTC.  Passing a naive watermark straight into a ``WHERE ts >= %s``
+    filter therefore shifts the window boundary by the session offset.
+    Call this at each Snowflake bind site so the bound value is an absolute
+    instant regardless of the session's timezone.  Naive inputs are assumed
+    already-UTC; aware inputs are normalized to UTC.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def data_dir() -> Path:
     return Path(os.environ.get("SNOWTUNER_DATA_DIR", str(DEFAULT_DATA_DIR)))
 

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 import duckdb
 
 from snowtuner.ingestion.base import Source, SnowflakeClient
+from snowtuner.storage.db import as_aware_utc, as_naive_utc, naive_utcnow
 
 
 _COLUMNS = [
@@ -69,19 +70,17 @@ class QueryHistorySource(Source):
         if chunk_days < 1:
             chunk_days = 1
 
-        # Need a concrete start to iterate windows.  If the orchestrator
-        # passed since=None (no watermark, no default lookback), fall back
-        # to the source's own default_initial_lookback_days.
-        end = datetime.now(timezone.utc)
+        # Iterate naive-UTC throughout.  `end` and `since` are both
+        # naive-UTC (the store convention), so the window comparison never
+        # mixes naive and aware datetimes.  as_naive_utc guards against an
+        # aware `since` arriving from a direct caller (e.g. a test).  The
+        # Snowflake bind happens in _fetch_window, which tags each boundary
+        # aware-UTC.
+        end = naive_utcnow()
         if since is None:
             start = end - timedelta(days=self.default_initial_lookback_days or 14)
         else:
-            start = since
-            # DuckDB stores watermarks as naive UTC (see naive_utcnow).
-            # Tag them tz-aware here so the < comparison against `end`
-            # (tz-aware) doesn't blow up.
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
+            start = as_naive_utc(since)
 
         cursor = start
         step = timedelta(days=chunk_days)
@@ -98,15 +97,19 @@ class QueryHistorySource(Source):
         since: datetime | None,
         until: datetime | None,
     ) -> list[dict[str, Any]]:
-        """One round-trip to QUERY_HISTORY bounded by [since, until)."""
+        """One round-trip to QUERY_HISTORY bounded by [since, until).
+
+        Both boundaries are tagged aware-UTC before binding so Snowflake
+        reads them as absolute instants rather than session-local times.
+        """
         clauses: list[str] = []
         params: list = []
         if since is not None:
             clauses.append("start_time >= %s")
-            params.append(since)
+            params.append(as_aware_utc(since))
         if until is not None:
             clauses.append("start_time < %s")
-            params.append(until)
+            params.append(as_aware_utc(until))
         where = " AND ".join(clauses) if clauses else "TRUE"
         sql = f"""
         SELECT

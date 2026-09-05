@@ -7,6 +7,7 @@ from typing import Any
 import duckdb
 
 from snowtuner.ingestion.base import Source, SnowflakeClient
+from snowtuner.storage.db import as_aware_utc
 
 _COLUMNS = [
     "warehouse_id", "warehouse_name", "start_time", "end_time",
@@ -27,7 +28,9 @@ class WarehouseMeteringSource(Source):
 
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "start_time >= %s" if since else "TRUE"
-        params: list = [since] if since else []
+        # Tag aware-UTC so Snowflake reads the boundary as an absolute
+        # instant, not a session-local time (see storage.db.as_aware_utc).
+        params: list = [as_aware_utc(since)] if since else []
         # WAREHOUSE_METERING_HISTORY legitimately has rows with NULL
         # warehouse_name - these are cloud-services / serverless metering
         # not attributable to a single warehouse.  We can't store them

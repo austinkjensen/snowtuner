@@ -18,6 +18,7 @@ from typing import Any
 import duckdb
 
 from snowtuner.ingestion.base import Source, SnowflakeClient
+from snowtuner.storage.db import as_aware_utc
 
 
 # event_id is computed locally; the rest mirror the Snowflake view.
@@ -43,7 +44,9 @@ class WarehouseEventsSource(Source):
 
     def fetch(self, client: SnowflakeClient, since: datetime | None) -> list[dict[str, Any]]:
         since_clause = "timestamp >= %s" if since else "TRUE"
-        params: list = [since] if since else []
+        # Tag aware-UTC so Snowflake reads the boundary as an absolute
+        # instant, not a session-local time (see storage.db.as_aware_utc).
+        params: list = [as_aware_utc(since)] if since else []
         sql = f"""
         SELECT
             timestamp, warehouse_id, warehouse_name, cluster_number,

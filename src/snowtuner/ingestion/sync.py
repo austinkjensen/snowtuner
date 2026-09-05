@@ -4,11 +4,12 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import duckdb
 
 from snowtuner.ingestion.base import Source, SnowflakeClient, SyncResult
+from snowtuner.storage.db import naive_utcnow
 
 
 @dataclass
@@ -41,7 +42,12 @@ def sync_source(
                 else source.default_initial_lookback_days
             )
             if lookback is not None:
-                since = datetime.now(timezone.utc) - timedelta(days=lookback)
+                # Naive-UTC to match the store convention: a stored
+                # watermark (the other branch) reads back naive, so the
+                # initial lookback must be naive too, or `since` would be
+                # tz-aware on first sync and naive after.  Each source tags
+                # it aware-UTC at its own Snowflake bind site.
+                since = naive_utcnow() - timedelta(days=lookback)
 
     # Stream chunks instead of materializing the whole pull at once.  Sources
     # that don't need chunking ship a default fetch_chunked() that yields

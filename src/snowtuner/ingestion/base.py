@@ -4,12 +4,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Protocol
 
 import duckdb
 
-from snowtuner.storage.db import naive_utcnow
+from snowtuner.storage.db import as_naive_utc, naive_utcnow
 
 
 class SnowflakeClient(Protocol):
@@ -96,11 +96,10 @@ class Source(ABC):
         rows_count: int,
     ) -> None:
         now = naive_utcnow()
-        # Coerce high_water to naive UTC: DuckDB silently converts tz-aware
-        # values to local time before stripping tz on bind, so we have to
-        # normalize at the boundary.  Naive values are assumed already-UTC.
-        if high_water is not None and high_water.tzinfo is not None:
-            high_water = high_water.astimezone(timezone.utc).replace(tzinfo=None)
+        # Normalize to naive UTC at the DuckDB write boundary (an aware value
+        # would otherwise be converted to local time on bind).  as_naive_utc
+        # is the canonical coercion; see storage.db.
+        high_water = as_naive_utc(high_water)
         conn.execute(
             """
             INSERT INTO app.sync_watermarks
